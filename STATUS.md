@@ -2,11 +2,11 @@
 
 **Current state:** Design + one upstream fix landed. No NAS-tools code yet.
 
-`SPECS.md` is at **revision 4** (~1476 lines, 21 sections). It has survived one
+`SPECS.md` is at **revision 5** (~1476 lines, 21 sections). It has survived one
 adversarial review (rev 1→2, 15 findings, all accepted), a round closing its own
 open questions (rev 2→3), and rev 4 adds confidentiality modes, the git face,
 permissions/ACLs, Object Lock, DVC, formal methods and a use-case cookbook.
-**Revision 4 has not yet been reviewed.**
+Revision 4 was reviewed and revision 5 closed all six blockers it found.
 
 ## Decided
 
@@ -26,15 +26,17 @@ listing; lease-based GC with deltas; **three confidentiality modes** (`e2ee`,
   theorems, zero `sorry`: decoder round-trip, encoding injectivity, padding
   reversibility.
 
-## Written but NOT verified
-
-- **`formal/tlaplus/SlotConsistency.tla`** — `tla2tools.jar` is not installed, so
-  this has never been model-checked. Labelled as such in `formal/README.md`. It is
-  a design document with angle brackets until TLC runs it.
+- **`formal/tlaplus/SlotConsistency.tla`** — MODEL-CHECKED. 38,709 distinct states
+  at MaxSeq=2 (CI gate), 4,699,837 at MaxSeq=3 (deep gate). Its first revision
+  failed TLC in 7 states, catching three defects; see `formal/README.md`.
+- **`crates/nas-core`** — canonical encoder with proptests mirroring the Lean
+  theorems. 6 tests green.
+- **`tests/usecases/`** — 83 acceptance assertions, milestone-gated; 53 are M0–M2.
 
 ## Not built
 
-Everything else. `crates/` does not exist. Next action is M0.
+M0 steps 2–4 (`nas-crypto`, `nas-store`, `nas-cli` + test substrate).
+`ci.sh` is green end to end today.
 
 ## Environment constraints
 

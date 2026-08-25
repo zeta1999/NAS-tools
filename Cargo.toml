@@ -1,0 +1,22 @@
+[workspace]
+resolver = "2"
+members = ["crates/nas-core"]
+
+[workspace.package]
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+blake3 = "1"
+
+# 16 GB machine, ~9 crates eventually. Full debug info is what actually hurts
+# here -- line tables are enough for a backtrace and cost a fraction of the RAM
+# and disk. Dependencies are built optimised once; our own crates stay cheap to
+# rebuild.
+[profile.dev]
+debug = 1
+codegen-units = 16
+
+[profile.dev.package."*"]
+opt-level = 2
+debug = false

@@ -1,5 +1,13 @@
 # NAS-tools — specs
 
+> **Revision 5.** Fixes six blockers found reviewing revision 4: the roster was
+> unreadable by the peer that must check it (§3.5), `append` was not peer-
+> enforceable in encrypted modes (§16.3), `passphrase` mode's recovery path was
+> unspecified (§2.2.2), `transit-only` dedup leaked a confirmation oracle to
+> co-tenants (§2.2.3), revision 4 contradicted the Goal and §12 (both rewritten
+> mode-conditionally), and the deletion quorum fell to decomposition (§16.2).
+> Padding now defaults to `none`.
+>
 > **Revision 4.** Adds confidentiality **modes** (§2.2) — end-to-end encrypted is
 > no longer the only option — plus the git remote helper (§7.3), the four layers
 > of permissions and ACLs (§15), append-only / Object Lock with a deletion
@@ -10,9 +18,13 @@
 ## Goal
 
 A suite of NAS-style decentralized tools where **storage peers are untrusted and
-only ever hold ciphertext**. Three application faces — a git-style app, an
-S3-style app, a doc-style app — over one content-addressed, end-to-end encrypted
-substrate, plus a read-only filesystem mount.
+hold ciphertext by default**. Three application faces — a git-style app, an
+S3-style app, a doc-style app — over one content-addressed substrate, plus a
+read-only filesystem mount.
+
+*"By default"* is load-bearing: a namespace may opt out per §2.2 and store
+plaintext on a peer you trust to read it. What never varies is integrity,
+authenticity and rollback detection.
 
 Part of **simple tools**. Reuse sibling crates; do not reinvent crypto.
 
@@ -22,9 +34,14 @@ Part of **simple tools**. Reuse sibling crates; do not reinvent crypto.
 - Erasure coding (replication only)
 - Access-pattern privacy (ORAM); see §1 — this leak is accepted and documented
 - Cross-tenant deduplication (deliberately given up, see §3.2)
-- **Server-mediated** public sharing / presigned URLs — impossible, since a peer
-  can only ever hand out ciphertext. Sharing *is* supported by handing a read-cap
-  out of band; scoped sub-namespace caps are post-v0.
+- **Server-mediated** public sharing / presigned URLs, in `e2ee` and `passphrase`
+  namespaces — a peer there can only hand out ciphertext. Sharing *is* supported
+  by handing a read-cap out of band; scoped sub-namespace caps are post-v0.
+- **Peer-side features** (thumbnails, indexing, transcoding, a web gallery).
+  `transit-only` (§2.2.3) makes them *possible*; v0 does not ship them. They are a
+  remote plaintext-serving surface needing their own identity model, auth
+  protocol and transport story, and half-specifying that is worse than deferring
+  it. §2.2.3 lists what the mode permits, not what exists.
 - Byzantine consensus between peers (fork *detection*, not prevention — §5)
 - Mobile clients (a mobile `nasd` is post-v0; `simple-backups` has the Android scaffold)
 
@@ -87,6 +104,13 @@ localhost gateway is *not* a security boundary by itself (§2.1).
 - **Dedup equality oracle.** The peer observes whether a write introduced zero new
   blobs or N new blobs, giving intra-tenant content-equality and snapshot-similarity
   signal. Distinct from access patterns.
+- **The writer roster.** It must be plaintext, because the peer that enforces it
+  cannot read encrypted manifests (§3.5). That publishes device count, each
+  device's verifying key, and the timing of additions and revocations —
+  correlatable with the lease inventory above. This leak is the direct price of
+  peer-enforced write control; the alternative was no enforcement at all.
+- **Retention sets.** Like lease sets, a plaintext list of protected addresses
+  with an expiry (§16.3).
 - **Access patterns.** Which blobs are fetched, together, in what order. Defending
   this means ORAM, unusably slow for a filesystem.
 - **DAG shape**, partially — manifest sizes imply object counts.
@@ -155,13 +179,27 @@ immutable thereafter** (changing it would mean rewriting every blob).
 | Peer-side features | none possible | none possible | thumbnails, index, search, gallery |
 | Losing the key means | data is gone | recoverable from memory | nothing to lose |
 | **Read** ACL enforceable by peer | no — cryptographic only | no | **yes** |
-| **Write** ACL enforceable by peer | yes | yes | yes |
 | Integrity, rollback detection, leases, witnesses | identical | identical | identical |
 
-The asymmetry in the last three rows is the important part. **Authenticity does
-not require readability**: the peer can verify signatures and enforce who may
-*write* without being able to read a byte. Only *read* control depends on the
-mode.
+#### What the peer can actually enforce
+
+Revision 4 claimed write ACLs were peer-enforceable in every mode. That was too
+glib, and the correction matters because §16's ransomware defence rests on it:
+
+| Peer-side check | `e2ee` / `passphrase` | `transit-only` |
+|---|---|---|
+| signature valid, writer is on the roster | **yes** — the roster is plaintext (§3.5) | yes |
+| sequence monotonic, CAS honoured | **yes** | yes |
+| retention set covers the addresses being swept | **yes** — the set is plaintext addresses | yes |
+| lease quota per holder | **yes** | yes |
+| read ACL | **no** — capability possession only | yes |
+| **semantic** append-only: "no existing key was removed" | **NO** | yes |
+
+That last row is the one to internalise. In encrypted modes a slot update is an
+opaque new root address; **the peer cannot distinguish "added a key" from
+"deleted every key."** Append-only is therefore not a peer-enforced property in
+encrypted modes — it is enforced by the retention set (§16.3), recoverable from
+slot history (§5.5), and audited by clients. §16 is written accordingly.
 
 #### Rules
 
@@ -187,8 +225,12 @@ from your memory rather than from a key file.
 
 ```
 KEK = derive_key_argon2(passphrase, salt, m ≥ 256 MiB, t ≥ 3, p = 1)
-DEK = 32 B CSPRNG                    ← the actual namespace key
-wrapped = XChaCha20Poly1305(KEK, random_nonce, DEK)   ← stored with the namespace
+DEK = 32 B CSPRNG                    ← the namespace root secret
+wrapped = XChaCha20Poly1305(KEK, random_nonce, DEK)
+
+    root_secret  = derive_key("nas-tools/ns/root/v1",        DEK)
+    CS_ns        = derive_key("nas-tools/ns/convergence/v1", DEK)
+    sk_slot_seed = derive_key("nas-tools/ns/slot/v1",        DEK)
 ```
 
 > **The passphrase wraps a random key; it never *is* the key.** That indirection
@@ -205,12 +247,60 @@ low-entropy input it is unsuited to.
 > eventually fall. Use five or more diceware words, and prefer this mode on
 > hardware you own over hardware you rent.
 
+##### What the DEK unwraps into
+
+Revision 4 never said, and §3 has no single "namespace key" it could have meant.
+Everything the namespace needs derives from the DEK, as above. Note in particular
+that **the convergence secret is per-namespace (`CS_ns`), not the tenant-wide
+`CS`** — otherwise a passphrase namespace would need a vault secret to write, and
+"recoverable from memory alone" would be false. The price is that a passphrase
+namespace deduplicates only within itself.
+
+##### Where the wrap lives, and how recovery gets an anchor
+
+```
+WrapRecord { salt, argon2_params, wrapped_DEK, seq,
+             anchor: (slot_seq, sig_hash), prev, sig }
+sig context "nas-tools/sig/wrap/v1"
+```
+
+Stored **on the peer** beside the slot, signed, leased and covered by retention
+so the peer cannot quietly drop it. If it lived only on your machine, losing that
+machine would lose the wrap and "recoverable from memory" would be a lie.
+
+**The wrap record carries the freshness anchor**, and that is what closes the hole
+revision 4 opened. A client recovering from a passphrase alone holds no
+capability, so under revision 4 it had no anchor — reopening exactly the
+bootstrapping rollback hole §5.3(1) exists to close. Here **the wrap record *is*
+the capability** for this mode: unwrapping it yields both the key material and the
+`(seq, sig_hash)` floor beneath which nothing will be accepted.
+
+##### Changing a passphrase does not retire the old target
+
+Re-wrapping is mechanically cheap, but a peer that keeps the superseded
+`WrapRecord` keeps a brute-force target against the *old* passphrase forever, and
+that record still unwraps the same DEK. So:
+
+- Superseded wraps are deleted, and `prev` chaining makes their absence checkable.
+- **Against a hostile peer this is best-effort** — it may retain a copy, and
+  nothing can stop it. Genuinely retiring a compromised passphrase means rotating
+  the DEK and re-encrypting, exactly as §3.9(c) requires for `CS`.
+- The user manual must say "changing your passphrase protects future writes; it
+  does not un-expose data an attacker already copied."
+
 #### 2.2.3 `transit-only`
 
 Encrypted on the wire, plaintext at rest. The peer can read everything.
 
-- `addr = BLAKE3(plaintext)`. Dedup is global across the peer, which is harmless:
-  there is no confidentiality claim to leak.
+- `addr = BLAKE3(tenant_salt ‖ plaintext)`. Revision 4 used bare
+  `BLAKE3(plaintext)` and called global dedup "harmless: there is no
+  confidentiality claim to leak" — which considered only the peer as reader. **On
+  a shared peer it hands every co-tenant a confirmation oracle:** upload a
+  candidate file into your own namespace, watch for the dedup skip (§4.5), and
+  learn that somebody else on this peer holds it. "Not secret from my own NAS" is
+  a very different statement from "confirmable by anyone who rents space beside
+  me." A per-tenant salt restores tenant-scoped dedup and removes the oracle. The
+  salt is not secret; it only has to be unshared.
 - Padding is pointless (the peer sees the content anyway), so it defaults to
   `none` — recovering the 20–35 % overhead.
 - Names are plaintext, which is exactly what makes server-side browsing possible.
@@ -252,7 +342,8 @@ All primitives already exist in the sibling crates. Nothing new is invented.
 |---|---|---|---|---|
 | `CS` (tenant convergence secret) | 32 B CSPRNG, vault-held, never leaves `nasd` | nothing directly | — | — |
 | `ck` (chunk key) | `BLAKE3::keyed_hash(CS, plaintext_chunk)` | exactly one plaintext, ever | deterministic: `keyed_hash(ck, "nas-tools/nonce/chunk/v1")[..24]` | **No** — content-bound by construction |
-| `mk` (sub-manifest key) | same convergent rule (manifests are ordinary blobs) | one plaintext | as `ck` | **No** |
+| `dir_secret` (per directory) | `derive_key("nas-tools/dir/v1", parent_dir_secret ‖ dir_id)` | nothing directly | — | — |
+| `dk` (directory manifest key) | `derive_key("nas-tools/dir/manifest/v1", dir_secret)` | one manifest version | **random 24 B** | **Yes** → random nonce mandatory |
 | `rk_v` (root manifest key) | **per-version:** `derive_key("nas-tools/root/v1", root_secret ‖ le64(seq))` | one root version | **random 24 B**, stored with the ciphertext | **No**, given per-version derivation *and* random nonce — belt and braces |
 | `cache_k` | 32 B CSPRNG per boot, `rust-secure-memory`, zeroized on shutdown | cache entries | **random 24 B** | Yes → random nonce mandatory |
 | `sk_slot` | ML-DSA-65, derived from vault seed, role-separated | signs only | — | — |
@@ -264,13 +355,20 @@ not signature contexts, and implied one identity for everything. Every signed
 message is prefixed with its context string, and roles use distinct keypairs:
 
 ```
-"nas-tools/sig/slot/v1"        "nas-tools/sig/lease/v1"
-"nas-tools/sig/checkpoint/v1"  "nas-tools/sig/roster/v1"
-"nas-tools/sig/cap/v1"
+"nas-tools/sig/slot/v1"             "nas-tools/sig/lease/v1"
+"nas-tools/sig/checkpoint/v1"       "nas-tools/sig/roster/v1"
+"nas-tools/sig/cap/v1"              "nas-tools/sig/witness/v1"
+"nas-tools/sig/retention/v1"        "nas-tools/sig/delete-request/v1"
+"nas-tools/sig/delete-approval/v1"  "nas-tools/sig/delete-execution/v1"
+"nas-tools/sig/wrap/v1"             "nas-tools/sig/mirror-publish/v1"
 ```
 
-`simple-network`'s handshake signatures are untagged today (§14); that is an
-inherited item, not something this layer can fix.
+Revision 4 listed only the first five and then introduced six more signed objects
+without contexts — the exact mistake §3.1 exists to prevent. **Any signed object
+added later must land in this list in the same commit that introduces it.**
+
+`simple-network`'s handshake signatures carry contexts as of its protocol v1
+(§14).
 
 ### 3.2 Convergent encryption
 
@@ -324,11 +422,23 @@ Revision 1's write-cap could not actually write: it lacked `CS`.
   against existing blobs forever. Revocation therefore requires *rotation* into a
   new generation `CS'`, under which new writes dedup separately. Generations are
   numbered in every manifest so several coexist; see §3.9 for the full path.
-- **Writer roster.** A cas-merge namespace (§5) carries a roster in its root
-  manifest: `{writer_id → ML-DSA verifying key}`, signed under
-  `"nas-tools/sig/roster/v1"`. Slot versions are signed by a *device* key and
-  checked against the roster. This is what makes per-key LWW tiebreaks
-  well-defined (§7.1) and device revocation possible.
+- **Writer roster — a plaintext, slot-chained object, NOT inside the manifest.**
+
+  ```
+  RosterRecord { namespace_id, seq, writers: {writer_id → ML-DSA vk},
+                 revoked: [writer_id], prev, sig }
+  sig context "nas-tools/sig/roster/v1"
+  ```
+
+  Revision 4 placed it in the root manifest and simultaneously required the peer
+  to check slot updates against it. The peer cannot read the root manifest, so
+  peer-side write enforcement reduced to "any signature at all." It must therefore
+  be plaintext, sequence-chained and signed by the namespace key.
+
+  **This is a real leak** — device count, verifying keys, and the timing of every
+  addition and revocation, correlatable with lease inventories. It is listed in §1
+  and it is the honest price of peer-enforced write control. The alternative was
+  believing in enforcement that could not happen.
 
 ### 3.6 Why BLAKE3 — corrected
 
@@ -451,13 +561,26 @@ Profiles, per bucket:
 
 | Profile | Chunking | Fingerprint | Dedup | Overhead |
 |---|---|---|---|---|
-| `none` | CDC | full leak | best | 0% |
-| `classes` *(default)* | CDC + ladder | coarsened to class sequence | full | measured at M0 |
+| `none` *(default)* | CDC | full leak | best | 0% |
+| `classes` | CDC + ladder | coarsened to class sequence | full | measured at M0 |
 | `fixed` | fixed 64 KiB, no CDC | none | brittle — one insertion shifts everything | ~0% |
 
-Overhead for `classes` is expected in the 20–35% range but **must be measured, not
-assumed** — it is an M0 success criterion (§12). The `padding_profile` field is
-written into every manifest from M0 so the choice is never a format break.
+**Default is `none`.** Padding defends against an adversary holding a *candidate
+file* who wants to confirm you have it — real, but low-probability unless you are
+individually targeted, and 20–35% of a NAS is a large premium against it. That
+figure is itself an estimate and **must be measured, not assumed** before anyone
+opts in; the measurement is an M0 success criterion (§12).
+
+The `padding_profile` field is written into every manifest from M0 regardless, so
+enabling it later is a configuration change and never a format break.
+
+> **Implementation note carried back from the Lean model (§18).**
+> `unpad(pad(x)) = x` is proved unconditionally — but in Lean, where `Nat`
+> subtraction *truncates at zero*. The Rust expression `class - 4 - len` over
+> `usize` **underflows** when `len > class - 4`: a panic in debug, a wrap-to-2⁶⁴
+> allocation in release. The model erases precisely the failure mode most likely
+> to occur, so the class arithmetic needs a checked subtraction and a boundary
+> test. A proof constrains the design, not the code that drifts from it.
 
 ### 4.3 Manifest
 
@@ -670,7 +793,7 @@ All are localhost adapters over the same substrate.
 | App | Namespace semantics | Slot regime | Genuinely new work |
 |---|---|---|---|
 | **S3-style** | per-key LWW *inside* a bucket manifest | `cas-merge` | S3 shim, SigV4, merge function |
-| **git-style** | immutable commit DAG + mutable refs | `single-writer` | remote helper, ownership handoff |
+| **git-style** | immutable commit DAG + mutable refs | `cas-merge`, fast-forward only (§7.3) | remote helper, patch queues |
 | **doc-style** | per-doc CRDT | `cas-merge` | CRDT engine, op-log compaction |
 
 ### 7.1 S3 merge semantics (revision 1 lost writes)
@@ -708,9 +831,13 @@ them ourselves is both faithful and cheap.
 Three details decide whether this works:
 
 1. **Store inflated loose objects, never packfiles.** The obvious shortcut — let
-   git build a pack and CDC-chunk it — fails badly: packs are zlib-compressed,
-   and compression destroys content-defined chunking. One changed byte upstream
-   cascades through the compressed stream and dedup collapses to nothing. So we
+   git build a pack and CDC-chunk it — fails, though not for the reason revision 4
+   gave. Packfiles deflate each object and delta *individually*, not as one
+   stream, so nothing "cascades" through a shared compressor. The real CDC killers
+   are **delta-base selection and nondeterministic object ordering**: repacking
+   the same history can pick different bases and a different layout, so
+   byte-identical content yields entirely different pack bytes and dedup collapses
+   anyway. The conclusion stands; the mechanism does not. So we
    inflate and store objects individually. Most fall under the 16 KiB minimum and
    become one chunk each; large blobs chunk normally. Batch them into one manifest
    per push so there is no round trip per object.
@@ -725,8 +852,16 @@ Three details decide whether this works:
    and your muscle memory expects it. The peer enforces sequence-CAS; the
    **client** enforces the descendant check, since the peer cannot read the DAG.
    A rejected push surfaces as git's own non-fast-forward error — `git pull
-   --rebase` and retry. Force-push becomes an explicit signed override that breaks
-   the descendant rule and lands in the audit trail. This is strictly better than
+   --rebase` and retry.
+
+   > **Fast-forward is a client convention with post-hoc detection, not an
+   > enforced property.** The peer checks only sequence-CAS, so any rostered — or
+   > compromised — device can publish a non-descendant root as an ordinary slot
+   > record, with no override flag and nothing distinguishing it in the audit
+   > trail. Other clients detect it afterwards by walking history. A writer can
+   > also publish a tip whose ancestry objects it withholds, leaving honest
+   > clients unable to verify descent; they must refuse the tip rather than accept
+   > it unverified. This is strictly better than
    passing slot ownership between devices; `single-writer` remains available as a
    stricter opt-in.
 
@@ -939,15 +1074,20 @@ local listing. `rclone` and `aws s3` work against `localhost`.
 
 **M4 — RO mount.** WebDAV on the same gateway; encrypted chunk cache; ranged reads.
 
-**M5 — git face.** Remote helper; refs as `single-writer` slots; ownership handoff.
+**M5 — git face.** Remote helper; refs as `cas-merge` slots with a fast-forward
+merge rule; worktrees; patch objects and queues.
 
 **M6 — doc face.** CRDT engine, op-log blobs, compaction.
 
 ## 12. Success criteria (v0 = M0–M4)
 
 1. Byte-identical round-trip through chunk → encrypt → peer → fetch → decrypt.
-2. A peer's on-disk state contains no plaintext — automated test greps blobs,
-   slots and leases for known plaintext markers.
+2. For `e2ee` and `passphrase` namespaces, a peer's on-disk state contains no
+   plaintext — automated test greps blobs for known markers. Roster, lease and
+   retention records are *expected* to be plaintext (§1) and are excluded by name,
+   not by accident. For `transit-only` namespaces the same test asserts the
+   **opposite**, and additionally that no `e2ee` namespace's data has ever landed
+   in one.
 3. Two trees sharing 90% content transfer roughly 10% of the bytes.
 4. Rollback, tamper, withholding, dedup-lie and CAS-non-enforcement each have a
    test that *detects* them, and a fresh client with only a cap resists all five.
@@ -994,10 +1134,15 @@ own `TODO.md` lists items this design silently depends on:
   than `SecureConnection`.
 - mTLS / cluster cert pairing is unimplemented.
 
-**Position:** closing the first two is a **prerequisite for M1**, not a
-nice-to-have, and they are to be fixed **upstream in `simple-network`** rather than
-worked around here. This is approved — NAS-tools work includes patching that repo.
-Tracked in `TODO.md` under *Upstream*.
+**Status: the first three are DONE upstream** as `simple-network` protocol v1 —
+transcript binding into the KDF, signature context tags, and a constant-time
+`check_pin`. 15 tests green. Revision 4 still described them as open; that text is
+withdrawn.
+
+**Carry the deployment constraint:** protocol v1 is **wire-breaking**. A v0 peer
+is refused with an explicit version error rather than silently downgraded, so both
+ends of any paired deployment upgrade together — `simple-backups` push/pull rides
+this channel. Verify interoperability at M1 rather than assuming it.
 
 If the doc face later wants pubsub (§7.2), the upstream cost is: topic filtering
 (small), routing pubsub over `SecureConnection` instead of raw TCP (moderate, and
@@ -1050,9 +1195,23 @@ to honour.** There is no third option, and picking one is what choosing a mode
 means.
 
 **Per-directory key derivation is mandatory from M0**, even though v0 only ever
-issues namespace-root capabilities. Each directory manifest's key derives from its
-parent's, so a capability can later be scoped to a subtree. Retrofitting this
-after data exists means re-keying everything. It costs nothing now.
+issues namespace-root capabilities. Each directory carries a `dir_secret` derived
+from its parent's (§3.1), so a capability can later be scoped to a subtree.
+Retrofitting after data exists means re-keying everything.
+
+Revision 4 asserted this while §3.1 still made manifest keys *convergent* — two
+mutually exclusive key schedules for one object. Resolved as:
+
+- **Chunks stay convergent.** `ck` is content-derived, dedup is preserved, and
+  this is where essentially all the bytes are.
+- **Directory manifests use `dk`, derived from `dir_secret`, with a random
+  nonce.** Manifest dedup is given up. It was never worth much — manifests are a
+  rounding error beside chunk data — and in exchange a subtree capability becomes
+  possible and a directory *move* re-keys one manifest rather than its entire
+  contents.
+
+So "it costs nothing" was wrong; it costs manifest dedup, which is the right
+trade rather than a free one.
 
 ### 15.4 Who may write — enforceable in every mode
 
@@ -1116,8 +1275,39 @@ All of it append-only, so the audit trail cannot be edited either:
    then are leases dropped.
 
 **Scope is one object, a prefix, or a whole namespace — and quorum scales with
-blast radius.** One approver to remove a file; three to remove a tree. The
-approval requirement should be proportional to what is at risk.
+blast radius.** One approver to remove a file; three to remove a tree.
+
+**But per-request quorum alone is defeated by decomposition.** With `object: 1`,
+one stolen approval token deletes an entire namespace as N single-object
+requests, never once triggering the namespace quorum of 3. So quorum is also
+aggregated over a rolling window:
+
+```yaml
+delete_quorum:
+  object: 1
+  prefix: 2
+  namespace: 3
+  rolling: { window: 30d, objects: 10, escalate_to: 3 }
+```
+
+Past the rolling threshold, every further request — whatever its scope — demands
+the namespace quorum. Volume is what actually correlates with harm, not the label
+on any single request.
+
+##### Whose clock gates the cooling-off
+
+There is **no trusted time source anywhere in this design.** The peer's clock is
+adversarial by assumption, and a request's timestamp is signed by a requester who
+may be compromised. So:
+
+> **Cooling-off is enforced by the approver devices, against their own local
+> clocks.** An approver must refuse to sign before its own cooling-off has
+> elapsed. Nothing in the protocol can enforce it.
+
+That reorders §16's claim. Revision 4 said cooling-off "is the part that actually
+defeats ransomware" — backwards. **Key separation defeats ransomware.**
+Cooling-off is a convention enforced by approver software, valuable because it
+gives a human time to notice, not because the protocol compels it.
 
 ### 16.3 Retention must override leases
 
@@ -1126,25 +1316,68 @@ a client stops renewing, the peer sweeps. **So a compromised client can destroy 
 WORM namespace by simply going quiet** — no deletion request required, no policy
 violated.
 
-Therefore the peer holds a signed **retention record** — one signature over a
-Merkle root of the protected set plus an expiry, per §3.8 — and refuses to sweep
-anything covered by it, leased or not. Pair any WORM namespace with at least two
-peers and challenge them periodically with the proof-of-possession mechanism from
-§4.5.
+Revision 4's retention record was one signature over a Merkle root of the
+protected set. That does not work: a root hash gives the peer **no way to decide
+membership** when it is about to sweep a given address. It also never said who
+signs it, or how it grows to cover newly appended data.
+
+```
+RetentionSet { namespace_id, epoch, addrs: [addr], expiry, mode,
+               prev, signer, sig }
+sig context "nas-tools/sig/retention/v1"
+```
+
+The set ships **addresses**, like a lease checkpoint (§6.1), so membership is
+decidable. The signing rule is what makes it survive a compromised laptop:
+
+| Operation | Required key | Peer-verified condition |
+|---|---|---|
+| **Extend** — add addresses | the everyday write key | new set ⊇ previous set |
+| **Shrink or shorten expiry** | the offline delete authority | quorum per §16.2 |
+
+**Ransomware holding the everyday key can only ever add protection.** A publish
+that removes addresses or pulls in the expiry is rejected by the peer on a check
+it can actually perform — plaintext set comparison — with no need to read
+anything. That is what makes append-only real despite the peer being unable to
+understand the manifest (§2.2).
+
+Pair any WORM namespace with at least two peers so that one peer ignoring
+retention is detectable rather than fatal.
+
+##### Auditing an archive you do not hold
+
+§4.5's proof of possession requires the challenger to have the ciphertext, in
+order to recompute `BLAKE3(nonce ‖ ciphertext)`. A client auditing a seven-year
+archive does **not** hold it — that was the entire point of the archive — so as
+written the periodic challenge was either a full re-download or impossible.
+
+Instead, at write time the client precomputes and stores a small set of
+challenge/response pairs `(nonce_i, BLAKE3(nonce_i ‖ ciphertext))` inside the
+encrypted manifest. Auditing spends one pair per challenge and needs no bytes
+from the peer beyond its answer. Pairs are replenished on any read that
+materialises the data.
 
 ### 16.4 Versioning, the gentler option
 
 A separate axis from Object Lock: every PUT creates a new version, DELETE writes a
 delete-marker and destroys nothing. Manifests are immutable and slots keep history
-(§5.5), so this is nearly free — and for many "never lose anything" requirements
-it is what people actually want, without the ceremony of retention policy.
+(§5.5), so this is cheap — and for many "never lose anything" requirements it is
+what people actually want, without the ceremony of retention policy.
+
+> **But versioning alone is not a ransomware defence.** Old versions survive only
+> while leased, and leases are published by the very client that may be
+> compromised: it can emit `remove:` deltas (§6.1) and let the old manifests sweep
+> after the grace period. Versioning without a retention set (§16.3) does not
+> survive the attack §16 exists to stop. Revision 4 called it "nearly free
+> protection"; it is nearly free *convenience*.
 
 ---
 
 ## 17. DVC integration
 
 **How DVC works.** Large files stay out of git. `dvc add data/train.csv` hashes
-the file (MD5 by default), moves it into a cache at `.dvc/cache/<ab>/<rest>`,
+the file (MD5 by default), moves it into the cache — `.dvc/cache/files/md5/<ab>/<rest>` in DVC 3.x; the
+flatter `.dvc/cache/<ab>/<rest>` is the 2.x layout —
 links it back into the workspace, gitignores the real path, and writes a small
 `train.csv.dvc` pointer containing the hash. You commit the pointer: git versions
 the pointer, DVC versions the bytes. `dvc push` uploads cache contents to a remote
@@ -1164,7 +1397,13 @@ Our CDC layer fixes that without DVC knowing anything happened.
 | Make `nas-store` *be* the DVC cache, materialising checkouts by reflink | invasive | one store; no duplicate copy between cache and workspace |
 
 Level 1 is the compelling one: zero work, and it removes DVC's single biggest
-limitation as a side effect.
+limitation *on the wire and on the peer* as a side effect.
+
+> **Precisely what improves.** "One changed row costs kilobytes, not 10 GB" is
+> true of **transfer and peer storage**. DVC's own local cache still writes a
+> second full 10 GB copy on your disk, and chunking underneath does not change
+> that — only Level 3, where `nas-store` becomes the cache, addresses it. Do not
+> let anyone read Level 1 as fixing local disk usage.
 
 **Caution:** DVC's MD5 is not collision-resistant. Treat it as a *name*, never as
 an integrity guarantee — `addr = BLAKE3(ciphertext)` remains the real check.
@@ -1223,7 +1462,7 @@ namespace: photos
 mode: transit-only          # plaintext at rest; the NAS is yours
 padding: none               # pointless when the peer can read anyway
 names: plaintext            # what makes server-side browsing possible
-peer_features: [thumbnails, index, gallery]
+peer_features: [thumbnails, index, gallery]   # PERMITTED by the mode; NOT in v0
 access:                     # REAL ACLs here — the peer can enforce them
   - { subject: family,  rights: [read] }
   - { subject: renaud,  rights: [read, write, admin] }
@@ -1282,8 +1521,12 @@ access:
   - { subject: token-a,  rights: [delete-approve] }  # offline hardware token
   - { subject: token-b,  rights: [delete-approve] }
   - { subject: token-c,  rights: [delete-approve] }
-delete_quorum: { object: 1, prefix: 2, namespace: 3 }
-cooling_off: 7d
+delete_quorum:
+  object: 1
+  prefix: 2
+  namespace: 3
+  rolling: { window: 30d, objects: 10, escalate_to: 3 }  # blocks decomposition (§16.2)
+cooling_off: 7d             # enforced by APPROVER devices; no trusted clock exists
 peers: [home-nas, vps-fra]  # ≥2, so one peer ignoring retention is detectable
 ```
 
@@ -1299,7 +1542,8 @@ mode: e2ee
 chunking: large-object      # avg 1 MiB; write-once bulk data
 ```
 ```sh
-dvc remote add -d nas s3://datasets   -o endpointurl=http://127.0.0.1:PORT
+dvc remote add -d nas s3://datasets
+dvc remote modify nas endpointurl http://127.0.0.1:PORT
 ```
 DVC keeps versioning pointers in git; we chunk, dedup and encrypt underneath.
 Changing one row of a 10 GB CSV now costs kilobytes rather than 10 GB.
@@ -1361,9 +1605,10 @@ than its *driver* for your situation, delete the feature.
 | You said | Which actually forces | Mechanism | What it costs you |
 |---|---|---|---|
 | "servers only handle encrypted data" | the peer cannot read, so it cannot index, search, thumbnail, share, **or garbage-collect** | localhost daemon (§2), local listing (§4.4), lease GC (§6) | every app becomes a local adapter; no presigned URLs |
-| a NAS should not store the same file twice | identical plaintext must encrypt to identical bytes | convergent encryption (§3.2) | a confirmation oracle, closed by a per-tenant secret — so no cross-tenant dedup, ever |
+| a NAS should not store the same file twice | dedup needs identical content to be *recognisable* — **not** necessarily identically encrypted | convergent encryption (§3.2) is **one** answer; a client-side encrypted index `BLAKE3(plaintext) → addr` under random keys is another | convergent: a confirmation oracle plus generation-rotation machinery. indexed: an index to sync and recover. **Revision 4 said "forces" and was wrong** — see §20.3 |
 | "post-quantum" | Shor breaks Ed25519 and X25519 | ML-DSA-65 + hybrid ML-KEM-768 (§3.7) | signatures ~50× larger → **Merkle roots everywhere** (§3.8) |
-| "family photos, don't lose them" | recoverability outranks confidentiality here | `transit-only` (§2.2.3) | the peer reads everything; read control becomes policy, not maths |
+| "family photos, don't lose them" | recoverability outranks confidentiality | `passphrase` (§2.2.2) suffices for recoverability *alone* | offline brute force against the wrap |
+| …plus "the family should browse them, with thumbnails" | server-side **reading** | `transit-only` (§2.2.3) | the peer reads everything; read control becomes policy, not maths |
 | "locked by a simple password" | the key must live in a human head | Argon2id KEK wrapping a random DEK (§2.2.2) | offline brute force is available to the peer; needs a real passphrase |
 | "append only, never delete" | a compromised client must not be able to destroy | key separation + quorum + cooling-off (§16) | approval keys must live off the laptop, or the defence is theatre |
 | "read-only mount, rootless" | no kext, no root password | WebDAV now, NFSv3 later (§8) | WebDAV cannot express POSIX modes (§15.2) |
@@ -1373,6 +1618,24 @@ than its *driver* for your situation, delete the feature.
 | "patch import/export" | agents produce reviewable units | patch blobs and queues (§7.5) | reuses the §16 quorum; no new machinery |
 | "mirror, minus `fixes/`" | history cannot be path-filtered without rewriting | derived repo + persisted SHA map (§7.6) | it is **not a mirror**; without the map you force-push forever |
 | DVC | large files versioned alongside code | S3 gateway as a DVC remote (§17) | none — and it repairs DVC's whole-file cache for free |
+
+### 20.3 The largest unforced choice in the design
+
+Convergent encryption is presented throughout §3 as though deduplication demanded
+it. It does not. A client-side encrypted index mapping `BLAKE3(plaintext) → addr`,
+synced through the namespace like any other metadata, gives **within-tenant dedup
+under ordinary random keys** — no confirmation oracle, no convergence secret, no
+per-tenant salt, and no generation-rotation story for a lost device.
+
+The genuine trade is **statelessness versus an oracle.** Convergent encryption
+needs no shared index and works from cold with only a key, at the cost of the
+confirmation attack and the §3.9(c) machinery required to rotate around it. The
+indexed alternative removes the oracle and adds an index that must be synced,
+merged and recovered.
+
+A large fraction of §3's complexity descends from this single choice. It deserves
+a deliberate decision before M0 locks a format, rather than being inherited
+because revision 1 assumed it.
 
 ### 20.1 The consequences nobody signs up for on purpose
 
@@ -1412,11 +1675,20 @@ assessments:
 - **The doc face (M6) is the most work and probably the least used** of the three.
   CRDT engines are where projects go to die. Unless real-time multi-writer editing
   is a thing you will actually do, cut it and keep the S3 and git faces.
-- **The Tor carrier** is only needed if you cannot obtain a stable address. A €3
-  VPS as a peer is simpler, faster, and has no anonymity requirement to satisfy.
+- ~~**The Tor carrier.**~~ **Retracted — this was wrong when written.** §19.1 and
+  §19.2 both mandate `peers: [home-nas]`, explicitly *not* a rented VPS, and §5.6
+  requires the roaming laptop to reach that home NAS from a café with
+  port-forwarding and VPNs ruled out. Tor **is** the reachability story for those
+  use cases; cutting it would silently cut §19.1 and §19.7 with it.
+- **The witness-only node** is more load-bearing than first stated. §5.4 says it
+  is what turns "one peer withholds forever" into "every node must collude." Two
+  regularly-used devices behind a *single* malicious peer get nothing from each
+  other. Cut it only if you already run more than one peer.
 
-Cutting the doc face and padding would remove roughly a third of the remaining
-work without touching anything in §19's use cases except 20.1's storage bill.
+Cutting the doc face removes roughly a quarter of the remaining work and touches
+none of §19's use cases. Padding is now off by default (§4.2.1), which costs
+nothing and reclaims the storage. The other three candidates did not survive
+scrutiny.
 
 ---
 
@@ -1453,6 +1725,33 @@ work without touching anything in §19's use cases except 20.1's storage bill.
 | §5.6 roaming section | Unstable connectivity is the primary use case, not an edge case |
 | §7.2 poll-first liveness | Pubsub cannot be load-bearing against an untrusted peer; the doc face was needlessly coupled to an upstream gap |
 | §14 upstream work approved | `simple-network` transcript binding and constant-time pin compare to be fixed in place |
+
+### Revision 5
+
+| Change | Driver |
+|---|---|
+| §3.5 roster becomes a plaintext, slot-chained object | It sat inside the encrypted manifest while the peer was required to check it — peer-side write enforcement was impossible as written |
+| §1 three further leaks | The roster and retention sets must be plaintext; the price is stated rather than hidden |
+| §2.2 "what the peer can actually enforce" table | Revision 4 claimed peer-enforced write ACLs in every mode; **semantic** append-only is not enforceable in encrypted modes |
+| §16.3 retention ships addresses, extend-only under the everyday key | A Merkle root left the peer unable to decide membership when sweeping; ransomware must be able to *add* protection but never remove it |
+| §16.3 precomputed challenge/response pairs | §4.5's proof of possession required holding the ciphertext — impossible for the archive it was meant to audit |
+| §16.2 rolling quorum + named clock owner | `object: 1` × N deletes a namespace at quorum 1; and no trusted time source exists, so cooling-off is an approver-device convention, not a protocol guarantee |
+| §2.2.2 passphrase mode fully specified | The DEK was never defined, wrap storage was unstated, recovery had no freshness anchor, and superseded wraps left the brute-force target in place |
+| §2.2.3 per-tenant address salt | Global dedup on a shared peer handed every co-tenant a confirmation oracle |
+| Goal, Non-goals, §12.2 rewritten mode-conditionally | Revision 4 contradicted all three the moment `transit-only` existed |
+| Peer-side features explicitly deferred | A remote plaintext-serving surface was introduced in a bullet list with no identity, auth or transport model |
+| §3.1 eleven more signature contexts | Six signed objects were added in revision 4 with no contexts — the exact mistake §3.1 exists to prevent |
+| §15.3 directory keys reconciled with §3.1 | Convergent and hierarchical manifest keys were mutually exclusive; chunks stay convergent, manifests move to `dk` |
+| §4.2.1 padding defaults to `none` | User decision; the 20–35% premium is not worth a low-probability targeted attack |
+| §4.2.1 underflow note | The Lean proof holds because `Nat` truncates; Rust `usize` underflows instead |
+| §7.3 fast-forward stated as advisory | The peer enforces only sequence-CAS; force-push is detectable after the fact, not preventable |
+| §7.3 packfile mechanism corrected | Packs deflate per object, not as one stream; the real killers are delta-base selection and object ordering |
+| §7 table + M5 corrected to `cas-merge` | Revision 4 changed §7.3 and left two other places contradicting it |
+| §14 marked done, wire-break carried | The upstream fix landed and made the spec stale |
+| §16.4 versioning caveat | Old versions are swept by the same compromised client's lease deltas |
+| §17 DVC layout and scope of the win corrected | 3.x cache path; the saving is wire and peer, not local disk |
+| §20 two causal chains corrected, §20.3 added | Dedup does **not** force convergent encryption, and recoverability does not force `transit-only` |
+| §20.2 Tor cut retracted | It is the reachability story for §19.1, §19.2 and §19.7 |
 
 ### Revision 4
 

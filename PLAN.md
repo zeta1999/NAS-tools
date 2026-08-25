@@ -1,185 +1,198 @@
 # Implementation plan — M0 → M2
 
-Scope chosen: **M0 through M2**, i.e. up to the point where *"resists a hostile
-peer"* is a demonstrated claim rather than a design intention. Padding defaults
-to `none`. Multi-node simulation on colima with a bounded VM.
+> **Revision 2**, after an adversarial review of revision 1. Revision 1 had an
+> unsatisfiable definition of done, a Step 0 whose central claim was false, and
+> four unowned subsystems. See §8 for what changed.
 
-Target of done: the 81 acceptance assertions in `tests/usecases/` stop being
-PENDING. They were written from the use-case cookbook before any code existed,
-precisely so the implementation cannot quietly redefine success.
+Scope: **M0 through M2** — up to where *"resists a hostile peer"* is demonstrated
+rather than intended. Padding defaults to `none`.
+
+**Definition of done: the 53 M0–M2 acceptance assertions in `tests/usecases/`
+pass.** The other 30 stay PENDING (M3–M5) and 1 is deferred (M6). Revision 1 said
+"all 81", which was unachievable inside this scope — and since `ci.sh` runs the
+harness, that would have made CI permanently red from the first binary, until
+somebody disabled the gate.
 
 ---
 
-## Step 0 — a decision that must precede M0
+## 1. Step 0 — the dedup scheme decision
 
-**SPECS §20.3: convergent encryption is an unforced choice.** A client-side
-encrypted index `BLAKE3(plaintext) → addr` gives within-tenant dedup under
-ordinary random keys, with no confirmation oracle, no convergence secret, no
-per-tenant salt, and no rotation story for a lost device.
+**Revision 1 claimed this "locks the on-disk format." That was wrong.** SPECS §4.3
+stores `ck` per chunk *because a reader has no plaintext and cannot derive it* —
+so reads never derive a key from `CS`, and `addr = BLAKE3(ct)` either way. The
+blob and manifest layouts are already scheme-agnostic.
 
-| | Convergent (current spec) | Indexed alternative |
+What it actually locks: the **capability format** (whether a cap carries `CS`),
+the **write/dedup path**, the **rotation machinery** (§3.9c), and the **test
+contract** — SPECS §12.5 and `uc03` hard-code the confirmation-attack pair, so
+choosing "indexed" means editing the spec and the harness too.
+
+| | Convergent (spec) | Indexed (`BLAKE3(pt) → addr`, random keys) |
 |---|---|---|
-| Works from cold with only a key | **yes** | no — needs the index |
-| Confirmation oracle | **yes**, mitigated by a shared secret | none |
-| Machinery | `CS`, generations, rotation, per-tenant salt (§3.9c, §2.2.3) | an index to sync, merge and recover |
-| Blast radius of a leaked secret | every blob, permanently | none — keys are per-object random |
+| Reads from cold with only a key | yes | yes — only *dedup* degrades until the index syncs |
+| Confirmation oracle | yes, gated on `CS` | yes, gated on **the index** — a stolen snapshot is an oracle over everything indexed at that moment |
+| Extra machinery | `CS`, generations, rotation, per-tenant salt | multi-writer index merge, index recovery |
+| Multi-writer cost | none | a new consistency object riding slots that don't exist until M1 |
 
-This **locks the on-disk format**, so it cannot be deferred past M0. Everything
-below assumes convergent unless overridden; switching later is a rewrite of
-`nas-crypto` and `nas-store`, not a flag.
+Revision 1's table claimed indexed had "no blast radius" and did not work from
+cold. Both were wrong, in opposite directions.
 
-> **Blocking question for the user.** Convergent as specified, or indexed?
-
----
-
-## M0 — substrate, local only
-
-No network, no containers. Four crates.
-
-### 1. `nas-core`
-Types, error taxonomy, addresses, capability types, manifest format, and the
-**canonical length-prefixed encoder**.
-
-- The encoder must be the one `formal/lean/NasVerify/Transcript.lean` models. A
-  `proptest` mirrors `encFields_inj` directly: distinct field vectors never
-  encode alike. The proof constrains the design; the test constrains the code.
-
-### 2. `nas-crypto`
-The §3.1 key schedule, as the **only** place in the workspace that chooses a
-nonce.
-
-- API shape is the safety property: callers pass a `KeyClass`, and the nonce
-  policy follows from it. A deterministic nonce must be *unreachable* for a
-  non-content-derived key rather than merely discouraged. Revision 1 of the spec
-  was one implementer-inference away from keystream reuse here; the type system
-  should close what prose could not.
-- Convergent chunk keys, `dir_secret` chain, `dk`, all eleven signing contexts.
-- Wraps `rust-secure-memory` for locked buffers and zeroization.
-
-### 3. `nas-store`
-FastCDC, padding, blob store, manifests, per-directory keys, bounded LRU cache
-encrypted under a per-boot key.
-
-- **Padding arithmetic uses checked subtraction.** `class - 4 - len` underflows
-  on `usize`; the Lean proof does not catch it because `Nat` truncates (SPECS
-  §4.2.1). Boundary test at `len == class - 4` and `len == class - 3`.
-- Measure padding overhead against a real corpus and record it in
-  `MANUAL-TESTING.md`. The 20–35% figure is an estimate nobody has checked.
-
-### 4. `nas-cli` (minimal)
-`ns create`, `put`, `get`, `ls`, and the `nas test …` subcommand tree the
-acceptance harness already calls. The harness is the interface contract.
-
-**M0 exits when** `uc03_work_e2ee.sh` is green apart from peer-dependent
-assertions, and round-trip, dedup-ratio and the confirmation-attack pair pass.
+> **Recommendation: convergent, as specified**, plus a `key_scheme` byte in the
+> manifest so the door stays open at zero cost. The oracle needs `CS` compromise
+> and is within-tenant; `passphrase` mode already forces per-namespace `CS_ns`;
+> and indexed drags a multi-writer index-merge problem into M0, before slots
+> exist to carry it.
 
 ---
 
-## M1 — the peer
+## 2. Cross-cutting work, owned explicitly
 
-### 5. `nas-slots`
-Slot records, both regimes, history with `prev` chaining, freshness anchors,
-client pins, skip-chain checkpoints.
+Revision 1 had no owner for any of these, while the harness demands all of them.
 
-### 6. `nas-lease`
-Delta and checkpoint records, young-blob grace, per-holder quotas.
-
-### 7. `nas-transfer`
-Client protocol over `simple-network` `pqc`. **Verify v1 interoperability
-first** — protocol v1 is wire-breaking and `simple-backups` shares the channel.
-
-### 8. `nas-peer` — the untrusted server
-The component our own threat model assumes is malicious, so it holds no secrets
-and requires none.
-
-- Blob store; slot ordering and CAS; **plaintext roster verification** (§3.5);
-  retention sets with peer-verified superset semantics (§16.3); lease
-  enforcement and sweep; PoP responder; `--witness` mode holding no blobs.
-
-### 9. Multi-node simulation
-- `colima start --cpu 4 --memory 6 --disk 40` — a bounded VM that cannot grow
-  into the working set on a 16 GB machine.
-- **Build on the host, ship only the binary.** No cargo toolchain in any image;
-  distroless base, one static arm64 binary. arm64 only — no QEMU.
-- Three nodes: two peers plus one witness, the minimum that makes §5.3
-  meaningful.
-
-**M1 exits when** push/pull round-trips against a real peer over the PQC channel
-and the lease cycle runs end to end, honest-peer only.
+| Concern | Where | Why it cannot wait |
+|---|---|---|
+| **Clock abstraction** | `nas-core`, M0 | Lease expiry, grace, sweep, cooling-off and "30 days offline" all need virtual time. A `Clock` trait retrofitted after M0 touches every crate. |
+| **`nas test` substrate** | `nas-cli`, M0→M2 | ~40 subcommands that spawn topologies, inject hostility and drive virtual time. This is a test *framework*, comparable to a crate — not CLI plumbing, and partly needed at M0. |
+| **Vault + identity + pairing** | `nas-vault`, M1 | `vault.bin` holds ML-DSA identities, `CS` generations, pinned peers, blocklist. Pairing distributes `CS` and negotiates quota and accepted modes. |
+| **`nasd`** | folded into `nas-cli` for M0–M2 | A stated decision, not an omission: the trust boundary is a library plus a CLI until the gateway arrives at M3. |
+| **Config** | `nas-core`, M1 | The §19 cookbook YAML shapes are the user-facing contract. |
+| **Observability** | all, from M0 | Our security model *is* detection. An alarm with no output channel is not detection. Structured `tracing` from the first crate. |
+| **Format versioning** | `nas-core`, M0 | Every on-disk and on-peer record carries a scheme/version field. Five plaintext peer record types are new in SPECS rev 5 and unexercised. |
+| **Fuzzing** | `fuzz/`, M1 | `formal/README.md` calls this the highest value per hour in the project, and revision 1 omitted it from CI. Every parser taking peer bytes. |
 
 ---
 
-## M2 — adversarial hardening
+## 3. M0 — substrate, local only *(baseline: 1×)*
 
-### 10. The hostile peer
-`nas-peer --hostile <behaviour>`: tamper, rollback, withhold, dedup-lie,
-fork (refuse CAS), withhold-witness, ignore-retention.
+1. **`nas-core`** — types, error taxonomy, addresses, caps, manifest format with
+   version + `key_scheme` fields, the canonical length-prefixed encoder, the
+   `Clock` trait. ✅ *encoder landed; proptests mirror the Lean theorems.*
+2. **`nas-crypto`** — the §3.1 key schedule, the **only** place a nonce is chosen.
+   Callers pass a `KeyClass`; a deterministic nonce is *unreachable* for a
+   non-content-derived key. All **twelve** signing contexts.
+3. **`nas-store`** — FastCDC, padding with **checked** subtraction (`class - 4 -
+   len` underflows on `usize`; the Lean proof misses it because `Nat` truncates),
+   blob store, manifests, per-directory keys. *No cache — that is an M4 mount
+   concern and revision 1 pulled it in for no reason.*
+4. **`nas-cli` + test substrate** — `ns create/put/get/ls`, and the `nas test`
+   scaffolding with the **exit-2 refusal contract** the harness now enforces.
 
-> Without this, every attack test is a mock asserting what we already believe.
-> The hostile peer is the load-bearing piece of M2, and it should be built
-> **first**, not last.
+**Exit:** the 5 M0-tagged assertions pass; padding overhead measured on a real
+corpus and recorded in `MANUAL-TESTING.md`.
 
-### 11. Detection
-Witness publication and relay, chain walking, cold-start from a capability alone.
+## 4. M1 — peer, modes, vault *(~3× M0)*
 
-- The client must re-evaluate accumulated evidence on **every** pin change, not
-  on witness arrival. This is not a preference: TLC found the arrival-only
-  version admits an undetected fork in 7 states (`formal/README.md`), and
-  "handle the event then forget it" is the default way anyone writes it.
+Revision 1 called this "push/pull + lease cycle" while the harness hung 20
+further assertions on it — two confidentiality modes, peer ACLs, wrap records.
+That is how revision 2 of SPECS ended up with a milestone containing half the
+project; naming the sizing is how it stays visible.
 
-### 12. Model checks
-`LeaseGC.tla` (write/sweep race against the grace period) and `DeleteQuorum.tla`
-(quorum, approval replay, cooling-off bypass), both wired into `formal/check.sh`
-with their own must-fail sanity checks.
+5. **`nas-slots`** — records, both regimes, history, anchors, pins, skip-chains.
+6. **`nas-lease`** — deltas, checkpoints, grace, quotas. **Measure ML-DSA record
+   sizes here, while the structs are being designed** — not "at M1" generically.
+   3.3 KB per signature is the constraint that shaped §3.8.
+7. **`nas-vault`** — identities, `CS` generations, pinned peers, pairing.
+8. **Modes** — `transit-only` (per-tenant salt, plaintext names, peer read ACLs)
+   and `passphrase` (Argon2id KEK, `WrapRecord` carrying the freshness anchor,
+   rewrap-not-reencrypt, superseded-wrap deletion).
+9. **`nas-transfer`** — over `simple-network` `pqc`. ✅ *upstream committed and
+   tagged `pqc-protocol-v1`; `simple-backups` verified green against it (16 tests).*
+10. **`nas-peer`, built hostile from day one.** Blob store, slot ordering and CAS,
+    plaintext roster verification, retention with peer-verified superset
+    semantics, lease sweep, PoP responder, `--witness`.
 
-**M2 exits when** `uc09_hostile_peer.sh` is fully green, including the cold-start
-case.
+    > **`--hostile tamper|rollback|withhold|dedup-lie|fork|ignore-retention`
+    > ships in M1, not M2.** Revision 1 put it in M2 while arguing it was
+    > load-bearing. But the five plaintext peer record formats freeze during M1
+    > and are format-breaking to change (§7 risk). Adding hostility afterwards
+    > means those formats never feel adversarial pressure while they are still
+    > cheap to change — which is exactly when a crafted record that slips past
+    > the retention-superset comparison would be found.
+
+11. **Simulation.** Start with **three `nas-peer` processes on localhost ports** —
+    that exercises everything except network namespaces, for zero VM cost.
+    Containers only when isolation is genuinely needed:
+    `colima start --cpu 4 --memory 2 --disk 40` (revision 1 said 6 GB, which
+    over-allocates on a 16 GB box: three distroless containers running one static
+    binary each need well under 2 GB). Cross-compiling on macOS arm64 needs
+    `aarch64-unknown-linux-musl` plus a cross linker — **name the toolchain
+    (`cargo-zigbuild`) or use a multi-stage Docker builder.** "No cargo in the
+    image" is about the *runtime* image.
+
+**Exit:** the 20 M1-tagged assertions pass; fuzz targets running.
+
+## 5. M2 — adversarial detection and the deletion loop *(~2× M0)*
+
+12. **Detection** — witness publication and relay, chain walking, cold start from
+    a capability alone. The client must re-evaluate accumulated evidence on
+    **every pin change**, never on witness arrival: TLC found the arrival-only
+    version admits an undetected fork in 7 states, and "handle the event, then
+    forget it" is how anyone writes it by default.
+13. **The §16 deletion loop** — `DeleteRequest/Approval/Execution`, scope-scaled
+    quorum with the rolling-window decomposition defence, approver-device
+    cooling-off, key separation, `simple-secrets` Shamir integration. Revision 1
+    planned the *model* of this and none of the code.
+14. **Model checks** — `LeaseGC.tla`, `DeleteQuorum.tla`, each with must-fail
+    sanity checks, wired into `formal/check.sh`.
+
+**Exit:** the 28 M2-tagged assertions pass, including cold-start.
 
 ---
 
-## Engineering discipline
+## 6. Engineering discipline
 
-### RAM — 16 GB is the binding constraint
-```toml
-[profile.dev]
-debug = 1            # line tables only; full debug info is what actually hurts
-codegen-units = 16
-[profile.dev.package."*"]
-opt-level = 2        # fast deps, cheap rebuilds of our own crates
-```
-- Never run `DEEP=1 ./formal/check.sh` (3 GB, 46 s) concurrently with a build.
-- Cap `cargo -j` while the colima VM is up.
+**RAM.** `debug = 1`, `codegen-units = 16`, deps at `opt-level = 2` — already in
+`Cargo.toml`. The real lever is a concrete parallelism cap: **`cargo build -j 6`**
+while anything else is running. Never run `DEEP=1 ./formal/check.sh` (3 GB, 46 s)
+during a build.
 
-### CI — `ci.sh`, matching the sibling repos
-`cargo fmt --check` → `cargo clippy --all-targets -- -D warnings` → `cargo test`
-→ `formal/check.sh` → `tests/usecases/run.sh`.
+**CI — `ci.sh`.** fmt → clippy `-D warnings` → test → `formal/check.sh` →
+`tests/usecases/run.sh` at the current `NAS_MILESTONE`. Gates that are easy to
+lose: fails on `sorry`; fails if a TLA+ sanity check stops failing; PENDING never
+counts as passing; **`check_refuses` demands exit 2 specifically**, so a stub that
+errors on everything fails instead of passing.
 
-Gates that are easy to forget and therefore explicit:
-- **fails on `sorry`** in any Lean file;
-- **fails if a TLA+ sanity check stops failing** — a vacuous model is worse than
-  no model;
-- **PENDING acceptance assertions are reported, never counted as passing.**
+**Commits** per crate-level milestone, message carrying the acceptance delta.
+Branch `impl/m0`, merge at milestone boundaries.
 
-### Commits
-One per crate-level milestone, message carrying the acceptance matrix delta.
-Work on `impl/m0` and merge at each milestone boundary rather than committing
-directly to `main`.
-
-### Review points
-Brutal review after **each** of M0, M1 and M2 — not only at the end. Revisions
-1→2 and 4→5 both found blockers that would have been far more expensive after
-the format was written to disk.
+**Review** after each of M0, M1 and M2 — not only at the end. Four review rounds
+have now each found blockers, and every one was cheaper before the format hit disk.
 
 ---
 
-## Risks, ranked
+## 7. Risks, ranked
 
-1. **The §20.3 decision** — locks the format; everything else is downstream.
-2. **ML-DSA signature size in the lease and retention paths.** 3.3 KB per
-   signature is the constraint that shaped §3.8. Measure real record sizes at M1
-   against a realistic blob count before the format sets.
-3. **`simple-network` v1 wire break** versus `simple-backups`. Verify at M1.
-4. **FastCDC × padding interaction** on real data, unmeasured today.
-5. **The peer's storage layout is format-breaking to change.** Roster, retention
-   and lease records are all plaintext on-peer structures introduced in revision
-   5 and have never been exercised by code.
+1. **`ml-dsa = "0.0.4"`** — a pre-1.0, pre-audit RustCrypto crate is the signature
+   scheme under *every* security property here. Needs a pinning and upgrade
+   policy, and a decision about what a breaking change to it costs us.
+2. **The peer's plaintext record formats** — roster, retention, lease, wrap,
+   witness: five signed structures introduced in SPECS rev 5, unexercised by any
+   code, and format-breaking to change. Mitigated by building the hostile peer in
+   M1 (§4.10).
+3. **Test-substrate cost.** ~40 `nas test` subcommands driving topologies,
+   hostility and virtual time. Easy to underestimate; partly needed at M0.
+4. **Virtual-time retrofit.** Mitigated only if the `Clock` trait lands in M0.
+5. **BLAKE3 is a new dependency.** SPECS §3's "all primitives already exist in the
+   sibling crates" is false for it — no sibling uses it. Load-bearing and new.
+6. **Single-developer bandwidth** across 9 crates and 2 further TLA+ models.
+
+*Dropped from revision 1:* the harness defects (fixed); the `simple-network` wire
+break (committed, tagged, verified); FastCDC × padding (moot now `padding: none`
+is the default — it only bites opt-in users).
+
+---
+
+## 8. What changed in revision 2
+
+| Change | Driver |
+|---|---|
+| Done = 53 M0–M2 assertions, not 81 | 25 belonged to M3–M5; with `ci.sh` running the harness, CI would have been red from the first binary until someone disabled the gate |
+| Harness gains milestone gating, an exit-2 refusal contract, and a fixed exit check | `check_refuses` passed on *any* non-zero exit, so a stub CLI erroring on everything passed all 14 security assertions; `run.sh` checked `echo`'s status |
+| Assertions reconciled with §5.4, §2.2, §19.1 | Three claimed more than the spec guarantees — including one that the must-fail `ForkAlwaysDetected` check deliberately disproves |
+| Step 0 restated | It locks caps and the test contract, not the disk format; both directions of the comparison table were wrong |
+| §2 cross-cutting work given owners | Clock, test substrate, vault, pairing, config, observability, versioning and fuzzing had none |
+| Modes and the §16 loop given steps | 31 assertions depended on code no step built |
+| Relative sizing added | Absence of estimates is the mechanism by which a milestone hides half a project |
+| Hostile peer moves to M1 | Formats freeze in M1; adversarial pressure must arrive before they do |
+| Simulation starts as localhost processes; VM 6 GB → 2 GB; cross-toolchain named | Containers were assumed rather than justified, and over-allocated |
+| Risks reranked | `ml-dsa 0.0.4` and the plaintext record formats outrank everything revision 1 listed |

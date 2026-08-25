@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/nas-core"]
+members = ["crates/nas-core", "crates/nas-crypto"]
 
 [workspace.package]
 edition = "2021"

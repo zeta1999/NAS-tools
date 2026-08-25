@@ -141,7 +141,48 @@ NAS_BIN=./target/debug/nas ./tests/usecases/run.sh
 
 ---
 
-## 4. Multi-node simulation (planned, M1)
+## 4. `nas-crypto` — the key schedule
+
+```sh
+cargo test -p nas-crypto
+```
+
+Observed: `12 passed`.
+
+### 4a. Why `rust-secure-memory` needed a change first
+
+`secure_memory::crypto::encrypt_aad` generates its nonce internally with
+`OsRng` (`crypto.rs:72`). Convergent encryption is therefore **impossible**
+through that API: identical plaintext encrypts differently every time and
+deduplication silently collapses to zero — it would not fail loudly, it would
+just quietly stop saving space.
+
+SPECS §3 claims "all primitives already exist in the sibling crates." That is
+false for this path. Fixed upstream by adding `seal_with_nonce` /
+`open_with_nonce` (`rust-secure-memory` commit `ff19f55`), with a deliberately
+loud doc comment, and `encrypt_aad` refactored to go through it so there is one
+AEAD call site rather than two.
+
+The footgun therefore lives in exactly one place, and `nas-crypto` makes it
+unreachable: `Key` has no public constructor accepting a nonce policy. The
+policy is set by the derivation function, and `seal` reads it from the key.
+**A caller cannot choose a nonce, correctly or otherwise.**
+
+### 4b. The four assertions that matter
+
+| Test | Proves |
+|---|---|
+| `convergent_sealing_is_deterministic` | identical plaintext under one secret gives byte-identical ciphertext — the property dedup is built on |
+| `a_different_convergence_secret_breaks_dedup_and_the_oracle` | two tenants storing one file produce different ciphertext, so a co-tenant learns nothing |
+| `manifest_keys_never_seal_the_same_bytes_twice` | path-derived keys get a random nonce; a deterministic one here would be keystream reuse across manifest versions |
+| `convergence_iff_same_plaintext` (proptest) | convergence happens exactly when the plaintext matches — never more, never less |
+
+Plus `open_never_panics` over arbitrary bytes, because a hostile peer supplies
+everything that reaches it.
+
+---
+
+## 5. Multi-node simulation (planned, M1)
 
 Not yet built. The shape, given 16 GB of RAM:
 

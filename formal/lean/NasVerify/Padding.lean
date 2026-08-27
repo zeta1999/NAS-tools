@@ -171,6 +171,73 @@ theorem padLadder_deterministic (L : List Nat) (x : List Nat) :
     padLadder L x = padLadder L x := rfl
 
 
+/-! ### The reader's strict check
+
+`padLadder_length_mem` says a padded chunk's length is *a* member of the ladder.
+That is weaker than it looks, and the gap was real: nothing in it stops a writer
+padding a five-byte payload into the 256 KiB class instead of the 32 KiB one.
+The class index is then a covert channel of `log2 |ladder|` bits per chunk,
+invisible to a reader that only checks membership — and it defeats the very
+length-hiding the profile exists for, since a writer can simply choose the class
+that matches the true size range.
+
+The model could not see this because it only ever reasoned about outputs of
+`padLadder`. `unpadStrict` is the reader as `padding.rs` now implements it: it
+demands the class be the one `selectClass` would have picked, and it checks the
+fill. The two theorems below are the pair that matters — no false rejection of
+honest output, and no acceptance of any other class. -/
+
+/-- The reader: length prefix in range, class exactly as selected, fill zero. -/
+def unpadStrict (L : List Nat) (p : List Nat) : Option (List Nat) :=
+  match p with
+  | []        => none
+  | n :: rest =>
+      if n ≤ rest.length ∧ selectClass L (n + HEADER) = some (n :: rest).length
+         ∧ (rest.drop n).all (· == 0) then
+        some (rest.take n)
+      else none
+
+/-- **No false rejection.** Anything the writer produces, the strict reader
+    accepts. A check that rejected honest output would be worse than no check. -/
+theorem unpadStrict_padLadder (L : List Nat) (x p : List Nat) (h : padLadder L x = some p) :
+    unpadStrict L p = some x := by
+  simp only [padLadder, Option.map_eq_some_iff] at h
+  obtain ⟨c, hsel, hp⟩ := h
+  obtain ⟨_, hneed⟩ := selectClass_spec L (x.length + HEADER) c hsel
+  subst hp
+  -- The padded length really is the class, so the reader's class check is the
+  -- same question as `selectClass`, which is what `hsel` already answers.
+  have hk : x.length + (c - HEADER - x.length) + 1 = c := by
+    simp only [HEADER] at hneed ⊢; omega
+  show unpadStrict L (x.length :: (x ++ List.replicate (c - HEADER - x.length) 0)) = some x
+  simp only [unpadStrict]
+  rw [if_pos]
+  · simp
+  · refine ⟨by simp, ?_, by simp⟩
+    simpa [hk] using hsel
+
+/-- **The channel is closed.** For a payload whose admissible class is `c'`,
+    padding into any other class `c` is rejected — even though that output has a
+    valid ladder length, an honest length prefix and an all-zero fill, so every
+    other check passes. This is the theorem `padLadder_length_mem` could not
+    state, and the one that corresponds to `PadError::NonMinimalClass`. -/
+theorem unpadStrict_rejects_other_classes
+    (L : List Nat) (x : List Nat) (c c' : Nat)
+    (hfits : x.length + HEADER ≤ c)
+    (hsel : selectClass L (x.length + HEADER) = some c')
+    (hne : c ≠ c') :
+    unpadStrict L (padTo c x) = none := by
+  have hk : x.length + (c - HEADER - x.length) + 1 = c := by
+    simp only [HEADER] at hfits ⊢; omega
+  show unpadStrict L (x.length :: (x ++ List.replicate (c - HEADER - x.length) 0)) = none
+  simp only [unpadStrict]
+  rw [if_neg]
+  rintro ⟨-, hclass, -⟩
+  rw [hsel] at hclass
+  simp only [Option.some.injEq, List.length_cons, List.length_append,
+             List.length_replicate] at hclass
+  omega
+
 /-! ## Axiom gate
 
 `formal/check.sh` greps for the token `sorry`, which an `axiom` declaration, a
@@ -186,5 +253,7 @@ even when the word `sorry` does not. -/
 #print axioms padLadder_eq_none_iff
 #print axioms padLadder_length_mem
 #print axioms unpad_padLadder
+#print axioms unpadStrict_padLadder
+#print axioms unpadStrict_rejects_other_classes
 
 end NasTools

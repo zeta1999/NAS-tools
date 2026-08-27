@@ -423,7 +423,118 @@ red**. Fixed in the same commit; the suite's status is now checked.
 
 ---
 
-## 7. Multi-node simulation (planned, M1)
+## 7. M0 brutal review — four confirmed defects, all fixed
+
+A Fable-5 adversarial review of M0. It reproduced **four** defects. Each was
+independently re-reproduced here before being fixed, and each now has a
+regression test that fails against the old code.
+
+### 7a. `Addr::from_hex` panicked on 64-*byte* multibyte input — reachable from an untrusted peer
+
+`addr.rs` checked `s.len() != 64` (bytes) and then sliced `&s[i*2..i*2+2]`,
+which panics if an index falls inside a multibyte character.
+
+```
+$ # "a" + "é"×31 + "a"  — 64 bytes, 33 characters
+thread 'main' panicked at crates/nas-core/src/addr.rs:62:42:
+end byte index 2 is not a char boundary; it is inside 'é' (bytes 1..3)
+```
+
+**Why this was the most serious of the four.** `BlobStore::addrs()` builds this
+string from **peer-controlled** blob directory names and relies on the `Err`
+branch to skip junk — the comment there says a peer "cannot be allowed to break
+a GC sweep by dropping a file in". The panic fires before any `Result` exists,
+so a malicious peer could halt the lease sweep (SPECS §6) with one filename.
+
+Fixed by parsing the byte slice, which removes the char-boundary question
+entirely. Uppercase hex is now rejected too, so one address has one spelling.
+Added a proptest over `".*"` — there was none before, and both hand-written
+cases were ASCII, which is exactly why this survived.
+
+### 7b. `DirManifest::decode` panicked on a truncated final entry
+
+```rust
+while i + 2 < f.len() + 1 && i + 2 <= f.len() {   // both clauses are the same
+    ... f[i + 2] ...                              // needs i + 2 < f.len()
+```
+
+```
+$ # a 3-field manifest: magic, name, kind — payload missing
+thread 'main' panicked at crates/nas-store/src/tree.rs:165:28:
+index out of bounds: the len is 3 but the index is 3
+```
+
+### 7c. `DirManifest::decode` silently dropped trailing fields
+
+```
+#2: clean 79 B, tainted 99 B, decode-equal = true
+```
+
+Two distinct encodings decoded to the same manifest. `encoding::decode_fields`
+refuses trailing bytes one layer below precisely to prevent this, and `tree.rs`
+threw that guarantee away. Both 7b and 7c fixed by requiring the field count to
+be one magic plus an exact multiple of three (`TreeError::RaggedEntries`).
+
+**The proptest that should have caught them was theatre.**
+`decode_never_panics_on_junk` fed only random bytes — every one rejected at the
+magic check, never reaching the loop. It is replaced with structured malformed
+inputs: truncations of a valid encoding, and every field count from 0 to 7.
+
+### 7d. The padding covert channel was only half closed
+
+`unpad` checked that the length was *a* class. It did not check it was the
+*minimal* class:
+
+```
+#4: minimal class = 32768 B, hand-built class = 262144 B, unpad = Ok(5)
+```
+
+Every other check passes — valid ladder length, honest length prefix, all-zero
+fill — so a writer could encode ~2 bits per chunk in the class index, invisible
+to every reader. Worse, it defeats the length-hiding padding exists for: a
+writer that picks the class matching the true size range leaks exactly what was
+meant to be hidden. Fixed with `PadError::NonMinimalClass`.
+
+**The Lean model could not see it either.** `padLadder_length_mem` proves the
+length is a ladder member; nothing proved minimality, because every theorem
+quantified only over *outputs of `padLadder`*. Two theorems added:
+`unpadStrict_padLadder` (no honest output is rejected) and
+`unpadStrict_rejects_other_classes` (no other class is accepted). The general
+lesson: a model that only quantifies over well-formed inputs says nothing about
+a malicious writer.
+
+### 7e. A format decision made now because it cannot be made later
+
+The review flagged, and reasoning confirms, that POSIX filenames are arbitrary
+bytes and `to_string_lossy` destroys them: `a\xFFb` and `a\xFEb` both become
+`a\u{FFFD}b`, so the second collides with the first and the **whole tree write
+fails** — and a single such file extracts under different bytes than it went in
+with. Not reproducible on this machine (APFS rejects non-UTF-8 names with
+`EILSEQ`), but the code path is unambiguous and this is an **on-disk format**
+decision that becomes a format break once M1 freezes the layout.
+
+Entry names are now `Vec<u8>`. Both `snapshot()` helpers were also keyed on
+lossy strings — comparing mangled against mangled — so the round-trip test could
+not have detected the mangling either; both now compare raw path bytes.
+
+### 7f. What the review could not fault
+
+It actively tried and failed to break: the nonce-policy type design (a
+deterministic nonce on a non-content-derived key is inexpressible), the
+`BlobStore::put` verify-then-repair path (no TOCTOU found), the
+addr/AEAD/`pt_hash` composition against substitution and reordering, and the
+`DirSecret` scoping (a sibling's key cannot open a subtree). The chunker's
+stream/slice equivalence also held.
+
+**Net:** the core crypto composition was sound; the **parser layer** was the weak
+point. Both reachable panics were in code that untrusted bytes flow through, and
+the "never panics" proptests gave false confidence by generating inputs that
+were rejected before reaching the defective code. `cargo-fuzz` targets for every
+peer-facing parser are raised in priority in TODO.md as a result.
+
+---
+
+## 8. Multi-node simulation (planned, M1)
 
 Not yet built. The shape, given 16 GB of RAM:
 

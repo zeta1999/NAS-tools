@@ -9,8 +9,8 @@ Run `./check.sh` — it fetches `tla2tools.jar` if absent and gates everything.
 | Artefact | Tool | State |
 |---|---|---|
 | `lean/NasVerify/Transcript.lean` | Lean 4.28 | **VERIFIED** — 3 theorems, 0 admitted, axioms clean |
-| `lean/NasVerify/Padding.lean` | Lean 4.28 | **VERIFIED** — 8 theorems, 0 admitted, axioms clean. Models the *ladder*, closing the gap where `Nat` truncation hid a `usize` underflow |
-| `tlaplus/SlotConsistency.tla` | TLA+ / TLC | **MODEL-CHECKED** — MaxSeq=2: 38,709 distinct states, depth 20 (<1 s, the CI gate). MaxSeq=3: **4,699,837 distinct states from 60.1 M generated, depth 30, 46 s** (the deep gate). 4 invariants + 1 action property hold at both bounds. |
+| `lean/NasVerify/Padding.lean` | Lean 4.28 | **VERIFIED** — 10 theorems, 0 admitted, axioms clean. Models the *ladder* (closing the gap where `Nat` truncation hid a `usize` underflow) and the reader's strict check (closing the class-selection covert channel the M0 review found) |
+| `tlaplus/SlotConsistency.tla` | TLA+ / TLC | **MODEL-CHECKED** — but note it constrains §5, which is **M2** code; it is assurance about the design, not about anything shipped in M0. — MaxSeq=2: 38,709 distinct states, depth 20 (<1 s, the CI gate). MaxSeq=3: **4,699,837 distinct states from 60.1 M generated, depth 30, 46 s** (the deep gate). 4 invariants + 1 action property hold at both bounds. |
 | sanity checks | TLA+ / TLC | **3 required counterexamples found** — the model is not vacuous |
 
 ### What the model check actually caught

@@ -1,8 +1,10 @@
 # NAS-tools Status
 
-**Current state:** **M0 is done.** All four steps built, the 5 M0-tagged
-acceptance assertions pass against the real binary, and the padding measurement
-that M0 gated on is complete — it **contradicted the spec by 2-3×**. Next: M1.
+**Current state:** **M0 is done and has survived its brutal review.** All four
+steps built, the 5 M0-tagged acceptance assertions pass against the real binary,
+and the padding measurement that M0 gated on is complete — it **contradicted the
+spec by 2-3×**. The review found **four reproduced defects**, all fixed; see
+MANUAL-TESTING.md §7. Next: M1.
 
 `SPECS.md` is at **revision 5** (~1476 lines, 21 sections). It has survived one
 adversarial review (rev 1→2, 15 findings, all accepted), a round closing its own
@@ -32,6 +34,9 @@ listing; lease-based GC with deltas; **three confidentiality modes** (`e2ee`,
   truncation hid a `usize` underflow — including `padTo_underpads`, the negative
   result proving the old theorem could not have caught it. Both gates are
   verified to actually fail on a planted cheat (MANUAL-TESTING.md §1d).
+  `unpadStrict_*` was added after the M0 review: the earlier theorems quantified
+  only over *outputs of the padder*, so the model could not see a malicious
+  writer choosing a non-minimal size class.
 
 - **`formal/tlaplus/SlotConsistency.tla`** — MODEL-CHECKED. 38,709 distinct states
   at MaxSeq=2 (CI gate), 4,699,837 at MaxSeq=3 (deep gate). Its first revision
@@ -48,8 +53,10 @@ listing; lease-based GC with deltas; **three confidentiality modes** (`e2ee`,
 - **`crates/nas-store`** — FastCDC (gear table in-repo and golden-pinned, because
   it is a format constant), checked size-class padding, the blob store with
   proof-of-possession, manifests, and the object write/read pipeline.
-  **66 tests green**, including whole-tree round-trips under the per-directory
-  key chain and incremental writes.
+  **71 tests green**, including whole-tree round-trips under the per-directory
+  key chain and incremental writes. Entry names are **raw bytes**, not `String`:
+  a POSIX filename need not be UTF-8, and `to_string_lossy` collided distinct
+  names into one. That is a format decision, made before M1 freezes the layout.
 - **`crates/nas-cli`** — the `nas` binary. Exit codes are a *contract*: 0 ok,
   1 error, 2 refused by policy, **3 unimplemented**. A specified-but-unbuilt
   subcommand must never exit 2, or the harness would score unwritten code as a
@@ -96,6 +103,9 @@ confidentiality modes, `nas-transfer`, and `nas-peer` built hostile from day
 one. `ci.sh` is green end to end today: 97 Rust tests, 11 Lean theorems verified
 with a clean axiom gate, TLC green with its three sanity checks still failing as
 required, and 5 acceptance assertions actually passing.
+
+> The TLA+ model constrains SPECS §5, which is **M2** code. It is assurance
+> about the design, not about anything shipped in M0.
 
 ## Environment constraints
 

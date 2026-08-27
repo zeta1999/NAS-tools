@@ -20,12 +20,25 @@
 //!
 //! # Why unpadding validates
 //!
-//! The AEAD tag already catches tampering, so validating the zero fill looks
-//! redundant. It is not: the padding bytes are inside the authenticated blob
-//! but carry no information of their own, which makes them a covert channel a
-//! malicious *writer* could smuggle data through while every reader's
-//! signature check still passed. Rejecting non-zero fill closes it, and costs
-//! one scan of bytes already in cache.
+//! The AEAD tag already catches tampering, so validating the padding looks
+//! redundant. It is not. Everything a writer controls that a reader does not
+//! check is a channel, and padding hands a writer two of them:
+//!
+//! 1. **The fill bytes.** They sit inside the authenticated blob and carry no
+//!    information of their own, so a malicious writer can smuggle data through
+//!    them while every reader's signature check still passes. Rejecting
+//!    non-zero fill closes it for one scan of bytes already in cache.
+//! 2. **The choice of class.** This one is larger and was missed at first. A
+//!    five-byte payload fits the 32 KiB class, but nothing stopped a writer
+//!    padding it into the 256 KiB class instead — so the class index encodes
+//!    log2(ladder) bits per chunk, invisible to every reader. Worse, it defeats
+//!    the length-hiding the profile exists for: a writer that always picks the
+//!    class matching the true size range leaks exactly what padding was meant
+//!    to hide. Requiring the **minimal** class closes it.
+//!
+//! Note what these two have in common: both are attacks by a *writer* against
+//! a *reader*, which the AEAD cannot address at all — it authenticates that the
+//! writer said this, not that what they said was well-formed.
 
 use nas_core::PaddingProfile;
 use std::borrow::Cow;
@@ -62,6 +75,10 @@ pub enum PadError {
     /// Fill bytes were not all zero: a covert channel, or corruption the AEAD
     /// would not have caught because the writer authenticated it.
     DirtyFill { offset: usize },
+    /// The payload was padded into a larger class than it needed. The *choice*
+    /// of class is itself a channel, and a bigger one than the fill: see the
+    /// module docs.
+    NonMinimalClass { got: usize, minimal: usize },
 }
 
 impl std::fmt::Display for PadError {
@@ -81,10 +98,21 @@ impl std::fmt::Display for PadError {
             }
             Self::NotAClass { len } => write!(f, "padded chunk of {len} B is not a size class"),
             Self::DirtyFill { offset } => write!(f, "non-zero padding at offset {offset}"),
+            Self::NonMinimalClass { got, minimal } => {
+                write!(f, "padded to the {got} B class when {minimal} B would fit")
+            }
         }
     }
 }
 impl std::error::Error for PadError {}
+
+/// The class a payload of `len` bytes must be padded into.
+///
+/// The *only* admissible class, not merely a valid one — see the module docs.
+pub fn minimal_class(profile: PaddingProfile, len: usize) -> Option<usize> {
+    let need = len.checked_add(HEADER)?;
+    classes(profile).iter().copied().find(|&c| c >= need)
+}
 
 /// Largest plaintext a profile can frame, or `None` when the profile does not
 /// pad and so has no limit of its own.
@@ -176,6 +204,24 @@ pub fn unpad(profile: PaddingProfile, padded: &[u8]) -> Result<&[u8], PadError> 
 
     if let Some(i) = padded[end..].iter().position(|&b| b != 0) {
         return Err(PadError::DirtyFill { offset: end + i });
+    }
+    // The class must be the smallest one that fits, not merely one that does.
+    match minimal_class(profile, want) {
+        Some(m) if m == padded.len() => {}
+        Some(m) => {
+            return Err(PadError::NonMinimalClass {
+                got: padded.len(),
+                minimal: m,
+            })
+        }
+        // `want` cannot be framed at all, yet arrived inside a class: the
+        // length prefix is lying about a payload this buffer cannot hold.
+        None => {
+            return Err(PadError::LengthOverrun {
+                want,
+                have: padded.len() - HEADER,
+            })
+        }
     }
     Ok(&padded[HEADER..end])
 }
@@ -288,6 +334,47 @@ mod tests {
         let mut p = pad(P, b"short").unwrap().into_owned();
         p[..HEADER].copy_from_slice(&u32::MAX.to_le_bytes());
         assert!(matches!(unpad(P, &p), Err(PadError::LengthOverrun { .. })));
+    }
+
+    #[test]
+    fn a_covert_channel_in_the_class_choice_is_rejected() {
+        // The larger of the two writer-side channels: ~2 bits per chunk with
+        // this ladder, and a direct defeat of the length hiding that is the
+        // whole purpose of padding.
+        let payload = b"short";
+        let minimal = pad(P, payload).unwrap();
+        assert_eq!(minimal.len(), LADDER[0]);
+
+        for &bigger in &LADDER[1..] {
+            let mut hand = Vec::with_capacity(bigger);
+            hand.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+            hand.extend_from_slice(payload);
+            hand.resize(bigger, 0);
+            // Every check except minimality passes: it is a valid class, the
+            // length prefix is honest, and the fill is all zeros.
+            assert_eq!(
+                unpad(P, &hand),
+                Err(PadError::NonMinimalClass {
+                    got: bigger,
+                    minimal: LADDER[0]
+                }),
+                "class {bigger} accepted for a {} B payload",
+                payload.len()
+            );
+        }
+    }
+
+    #[test]
+    fn every_legitimately_padded_chunk_still_passes_the_strict_check() {
+        // The check must not reject the writer's own output. Boundaries first,
+        // since those are where a minimality check is most likely to be wrong.
+        for &class in LADDER.iter() {
+            for len in [0usize, 1, class - HEADER - 1, class - HEADER] {
+                let pt = vec![7u8; len];
+                let Ok(p) = pad(P, &pt) else { continue };
+                assert_eq!(unpad(P, &p).unwrap(), &pt[..], "len {len}, class {class}");
+            }
+        }
     }
 
     #[test]

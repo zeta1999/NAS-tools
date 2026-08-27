@@ -49,14 +49,27 @@ settled and the work that follows from them.
 
 ## Formal
 
-- [x] `formal/lean/NasVerify/Transcript.lean` — VERIFIED, 3 theorems, 0 `sorry`
+- [x] `formal/lean/NasVerify/Transcript.lean` — VERIFIED, 3 theorems
+- [x] `formal/lean/NasVerify/Padding.lean` — VERIFIED, 10 theorems. Models the
+      *ladder*, closing the gap where `Nat` truncation hid a `usize` underflow,
+      and (after the M0 review) the reader's strict check: `unpadStrict_padLadder`
+      proves no honest output is rejected, `unpadStrict_rejects_other_classes`
+      proves the class-selection covert channel is closed
 - [x] `formal/README.md` — what each tool is for, and what we deliberately skip
-- [ ] Fetch `tla2tools.jar` and actually model-check `SlotConsistency.tla`
-      (**currently written but unchecked — do not cite it as assurance**)
+- [x] Fetch `tla2tools.jar` and actually model-check `SlotConsistency.tla` —
+      **done**: 38,709 distinct states at MaxSeq=2 (CI gate), 4,699,837 at
+      MaxSeq=3 (deep gate), with three must-FAIL sanity checks proving the model
+      is not vacuous. Note it constrains **§5, which is M2 code** — it is
+      assurance about the design, not about anything shipped in M0.
+- [x] CI gate that fails on `sorry` in any Lean file — and a stronger one: every
+      theorem carries `#print axioms`, and the gate fails on anything outside
+      `propext` / `Classical.choice` / `Quot.sound`. Both verified to bite.
 - [ ] `LeaseGC.tla` — the write/sweep race against the young-blob grace period
 - [ ] `DeleteQuorum.tla` — quorum, approval replay, cooling-off bypass
-- [ ] CI gate that fails on `sorry` in any Lean file
-- [ ] `cargo-fuzz` targets for every parser consuming peer bytes
+- [ ] `cargo-fuzz` targets for every parser consuming peer bytes. **Raised in
+      priority by the M0 review**: both reachable panics it found were in
+      parsers, and the "never panics" proptests missed them by generating
+      inputs that were rejected before reaching the defective code.
 
 ## M0 — substrate, local only
 

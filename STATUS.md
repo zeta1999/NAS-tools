@@ -1,8 +1,8 @@
 # NAS-tools Status
 
-**Current state:** M0 substrate built. `nas-core`, `nas-crypto` and `nas-store`
-are green; the M0 padding measurement is done and **contradicted the spec**.
-Remaining for M0: `nas-cli` + the `nas test` substrate.
+**Current state:** **M0 is done.** All four steps built, the 5 M0-tagged
+acceptance assertions pass against the real binary, and the padding measurement
+that M0 gated on is complete — it **contradicted the spec by 2-3×**. Next: M1.
 
 `SPECS.md` is at **revision 5** (~1476 lines, 21 sections). It has survived one
 adversarial review (rev 1→2, 15 findings, all accepted), a round closing its own
@@ -48,8 +48,16 @@ listing; lease-based GC with deltas; **three confidentiality modes** (`e2ee`,
 - **`crates/nas-store`** — FastCDC (gear table in-repo and golden-pinned, because
   it is a format constant), checked size-class padding, the blob store with
   proof-of-possession, manifests, and the object write/read pipeline.
-  **56 tests green.**
-- **`tests/usecases/`** — 83 acceptance assertions, milestone-gated; 53 are M0–M2.
+  **66 tests green**, including whole-tree round-trips under the per-directory
+  key chain and incremental writes.
+- **`crates/nas-cli`** — the `nas` binary. Exit codes are a *contract*: 0 ok,
+  1 error, 2 refused by policy, **3 unimplemented**. A specified-but-unbuilt
+  subcommand must never exit 2, or the harness would score unwritten code as a
+  passing security control.
+- **`tests/usecases/`** — 83 acceptance assertions, milestone-gated; 53 are
+  M0–M2. **5 passing, 0 failing, 78 pending** at `NAS_MILESTONE=M0`. Verified to
+  bite: a stub that always exits 0 fails the refusal assertion, and one that
+  always exits 1 is reported BROKEN rather than refused (MANUAL-TESTING.md §6a).
 
 ## Measured, not assumed
 
@@ -65,11 +73,29 @@ listing; lease-based GC with deltas; **three confidentiality modes** (`e2ee`,
 
 See `MANUAL-TESTING.md` §5 for the commands and raw output.
 
+## Known weaknesses, stated rather than discovered later
+
+- **The vault is not a vault yet.** `nas ns create` writes `CS` and the
+  namespace root secret **unencrypted at 0600**. There is no daemon and no
+  passphrase KDF at M0; `nas-vault` is M1 step 7. Until it lands a namespace is
+  only as safe as the local disk. `--mode passphrase` exits 3 rather than
+  creating a namespace whose config claims a protection it does not have.
+- **Names are not separately encrypted.** SPECS §4.4 specifies Cryptomator-style
+  per-segment encryption; that design exists because Cryptomator maps segments
+  onto *server filenames*. Here the peer sees `blobs/<ab>/<hex>` and names live
+  inside the sealed directory manifest, so a second layer buys nothing.
+  `transit-only` — where the peer legitimately reads plaintext and names must be
+  *visible* — will need this reconsidered at M1.
+- **Symlinks are skipped**, not stored: following them lets a tree escape its
+  own root, and storing them needs a format field that does not exist.
+
 ## Not built
 
-M0 step 4 (`nas-cli` + the `nas test` substrate). `ci.sh` is green end to end
-today: 87 Rust tests, Lean verified, TLC green with its three sanity checks
-still failing as required.
+M1 in full: `nas-slots`, `nas-lease`, `nas-vault`, the two remaining
+confidentiality modes, `nas-transfer`, and `nas-peer` built hostile from day
+one. `ci.sh` is green end to end today: 97 Rust tests, 11 Lean theorems verified
+with a clean axiom gate, TLC green with its three sanity checks still failing as
+required, and 5 acceptance assertions actually passing.
 
 ## Environment constraints
 

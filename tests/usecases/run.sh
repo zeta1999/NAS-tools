@@ -4,6 +4,20 @@
 # Exit 1 on any FAIL. PENDING is reported, never counted as success.
 # NAS_MILESTONE (default M0) bounds which assertions actually execute.
 cd "$(dirname "$0")"
+
+# A private NAS_HOME per run. Without this the suite would either scribble in
+# the user's real namespace directory or fail on the second run, since
+# `ns create` refuses to overwrite an existing namespace.
+if [ -z "${NAS_HOME:-}" ]; then
+  NAS_HOME=$(mktemp -d "${TMPDIR:-/tmp}/nas-acceptance.XXXXXX")
+  export NAS_HOME
+  trap 'rm -rf "$NAS_HOME"' EXIT
+fi
+
+# The fixture is generated, not committed: it is 1.3 MB of pseudo-random bytes
+# that compress to nothing and would bloat every clone.
+[ -d fixtures/tree ] || ./fixtures/make.sh >/dev/null
+
 tp=0; tf=0; tpend=0; rc=0
 for f in uc*.sh; do
   out=$(bash "$f" 2>&1); status=$?      # capture the SCRIPT's status, not echo's

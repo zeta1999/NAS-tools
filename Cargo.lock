@@ -397,6 +397,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "nas-cli"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "nas-core",
+ "nas-crypto",
+ "nas-store",
+]
+
+[[package]]
 name = "nas-core"
 version = "0.1.0"
 dependencies = [

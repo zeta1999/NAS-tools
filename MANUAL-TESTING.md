@@ -319,7 +319,111 @@ a number.
 
 ---
 
-## 6. Multi-node simulation (planned, M1)
+## 6. `nas-cli` — the M0 acceptance assertions actually run
+
+```sh
+cargo build --release -p nas-cli
+NAS_BIN=$PWD/target/release/nas ./tests/usecases/run.sh
+```
+
+`run.sh` creates a private `NAS_HOME` per run and generates
+`fixtures/tree` if absent — 9 files, 1.3 MB, deterministic (BLAKE3-seeded via
+`openssl enc -aes-256-ctr`, so a dedup ratio measured today is the same ratio
+next month). The fixture is `.gitignore`d: it is incompressible pseudo-random
+bytes that would bloat every clone.
+
+Observed (2026-08-27):
+
+```
+UC03 — Work source code, fully end-to-end encrypted  (SPECS §19.3, default M0; running ≤M0)
+  ✓ namespace created in e2ee mode
+  ✓ round-trip is byte-identical
+  ✓ two trees sharing 90% transfer ~10% of bytes
+  ○ PENDING peer disk contains no plaintext marker      └ assertion is M1
+  ○ PENDING path segments are encrypted on the peer     └ assertion is M1
+  ○ PENDING listing resolves locally                    └ assertion is M1
+  ✓ confirmation attack succeeds WITH the secret
+  ✓ confirmation attack fails WITHOUT the secret  (refused, exit 2)
+  ○ PENDING no dedup across tenants                     └ assertion is M1
+
+use-case acceptance (≤M0): 5 passed, 0 failed, 78 pending
+```
+
+The individual commands, run directly:
+
+```
+$ nas ns create work --mode e2ee
+created work at .../nashome/work
+  mode e2ee, padding None
+  M0: secrets are stored UNENCRYPTED at 0600. nas-vault (M1) replaces this.
+
+$ nas test roundtrip work ./fixtures/tree
+roundtrip ok: 13 entries, mode E2ee, padding None, root 1e10701cf772c6da…
+
+$ nas test dedup-ratio work --shared 90 --max-transfer 15
+second tree of 8388608 B added 851168 B (10.1%), budget 15%
+
+$ nas test confirmation-attack work --with-cs
+confirmation attack SUCCEEDED with CS: 3/3 chunks located          # exit 0
+
+$ nas test confirmation-attack work --without-cs
+refused: … located 0/3 chunks — the secret is load-bearing         # exit 2
+```
+
+10.1% transfer for a 90%-shared pair is the figure SPECS §19.3 predicts.
+
+### 6a. Confirming the assertions bite
+
+An acceptance suite that has never failed is not known to test anything. Two
+stub binaries, same discipline as the TLA+ sanity checks and the Lean gates:
+
+```sh
+printf '#!/bin/sh\nexit 0\n'  > /tmp/always-ok   && chmod +x /tmp/always-ok
+printf '#!/bin/sh\nexit 1\n'  > /tmp/always-fail && chmod +x /tmp/always-fail
+NAS_BIN=/tmp/always-ok   ./tests/usecases/run.sh
+NAS_BIN=/tmp/always-fail ./tests/usecases/run.sh
+```
+
+Observed:
+
+```
+=== always succeeds ===
+  ✓ namespace created in e2ee mode
+  ✓ round-trip is byte-identical
+  ✓ two trees sharing 90% transfer ~10% of bytes
+  ✓ confirmation attack succeeds WITH the secret
+  ✗ FAIL confirmation attack fails WITHOUT the secret
+        └ it SUCCEEDED and must not
+
+=== always fails with exit 1 ===
+  ✗ FAIL namespace created in e2ee mode
+  ✗ FAIL round-trip is byte-identical
+  ✗ FAIL two trees sharing 90% transfer ~10% of bytes
+  ✗ FAIL confirmation attack succeeds WITH the secret
+  ✗ FAIL confirmation attack fails WITHOUT the secret
+        └ BROKEN, not refused: exit 1 (a refusal is exit 2)
+
+always-ok   -> exit 1
+always-fail -> exit 1
+real nas    -> exit 0
+```
+
+The second stub is the one that matters. "Any non-zero means correctly refused"
+would have scored `always-fail` as passing every security assertion in the
+suite; the exit-2 contract reports it as **BROKEN** instead. That contract is
+why `nas` exits **3** for anything specified-but-unbuilt: an unimplemented
+subcommand must never be mistaken for a working security control.
+
+### 6b. A gap in `ci.sh` that this exposed
+
+`ci.sh` ran the acceptance suite as `./tests/usecases/run.sh | tail -3` with no
+`|| fail=1`. While every assertion was PENDING that was invisible. The moment
+assertions began to run it meant **a failing acceptance test could not turn CI
+red**. Fixed in the same commit; the suite's status is now checked.
+
+---
+
+## 7. Multi-node simulation (planned, M1)
 
 Not yet built. The shape, given 16 GB of RAM:
 

@@ -1,7 +1,7 @@
 # NAS-tools TODO
 
-Honest status. M0 is three-quarters built; this tracks the design decisions that
-are settled and the work that follows from them.
+Honest status. **M0 is complete**; this tracks the design decisions that are
+settled and the work that follows from them.
 
 ## Done (design)
 
@@ -74,9 +74,17 @@ are settled and the work that follows from them.
 - [x] Per-directory key derivation (impossible to retrofit — see SPECS §15.3)
 - [x] Round-trip test: bytes in, byte-identical bytes out, every profile
 - [x] Dedup test: 54.1% recovered on a corpus of split binaries
-- [ ] Per-segment name encryption (the manifest carries `name_enc`; nothing
-      populates it until `nas-cli` has paths to encrypt)
-- [ ] `nas-cli` + the `nas test` substrate, honouring the exit-2 refusal contract
+- [x] `nas-cli` + the `nas test` substrate, honouring the exit-2 refusal contract
+- [x] The 5 M0-tagged acceptance assertions pass against the real binary
+- [ ] **Per-segment name encryption — reconsider, do not just implement.**
+      Names already live inside the sealed directory manifest and the peer never
+      sees a filename, so §4.4's Cryptomator-style second layer buys nothing in
+      `e2ee`. The case that actually needs a decision is `transit-only`, where
+      the peer legitimately reads plaintext and names must be *visible*. M1.
+- [ ] **Store symlinks.** Currently skipped: following them lets a tree escape
+      its own root, and storing them needs a manifest field that does not exist.
+- [ ] **`nas-vault` (M1 step 7) replaces the M0 plaintext vault.** `ns create`
+      writes `CS` and the namespace root secret unencrypted at 0600 today.
 
 ## M1 — the peer
 

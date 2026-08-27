@@ -98,6 +98,14 @@ settled and the work that follows from them.
       its own root, and storing them needs a manifest field that does not exist.
 - [ ] **`nas-vault` (M1 step 7) replaces the M0 plaintext vault.** `ns create`
       writes `CS` and the namespace root secret unencrypted at 0600 today.
+- [ ] **The root manifest key `rk_v` is unbuilt.** SPECS §3.1 specifies
+      per-version derivation `derive_key("nas-tools/root/v1", root_secret ‖
+      le64(seq))`; M0 uses a local `state/HEAD` file and never derives it. The
+      KDF context now exists as `context::ROOT_MANIFEST` with a doc warning it
+      apart from `NS_ROOT` — the two differ by one path segment, and using
+      `NS_ROOT` by mistake would encrypt every root version under one key. That
+      is the "may it see two plaintexts" hazard §3.1 exists to prevent. Lands
+      with `nas-slots` (M1 step 5).
 
 ## M1 — the peer
 

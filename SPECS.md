@@ -341,7 +341,7 @@ All primitives already exist in the sibling crates. Nothing new is invented.
 | Key | Derivation | Encrypts | Nonce | May it see two plaintexts? |
 |---|---|---|---|---|
 | `CS` (tenant convergence secret) | 32 B CSPRNG, vault-held, never leaves `nasd` | nothing directly | — | — |
-| `ck` (chunk key) | `BLAKE3::keyed_hash(CS, plaintext_chunk)` | exactly one plaintext, ever | deterministic: `keyed_hash(ck, "nas-tools/nonce/chunk/v1")[..24]` | **No** — content-bound by construction |
+| `ck` (chunk key) | `BLAKE3::keyed_hash(CS, padded_chunk)` — over the **padded** bytes, see §4.2.1 | exactly one plaintext, ever | deterministic: `keyed_hash(ck, "nas-tools/nonce/chunk/v1")[..24]` | **No** — content-bound by construction |
 | `dir_secret` (per directory) | `derive_key("nas-tools/dir/v1", parent_dir_secret ‖ dir_id)` | nothing directly | — | — |
 | `dk` (directory manifest key) | `derive_key("nas-tools/dir/manifest/v1", dir_secret)` | one manifest version | **random 24 B** | **Yes** → random nonce mandatory |
 | `rk_v` (root manifest key) | **per-version:** `derive_key("nas-tools/root/v1", root_secret ‖ le64(seq))` | one root version | **random 24 B**, stored with the ciphertext | **No**, given per-version derivation *and* random nonce — belt and braces |
@@ -349,6 +349,14 @@ All primitives already exist in the sibling crates. Nothing new is invented.
 | `sk_slot` | ML-DSA-65, derived from vault seed, role-separated | signs only | — | — |
 | `sk_lease` | ML-DSA-65, **distinct keypair** | signs only | — | — |
 | `sk_transport` | ML-DSA-65, owned by `simple-network` | signs only | — | — |
+
+> **Revision 6 correction.** This row previously said `keyed_hash(CS,
+> plaintext_chunk)` while §4.2.1 said `keyed_hash(CS, padded)`. The two agree
+> only when the padding profile is `none`, and §4.2.1 — the section that
+> actually specifies padding — is the one the implementation follows. The row is
+> corrected so a future reader does not "fix" the code to match the looser
+> statement and thereby give the same plaintext two different chunk keys under
+> two different profiles.
 
 **Signature domain separation — NORMATIVE.** Revision 1 specified KDF contexts but
 not signature contexts, and implied one identity for everything. Every signed

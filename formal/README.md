@@ -8,7 +8,8 @@ Run `./check.sh` — it fetches `tla2tools.jar` if absent and gates everything.
 
 | Artefact | Tool | State |
 |---|---|---|
-| `lean/NasVerify/Transcript.lean` | Lean 4.28 | **VERIFIED** — 3 theorems, 0 `sorry`, 0 warnings |
+| `lean/NasVerify/Transcript.lean` | Lean 4.28 | **VERIFIED** — 3 theorems, 0 admitted, axioms clean |
+| `lean/NasVerify/Padding.lean` | Lean 4.28 | **VERIFIED** — 8 theorems, 0 admitted, axioms clean. Models the *ladder*, closing the gap where `Nat` truncation hid a `usize` underflow |
 | `tlaplus/SlotConsistency.tla` | TLA+ / TLC | **MODEL-CHECKED** — MaxSeq=2: 38,709 distinct states, depth 20 (<1 s, the CI gate). MaxSeq=3: **4,699,837 distinct states from 60.1 M generated, depth 30, 46 s** (the deep gate). 4 invariants + 1 action property hold at both bounds. |
 | sanity checks | TLA+ / TLC | **3 required counterexamples found** — the model is not vacuous |
 

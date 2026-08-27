@@ -92,4 +92,16 @@ def unpad : List Nat → Option (List Nat)
 theorem unpad_pad (cls : Nat) (x : List Nat) : unpad (pad cls x) = some x := by
   simp [pad, unpad]
 
+
+/-! ## Axiom gate
+
+`formal/check.sh` greps for the token `sorry`, which an `axiom` declaration, a
+`native_decide`, or an `@[implemented_by]` would all sail straight past. These
+lines close that: they print what each theorem *actually* rests on, and the gate
+fails on anything outside Lean's three standard axioms. `sorryAx` appears here
+even when the word `sorry` does not. -/
+#print axioms decField_encField
+#print axioms encFields_inj
+#print axioms unpad_pad
+
 end NasTools

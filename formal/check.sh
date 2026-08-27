@@ -13,14 +13,37 @@ fail=0
 say() { printf '%-46s %s\n' "$1" "$2"; }
 
 echo "── Lean ──────────────────────────────────────────────────────────"
-if grep -rn "sorry" lean --include='*.lean' | grep -v '^\s*--'; then
+# Backticked prose is stripped first, so documentation may name `sorry` and
+# `sorryAx` without tripping the gate. This is belt-and-braces anyway: the
+# axiom check below is strictly stronger, since an admitted proof shows up as
+# `sorryAx` in `#print axioms` whether or not the token appears in the source.
+if grep -rn "sorry" lean --include='*.lean' | sed 's/`[^`]*`//g' \
+     | grep -v '^[^:]*:[0-9]*: *--' | grep -E '\bsorry'; then
   say "no-sorry gate" "FAIL — admitted proofs found"; fail=1
 else
   say "no-sorry gate" "ok"
 fi
+# Allowed axioms. Anything else -- above all `sorryAx`, which an `axiom`
+# declaration or a `native_decide` would introduce without the token `sorry`
+# ever appearing -- fails the gate.
+ALLOWED='propext|Classical.choice|Quot.sound'
 for f in lean/NasVerify/*.lean; do
-  if lean "$f" 2>&1 | grep -qE "error|sorry"; then say "$f" "FAIL"; fail=1
-  else say "$f" "verified"; fi
+  out=$(lean "$f" 2>&1)
+  if echo "$out" | grep -qE "error|sorry"; then
+    say "$f" "FAIL"; echo "$out" | head -20; fail=1; continue
+  fi
+  # Every `#print axioms` line must list only allowed axioms.
+  bad=$(echo "$out" | grep "depends on axioms" \
+        | sed -E 's/.*\[(.*)\].*/\1/' | tr ',' '\n' | tr -d ' ' \
+        | grep -vE "^($ALLOWED)$" | sort -u)
+  n=$(echo "$out" | grep -c "depends on axioms")
+  if [ -n "$bad" ]; then
+    say "$f" "FAIL — unexpected axioms: $(echo $bad | tr '\n' ' ')"; fail=1
+  elif [ "$n" -eq 0 ]; then
+    say "$f" "FAIL — no #print axioms assertions"; fail=1
+  else
+    say "$f" "verified ($n theorems, axioms clean)"
+  fi
 done
 
 echo "── TLA+ ──────────────────────────────────────────────────────────"

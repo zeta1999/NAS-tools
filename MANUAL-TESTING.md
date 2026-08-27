@@ -71,6 +71,53 @@ meaningless and `check.sh` fails the build.
 
 ---
 
+### 1d. Confirming the Lean gates bite
+
+Same discipline as the TLA+ sanity checks: a gate that has never failed is not
+known to work. Both cheats were injected as a temporary file under
+`formal/lean/NasVerify/` and removed afterwards.
+
+An `axiom` declaration — invisible to a `sorry` grep:
+
+```lean
+namespace GateTest
+axiom cheating : 1 = 2
+theorem bogus : 1 = 2 := cheating
+#print axioms bogus
+end GateTest
+```
+
+Observed (2026-08-27):
+
+```
+no-sorry gate                                  ok
+lean/NasVerify/Padding.lean                    verified (8 theorems, axioms clean)
+lean/NasVerify/Transcript.lean                 verified (3 theorems, axioms clean)
+lean/NasVerify/ZZGateTest.lean                 FAIL — unexpected axioms: GateTest.cheating
+```
+
+An admitted proof:
+
+```lean
+theorem admitted : 1 = 2 := by sorry
+```
+
+```
+lean/NasVerify/ZZGateTest.lean:2:theorem admitted : 1 = 2 := by sorry
+no-sorry gate                                  FAIL — admitted proofs found
+lean/NasVerify/ZZGateTest.lean                 FAIL
+'GateTest.admitted' depends on axioms: [sorryAx]
+```
+
+Caught twice over, which is the point: the axiom check is strictly stronger than
+the token grep, since `sorryAx` shows up whether or not the word `sorry` appears
+in the source. The token grep survives only as belt-and-braces, and now strips
+backticked prose so documentation may name `sorry` without tripping it.
+
+With both files removed the gate returns to `formal: PASS`.
+
+---
+
 ## 2. Upstream `simple-network` protocol v1
 
 ```sh

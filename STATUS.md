@@ -24,9 +24,14 @@ listing; lease-based GC with deltas; **three confidentiality modes** (`e2ee`,
 - **`../simple-network` protocol v1** — handshake transcript binding + constant-time
   pin comparison. 15 tests green, clippy clean, fmt clean. Wire-breaking by design;
   v0 peers are refused with an explicit version error rather than downgraded.
-- **`formal/lean/NasVerify/Transcript.lean`** — VERIFIED under Lean 4.28. Three
-  theorems, zero `sorry`: decoder round-trip, encoding injectivity, padding
-  reversibility.
+- **`formal/lean/NasVerify/`** — VERIFIED under Lean 4.28. **Eleven theorems**,
+  zero admitted, and an axiom gate that fails on anything outside `propext` /
+  `Classical.choice` / `Quot.sound`. `Transcript.lean`: decoder round-trip,
+  encoding injectivity, padding reversibility. `Padding.lean` models the size-
+  class **ladder**, closing the gap where the single-class model's `Nat`
+  truncation hid a `usize` underflow — including `padTo_underpads`, the negative
+  result proving the old theorem could not have caught it. Both gates are
+  verified to actually fail on a planted cheat (MANUAL-TESTING.md §1d).
 
 - **`formal/tlaplus/SlotConsistency.tla`** — MODEL-CHECKED. 38,709 distinct states
   at MaxSeq=2 (CI gate), 4,699,837 at MaxSeq=3 (deep gate). Its first revision

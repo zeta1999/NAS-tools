@@ -1,7 +1,7 @@
 # NAS-tools TODO
 
-Honest status. Nothing is implemented; this tracks the design decisions that are
-settled and the work that follows from them.
+Honest status. M0 is three-quarters built; this tracks the design decisions that
+are settled and the work that follows from them.
 
 ## Done (design)
 
@@ -60,15 +60,23 @@ settled and the work that follows from them.
 
 ## M0 — substrate, local only
 
-- [ ] `nas-core`: types, caps, manifest format, canonical encoding
-- [ ] `nas-crypto`: key schedule (§3.1) as the single source of truth for nonces
-- [ ] FastCDC + deterministic size-class padding + convergent encryption
-- [ ] Blob store, manifests, per-segment name encryption
-- [ ] **Measure padding overhead** against the real CDC distribution; retune the
-      ladder before any data is stored with it
-- [ ] Per-directory key derivation (impossible to retrofit — see SPECS §15.3)
-- [ ] Round-trip test: directory in, byte-identical directory out
-- [ ] Dedup test: two trees sharing 90% of content
+- [x] `nas-core`: types, addresses, `Clock`, manifest format discriminants,
+      canonical encoding
+- [x] `nas-crypto`: key schedule (§3.1) as the single source of truth for nonces
+- [x] FastCDC + deterministic size-class padding + convergent encryption
+- [x] Blob store, manifests, proof-of-possession, object write/read pipeline
+- [x] **Measure padding overhead** against the real CDC distribution — done, and
+      the spec's estimate was wrong by 2–3× (MANUAL-TESTING.md §5, SPECS rev 6)
+- [ ] **Retune the ladder** in light of the measurement, or record the decision
+      not to. Deferred to M2 as an open question, *not* silently dropped: the
+      premium is 56–97%, the default is `none`, so nothing is stored under a bad
+      ladder in the meantime.
+- [x] Per-directory key derivation (impossible to retrofit — see SPECS §15.3)
+- [x] Round-trip test: bytes in, byte-identical bytes out, every profile
+- [x] Dedup test: 54.1% recovered on a corpus of split binaries
+- [ ] Per-segment name encryption (the manifest carries `name_enc`; nothing
+      populates it until `nas-cli` has paths to encrypt)
+- [ ] `nas-cli` + the `nas test` substrate, honouring the exit-2 refusal contract
 
 ## M1 — the peer
 

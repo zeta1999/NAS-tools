@@ -9,6 +9,6 @@ pub mod keys;
 
 pub use context::SigContext;
 pub use keys::{
-    chunk_key, manifest_key, open, seal, ConvergenceSecret, CryptoError, DirSecret, Key, KEY_LEN,
-    NONCE_LEN,
+    chunk_key, chunk_key_from_stored, manifest_key, open, open_chunk, seal, ChunkReadKey,
+    ConvergenceSecret, CryptoError, DirSecret, Key, KEY_LEN, NONCE_LEN,
 };

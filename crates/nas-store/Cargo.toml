@@ -1,0 +1,14 @@
+[package]
+name = "nas-store"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+blake3 = { workspace = true }
+nas-core = { path = "../nas-core" }
+nas-crypto = { path = "../nas-crypto" }
+zeroize = { version = "1", features = ["zeroize_derive"] }
+
+[dev-dependencies]
+proptest = "1"

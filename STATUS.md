@@ -1,6 +1,8 @@
 # NAS-tools Status
 
-**Current state:** Design + one upstream fix landed. No NAS-tools code yet.
+**Current state:** M0 substrate built. `nas-core`, `nas-crypto` and `nas-store`
+are green; the M0 padding measurement is done and **contradicted the spec**.
+Remaining for M0: `nas-cli` + the `nas test` substrate.
 
 `SPECS.md` is at **revision 5** (~1476 lines, 21 sections). It has survived one
 adversarial review (rev 1→2, 15 findings, all accepted), a round closing its own
@@ -30,13 +32,39 @@ listing; lease-based GC with deltas; **three confidentiality modes** (`e2ee`,
   at MaxSeq=2 (CI gate), 4,699,837 at MaxSeq=3 (deep gate). Its first revision
   failed TLC in 7 states, catching three defects; see `formal/README.md`.
 - **`crates/nas-core`** — canonical encoder with proptests mirroring the Lean
-  theorems. 6 tests green.
+  theorems, plus `Addr`, the `Clock` trait and the format discriminants.
+  15 tests green.
+- **`crates/nas-crypto`** — the §3.1 key schedule. `NoncePolicy` is private and
+  `Key` has no constructor that accepts one, so a deterministic nonce on a
+  non-content-derived key is unrepresentable. `ChunkReadKey` lets a stored `ck`
+  decrypt without being able to seal — the manifest needs the round trip, and
+  making the reconstructed key *open-only* is what keeps it from becoming a
+  nonce-reuse hole. All twelve signature contexts. 16 tests green.
+- **`crates/nas-store`** — FastCDC (gear table in-repo and golden-pinned, because
+  it is a format constant), checked size-class padding, the blob store with
+  proof-of-possession, manifests, and the object write/read pipeline.
+  **56 tests green.**
 - **`tests/usecases/`** — 83 acceptance assertions, milestone-gated; 53 are M0–M2.
+
+## Measured, not assumed
+
+- **Padding overhead (M0 exit criterion).** SPECS §4.2.1 estimated 20–35%.
+  Measured on two real corpora: **+56%** on large files, **+97%** on a source
+  tree. The estimate was off by 2–3× and SPECS has been corrected (rev 6). A ×2
+  ladder costs ~1.5× on any distribution, and small files pay the 32 KiB floor
+  regardless of tuning — overhead scales with *file count*.
+- **Streaming is real.** 5.5 MiB peak RSS while writing 631 MB; 8.6 MiB across
+  12904 files. Memory tracks the chunker window, not file size.
+- **Dedup works.** 54.1% recovered on a corpus of split binaries without being
+  told the files were related; `fixed` managed only 16.2% on the same data.
+
+See `MANUAL-TESTING.md` §5 for the commands and raw output.
 
 ## Not built
 
-M0 steps 2–4 (`nas-crypto`, `nas-store`, `nas-cli` + test substrate).
-`ci.sh` is green end to end today.
+M0 step 4 (`nas-cli` + the `nas test` substrate). `ci.sh` is green end to end
+today: 87 Rust tests, Lean verified, TLC green with its three sanity checks
+still failing as required.
 
 ## Environment constraints
 

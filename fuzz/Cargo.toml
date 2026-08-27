@@ -1,0 +1,58 @@
+[package]
+name = "nas-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+# Excluded from the workspace: the fuzz crate needs nightly and a different
+# profile, and pulling it into `cargo test --workspace` would break the stable
+# build for everyone.
+[workspace]
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+nas-core = { path = "../crates/nas-core" }
+nas-crypto = { path = "../crates/nas-crypto" }
+nas-store = { path = "../crates/nas-store" }
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "decode_fields"
+path = "fuzz_targets/decode_fields.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "addr_from_hex"
+path = "fuzz_targets/addr_from_hex.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "unpad"
+path = "fuzz_targets/unpad.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "manifest_decode"
+path = "fuzz_targets/manifest_decode.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "dir_manifest_decode"
+path = "fuzz_targets/dir_manifest_decode.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "aead_open"
+path = "fuzz_targets/aead_open.rs"
+test = false
+doc = false

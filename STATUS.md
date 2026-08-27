@@ -53,7 +53,7 @@ listing; lease-based GC with deltas; **three confidentiality modes** (`e2ee`,
 - **`crates/nas-store`** — FastCDC (gear table in-repo and golden-pinned, because
   it is a format constant), checked size-class padding, the blob store with
   proof-of-possession, manifests, and the object write/read pipeline.
-  **71 tests green**, including whole-tree round-trips under the per-directory
+  **76 tests green**, including whole-tree round-trips under the per-directory
   key chain and incremental writes. Entry names are **raw bytes**, not `String`:
   a POSIX filename need not be UTF-8, and `to_string_lossy` collided distinct
   names into one. That is a format decision, made before M1 freezes the layout.
@@ -65,6 +65,22 @@ listing; lease-based GC with deltas; **three confidentiality modes** (`e2ee`,
   M0–M2. **5 passing, 0 failing, 78 pending** at `NAS_MILESTONE=M0`. Verified to
   bite: a stub that always exits 0 fails the refusal assertion, and one that
   always exits 1 is reported BROKEN rather than refused (MANUAL-TESTING.md §6a).
+
+## Fuzzing
+
+Six targets under `fuzz/`, one per parser that consumes bytes it did not write:
+`decode_fields`, `addr_from_hex`, `unpad`, `manifest_decode`,
+`dir_manifest_decode`, `aead_open`. They assert *properties* — injectivity,
+canonical re-encoding, and that attacker bytes never open — not merely absence
+of panics. ~102 M executions clean at 60 s per target.
+
+The first run found **three canonicalisation defects in 45 seconds**, in a
+function a full adversarial review had just read: a `kind` field read via
+`.first()` so any length was accepted and the surplus discarded; entries not
+required to be in sorted order; and two sibling directories permitted to share a
+`dir_id`, which gives them the same `DirSecret` and so **breaks subtree
+capability scoping** (SPECS §15.3). Not in `ci.sh` — a time-boxed fuzz run is
+not a pass/fail gate. Run `./fuzz/run.sh` before closing a milestone.
 
 ## Measured, not assumed
 

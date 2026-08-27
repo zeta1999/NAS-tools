@@ -28,23 +28,36 @@ fn refuse(msg: impl std::fmt::Display) -> i32 {
 }
 
 /// Relative path → contents, for exact tree comparison.
-fn snapshot(root: &Path) -> std::io::Result<BTreeMap<String, Vec<u8>>> {
-    fn walk(base: &Path, dir: &Path, out: &mut BTreeMap<String, Vec<u8>>) -> std::io::Result<()> {
+///
+/// Keyed on **raw path bytes**, not on a lossy `String`: a POSIX filename need
+/// not be UTF-8, and comparing two lossily-stringified snapshots would compare
+/// mangled against mangled and report a byte-identical round trip that was not.
+fn snapshot(root: &Path) -> std::io::Result<BTreeMap<Vec<u8>, Vec<u8>>> {
+    fn rel_bytes(base: &Path, p: &Path) -> Vec<u8> {
+        let r = p.strip_prefix(base).unwrap_or(p);
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            r.as_os_str().as_bytes().to_vec()
+        }
+        #[cfg(not(unix))]
+        {
+            r.to_string_lossy().into_owned().into_bytes()
+        }
+    }
+    fn walk(base: &Path, dir: &Path, out: &mut BTreeMap<Vec<u8>, Vec<u8>>) -> std::io::Result<()> {
         let mut es: Vec<_> = fs::read_dir(dir)?.collect::<Result<_, _>>()?;
         es.sort_by_key(|e| e.file_name());
         for e in es {
             let p = e.path();
-            let rel = p
-                .strip_prefix(base)
-                .unwrap_or(&p)
-                .to_string_lossy()
-                .into_owned();
+            let mut rel = rel_bytes(base, &p);
             let ft = e.file_type()?;
             if ft.is_symlink() {
                 continue;
             }
             if ft.is_dir() {
-                out.insert(format!("{rel}/"), Vec::new());
+                rel.push(b'/');
+                out.insert(rel, Vec::new());
                 walk(base, &p, out)?;
             } else {
                 out.insert(rel, fs::read(&p)?);
@@ -127,12 +140,23 @@ pub fn roundtrip(ns: &str, src: &str) -> i32 {
     let _ = fs::remove_dir_all(&out);
 
     if a != b {
-        let missing: Vec<_> = a.keys().filter(|k| !b.contains_key(*k)).take(5).collect();
-        let extra: Vec<_> = b.keys().filter(|k| !a.contains_key(*k)).take(5).collect();
+        let show = |k: &Vec<u8>| String::from_utf8_lossy(k).into_owned();
+        let missing: Vec<_> = a
+            .keys()
+            .filter(|k| !b.contains_key(*k))
+            .take(5)
+            .map(show)
+            .collect();
+        let extra: Vec<_> = b
+            .keys()
+            .filter(|k| !a.contains_key(*k))
+            .take(5)
+            .map(show)
+            .collect();
         let differing: Vec<_> = a
             .iter()
             .filter(|(k, v)| b.get(*k).is_some_and(|w| w != *v))
-            .map(|(k, _)| k)
+            .map(|(k, _)| show(k))
             .take(5)
             .collect();
         return err(format!(

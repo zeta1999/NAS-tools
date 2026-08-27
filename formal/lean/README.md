@@ -39,6 +39,23 @@ implementation actually does.
 | `padLadder_length_mem` | a successfully padded chunk's length is a member of the ladder | **confidentiality**: a non-class length leaks the size padding exists to hide. Enforced on the read path by `PadError::NotAClass` |
 | `unpad_padLadder` | reversibility survives the added partiality | data recoverability |
 | `padLadder_deterministic` | padding is a function | convergent dedup — a random fill would silently destroy it (SPECS §4.2.1) |
+| `unpadStrict_padLadder` | the strict reader accepts every honest output | a check that rejected valid data would be worse than no check |
+| `unpadStrict_rejects_other_classes` | **any** class but the selected one is rejected | the class-selection covert channel, ~2 bits per chunk — see below |
+
+### The gap the M0 review found in this file
+
+`padLadder_length_mem` proves a padded chunk's length is *a* member of the
+ladder. That is weaker than it looks: nothing in it stops a writer padding a
+five-byte payload into the 256 KiB class instead of the 32 KiB one. The class
+index is then a covert channel invisible to a reader that only checks
+membership — and it defeats the length-hiding the profile exists for, since a
+writer can simply pick the class matching the true size range.
+
+The model could not see this because every theorem reasoned only about *outputs
+of `padLadder`*. `unpadStrict` models the reader as `padding.rs` now implements
+it, and the two theorems above are the pair that matters: no false rejection,
+and no acceptance of any other class. The lesson generalises — a model that only
+quantifies over well-formed inputs cannot say anything about a malicious writer.
 
 ## Axiom gate
 

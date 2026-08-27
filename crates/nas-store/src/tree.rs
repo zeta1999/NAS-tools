@@ -27,6 +27,23 @@
 //! `transit-only` is the case that will need this reconsidered, since there the
 //! peer legitimately reads plaintext and names must be *visible*. That is an M1
 //! concern and is recorded in TODO.md rather than guessed at here.
+//!
+//! # Names are raw bytes, not `String`
+//!
+//! A POSIX filename is an arbitrary byte sequence that is not required to be
+//! UTF-8. Keying entries by `String` via `to_string_lossy` looked harmless on
+//! macOS, where the filesystem rejects invalid sequences — and is silently
+//! destructive on Linux, where it is not:
+//!
+//! * two distinct legal names (`a\xFFb`, `a\xFEb`) both become `a\u{FFFD}b`,
+//!   so the second collides with the first and the **whole tree write fails**;
+//! * a single such file is extracted under a *different* byte sequence, so the
+//!   round trip is not byte-identical — and a test that compares two lossily
+//!   stringified snapshots compares mangled to mangled and sees nothing.
+//!
+//! Entry names are therefore `Vec<u8>`. This is a **format** decision, not an
+//! implementation one: it has to be right before the on-disk layout freezes at
+//! M1, because changing the name representation afterwards is a format break.
 
 use crate::blobs::{BlobStore, StoreError};
 use crate::chunker::ChunkerConfig;
@@ -65,6 +82,11 @@ pub enum TreeError {
     DuplicateName {
         name: String,
     },
+    /// The field count is not one magic plus a whole number of 3-field entries.
+    /// Rejecting this is what keeps the encoding injective at the tail.
+    RaggedEntries {
+        fields: usize,
+    },
 }
 
 impl std::fmt::Display for TreeError {
@@ -80,6 +102,9 @@ impl std::fmt::Display for TreeError {
             Self::BadEntry { value } => write!(f, "unknown entry kind {value}"),
             Self::UnsafeName { name } => write!(f, "refusing unsafe path component {name:?}"),
             Self::DuplicateName { name } => write!(f, "duplicate entry {name:?}"),
+            Self::RaggedEntries { fields } => {
+                write!(f, "{fields} entry fields is not a multiple of 3")
+            }
         }
     }
 }
@@ -109,23 +134,53 @@ pub struct DirManifest {
     /// Sorted by name, so an unchanged directory encodes to identical bytes and
     /// re-uploading it is a no-op. A `HashMap` here would make the encoding
     /// depend on iteration order and quietly break that.
-    pub entries: BTreeMap<String, Entry>,
+    ///
+    /// Keys are raw bytes: see the module docs on why `String` was wrong.
+    pub entries: BTreeMap<Vec<u8>, Entry>,
 }
 
 /// Reject anything that is not a single, ordinary path component.
-fn safe_name(name: &str) -> Result<(), TreeError> {
+///
+/// Operates on bytes, since that is what a filename is. A backslash is refused
+/// as well as `/`, so a manifest written on one platform cannot express a
+/// traversal that only bites on another.
+fn safe_name(name: &[u8]) -> Result<(), TreeError> {
     let bad = name.is_empty()
-        || name == "."
-        || name == ".."
-        || name.contains('/')
-        || name.contains('\\')
-        || name.contains('\0');
+        || name == b"."
+        || name == b".."
+        || name.contains(&b'/')
+        || name.contains(&b'\\')
+        || name.contains(&0);
     if bad {
         return Err(TreeError::UnsafeName {
-            name: name.to_string(),
+            name: String::from_utf8_lossy(name).into_owned(),
         });
     }
     Ok(())
+}
+
+/// A filename as bytes, on platforms where that is what a filename is.
+#[cfg(unix)]
+fn name_bytes(n: &std::ffi::OsStr) -> Vec<u8> {
+    use std::os::unix::ffi::OsStrExt;
+    n.as_bytes().to_vec()
+}
+
+#[cfg(not(unix))]
+fn name_bytes(n: &std::ffi::OsStr) -> Vec<u8> {
+    n.to_string_lossy().into_owned().into_bytes()
+}
+
+/// The inverse of [`name_bytes`].
+#[cfg(unix)]
+fn name_os(b: &[u8]) -> std::ffi::OsString {
+    use std::os::unix::ffi::OsStringExt;
+    std::ffi::OsString::from_vec(b.to_vec())
+}
+
+#[cfg(not(unix))]
+fn name_os(b: &[u8]) -> std::ffi::OsString {
+    std::ffi::OsString::from(String::from_utf8_lossy(b).into_owned())
 }
 
 impl DirManifest {
@@ -133,7 +188,7 @@ impl DirManifest {
         let mut fields: Vec<Vec<u8>> = vec![DIR_MAGIC.to_vec()];
         for (name, e) in &self.entries {
             safe_name(name)?;
-            fields.push(name.as_bytes().to_vec());
+            fields.push(name.clone());
             match e {
                 Entry::File(m) => {
                     fields.push(vec![0]);
@@ -156,10 +211,24 @@ impl DirManifest {
         if f.first() != Some(&&DIR_MAGIC[..]) {
             return Err(TreeError::BadMagic);
         }
+        // Three fields per entry, and the count must come out exact.
+        //
+        // The previous bound was `i + 2 < f.len() + 1 && i + 2 <= f.len()`, in
+        // which both clauses reduce to `i + 2 <= f.len()` while the body indexes
+        // `f[i + 2]` — so a field count that is a multiple of three (a truncated
+        // final entry) read one past the end and **panicked**. And because the
+        // loop simply stopped when a partial triple remained, trailing fields
+        // were silently dropped: two different encodings decoded to the same
+        // manifest, which is precisely the tail-injectivity that
+        // `encoding::decode_fields` refuses to allow one layer below.
+        let body = f.len() - 1;
+        if !body.is_multiple_of(3) {
+            return Err(TreeError::RaggedEntries { fields: body });
+        }
         let mut entries = BTreeMap::new();
         let mut i = 1;
-        while i + 2 < f.len() + 1 && i + 2 <= f.len() {
-            let name = String::from_utf8_lossy(f[i]).into_owned();
+        while i + 2 < f.len() {
+            let name = f[i].to_vec();
             safe_name(&name)?;
             let kind = f[i + 1];
             let payload = f[i + 2];
@@ -180,10 +249,13 @@ impl DirManifest {
                 None => return Err(TreeError::BadEntry { value: 255 }),
             };
             if entries.insert(name.clone(), e).is_some() {
-                return Err(TreeError::DuplicateName { name });
+                return Err(TreeError::DuplicateName {
+                    name: String::from_utf8_lossy(&name).into_owned(),
+                });
             }
             i += 3;
         }
+        debug_assert_eq!(i, f.len(), "the multiple-of-three check guarantees this");
         Ok(Self { entries })
     }
 }
@@ -242,10 +314,10 @@ impl<'a> TreeStore<'a> {
         let mut dm = DirManifest::default();
         let w = ObjectWriter::new(self.blobs, self.cs, self.profile, self.cfg)?;
 
-        let mut names: Vec<(String, PathBuf, bool)> = Vec::new();
+        let mut names: Vec<(Vec<u8>, PathBuf, bool)> = Vec::new();
         for e in fs::read_dir(src)? {
             let e = e?;
-            let name = e.file_name().to_string_lossy().into_owned();
+            let name = name_bytes(&e.file_name());
             safe_name(&name)?;
             let ft = e.file_type()?;
             // Symlinks are skipped, not followed: following them would let a
@@ -260,7 +332,7 @@ impl<'a> TreeStore<'a> {
 
         for (name, path, is_dir) in names {
             if is_dir {
-                let dir_id = name.as_bytes().to_vec();
+                let dir_id = name.clone();
                 let child = dir.child(&dir_id);
                 let prev_child = old.as_ref().and_then(|o| match o.entries.get(&name) {
                     Some(Entry::Dir { addr, .. }) => Some(*addr),
@@ -304,12 +376,14 @@ impl<'a> TreeStore<'a> {
         fs::create_dir_all(dst)?;
         for (name, e) in &dm.entries {
             safe_name(name)?;
-            let out = dst.join(name);
+            let out = dst.join(name_os(name));
             // Belt and braces: even with safe_name above, refuse to write
             // outside the destination. The check is cheap and the failure it
             // guards against is arbitrary file overwrite.
             if out.components().any(|c| matches!(c, Component::ParentDir)) {
-                return Err(TreeError::UnsafeName { name: name.clone() });
+                return Err(TreeError::UnsafeName {
+                    name: String::from_utf8_lossy(name).into_owned(),
+                });
             }
             match e {
                 Entry::File(m) => {
@@ -365,16 +439,34 @@ mod tests {
     }
 
     /// Every relative path and its bytes, so two trees can be compared exactly.
-    fn snapshot(root: &Path) -> BTreeMap<String, Vec<u8>> {
+    ///
+    /// Paths are keyed on **raw bytes**. Keying on `to_string_lossy` compares a
+    /// mangled snapshot against a mangled snapshot, so a name that failed to
+    /// survive the round trip would look identical on both sides — the test
+    /// would pass while the data was wrong.
+    fn snapshot(root: &Path) -> BTreeMap<Vec<u8>, Vec<u8>> {
+        fn rel_bytes(base: &Path, p: &Path) -> Vec<u8> {
+            let r = p.strip_prefix(base).unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::ffi::OsStrExt;
+                r.as_os_str().as_bytes().to_vec()
+            }
+            #[cfg(not(unix))]
+            {
+                r.to_string_lossy().into_owned().into_bytes()
+            }
+        }
         let mut out = BTreeMap::new();
-        fn walk(base: &Path, dir: &Path, out: &mut BTreeMap<String, Vec<u8>>) {
+        fn walk(base: &Path, dir: &Path, out: &mut BTreeMap<Vec<u8>, Vec<u8>>) {
             let mut es: Vec<_> = fs::read_dir(dir).unwrap().map(|e| e.unwrap()).collect();
             es.sort_by_key(|e| e.file_name());
             for e in es {
                 let p = e.path();
-                let rel = p.strip_prefix(base).unwrap().to_string_lossy().into_owned();
+                let mut rel = rel_bytes(base, &p);
                 if e.file_type().unwrap().is_dir() {
-                    out.insert(format!("{rel}/"), Vec::new());
+                    rel.push(b'/');
+                    out.insert(rel, Vec::new());
                     walk(base, &p, out);
                 } else {
                     out.insert(rel, fs::read(&p).unwrap());
@@ -518,7 +610,7 @@ mod tests {
         let Entry::Dir {
             addr: src_addr,
             dir_id,
-        } = &dm.entries["src"]
+        } = &dm.entries[&b"src"[..]]
         else {
             panic!("src should be a directory");
         };
@@ -593,11 +685,103 @@ mod tests {
         assert!(matches!(dm.encode(), Err(TreeError::UnsafeName { .. })));
     }
 
+    /// A valid manifest to mutate in the tests below.
+    fn sample_dm() -> DirManifest {
+        let mut dm = DirManifest::default();
+        dm.entries.insert(
+            b"a.txt".to_vec(),
+            Entry::File(Manifest::new(
+                Kind::File,
+                nas_core::KeyScheme::Convergent,
+                PaddingProfile::None,
+            )),
+        );
+        dm
+    }
+
     #[test]
-    fn decode_never_panics_on_junk() {
+    fn a_truncated_final_entry_is_an_error_not_a_panic() {
+        // The exact shape that panicked: a field count that is a multiple of
+        // three, so the old bound entered the loop and read one past the end.
+        // The previous proptest fed only random bytes, every one of which was
+        // rejected at the magic check and never reached the loop at all --
+        // which is why it passed while this bug was live.
+        let three = nas_core::encode_fields(&[&DIR_MAGIC[..], b"name", &[0u8]]).unwrap();
+        assert!(matches!(
+            DirManifest::decode(&three),
+            Err(TreeError::RaggedEntries { fields: 2 })
+        ));
+        // And the other partial shape.
+        let two = nas_core::encode_fields(&[&DIR_MAGIC[..], b"name"]).unwrap();
+        assert!(matches!(
+            DirManifest::decode(&two),
+            Err(TreeError::RaggedEntries { fields: 1 })
+        ));
+    }
+
+    #[test]
+    fn trailing_fields_are_rejected_not_silently_dropped() {
+        // Tail injectivity. `encoding::decode_fields` refuses trailing bytes one
+        // layer below; dropping them here threw that guarantee away, so two
+        // distinct encodings decoded to the same manifest.
+        let dm = sample_dm();
+        let clean = dm.encode().unwrap();
+        let mut tainted = clean.clone();
+        tainted.extend_from_slice(&nas_core::encode_fields(&[b"TRAILING"]).unwrap());
+
+        assert_eq!(DirManifest::decode(&clean).unwrap(), dm);
+        assert!(
+            DirManifest::decode(&tainted).is_err(),
+            "a longer encoding decoded to the same manifest"
+        );
+    }
+
+    #[test]
+    fn a_name_that_is_not_utf8_survives_the_round_trip() {
+        // POSIX filenames are arbitrary bytes. Keying on String via
+        // to_string_lossy mapped every invalid sequence onto U+FFFD, so two
+        // distinct names collided into one and a stored file came back under
+        // different bytes than it went in with.
+        let mut dm = DirManifest::default();
+        for raw in [&b"a\xFFb"[..], &b"a\xFEb"[..], "naïve".as_bytes()] {
+            dm.entries.insert(
+                raw.to_vec(),
+                Entry::File(Manifest::new(
+                    Kind::File,
+                    nas_core::KeyScheme::Convergent,
+                    PaddingProfile::None,
+                )),
+            );
+        }
+        assert_eq!(
+            dm.entries.len(),
+            3,
+            "two distinct byte names collapsed into one"
+        );
+        let back = DirManifest::decode(&dm.encode().unwrap()).unwrap();
+        assert_eq!(back, dm);
+        assert!(back.entries.contains_key(&b"a\xFFb"[..]));
+        assert!(back.entries.contains_key(&b"a\xFEb"[..]));
+    }
+
+    #[test]
+    fn decode_never_panics_on_junk_or_on_structured_garbage() {
         for n in [0usize, 1, 4, 5, 40, 200] {
             let _ = DirManifest::decode(&corpus(n, 7));
         }
         let _ = DirManifest::decode(&[]);
+
+        // Structured inputs that reach past the magic check -- the ones the
+        // old proptest could never generate.
+        let valid = sample_dm().encode().unwrap();
+        for cut in 0..valid.len().min(120) {
+            let _ = DirManifest::decode(&valid[..cut]);
+        }
+        for n in 0..8usize {
+            let fields: Vec<&[u8]> = std::iter::once(&DIR_MAGIC[..])
+                .chain(std::iter::repeat_n(&b"x"[..], n))
+                .collect();
+            let _ = DirManifest::decode(&nas_core::encode_fields(&fields).unwrap());
+        }
     }
 }

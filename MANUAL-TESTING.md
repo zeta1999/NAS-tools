@@ -534,7 +534,92 @@ peer-facing parser are raised in priority in TODO.md as a result.
 
 ---
 
-## 8. Multi-node simulation (planned, M1)
+## 8. Fuzzing — and the defect it found that the review did not
+
+Six targets, one per parser that consumes bytes it did not write.
+
+```sh
+./fuzz/run.sh              # 60 s per target
+SECS=900 ./fuzz/run.sh     # before closing a milestone
+```
+
+Needs nightly (libFuzzer) and `cargo-fuzz`. Deliberately **not** wired into
+`ci.sh`: a time-boxed fuzz run is not a pass/fail gate, and making one into a
+gate trades a real signal for a flaky one.
+
+Observed (2026-08-27), after the fixes below:
+
+```
+── decode_fields (60 s) ──        ok — 21237979 runs, cov: 74
+── addr_from_hex (60 s) ──        ok — 46988046 runs, cov: 57
+── unpad (60 s) ──                ok — 232634 runs, cov: 55
+── manifest_decode (60 s) ──      ok — 14449259 runs, cov: 112
+── dir_manifest_decode (60 s) ──  ok — 13443122 runs, cov: 247
+── aead_open (60 s) ──            ok — 5663936 runs, cov: 475
+fuzz: PASS
+```
+
+The targets assert properties, not merely absence of panics: `decode_fields`
+checks injectivity (the Lean theorem `encFields_inj`, checked against the
+implementation), `unpad` checks that anything accepted re-pads to the same
+bytes, `dir_manifest_decode` checks that anything accepted re-encodes
+identically, and `aead_open` asserts that attacker bytes never open.
+
+### 8a. Three canonicalisation defects, found in 45 seconds
+
+The very first run crashed `dir_manifest_decode` — on the **canonical-form**
+assertion, not on a panic. Analysis of the artifact:
+
+```
+n=3, framed fields:
+  [0] len=4  head=[78, 65, 83, 68]        # NASD
+  [1] len=35 head=[238, 78, 154, 154, …]  # name
+  [2] len=35 head=[1, 91, 91, 91, 91, …]  # kind — THIRTY-FIVE bytes
+  [3] len=35 head=[91, 91, 91, 91, 91, …] # payload
+decoded 1 entries
+re-encoded 91 B vs framed 125 B, equal=false
+```
+
+The decoder read `kind.first()`. A 35-byte kind field whose first byte was `1`
+was accepted and **34 bytes of attacker data were silently discarded** — an
+unbounded covert channel inside a sealed manifest. This survived a full
+adversarial human review of the same function; the fuzzer found it in 45 s.
+
+Investigating it surfaced two more of the same class:
+
+| Defect | Channel |
+|---|---|
+| `kind` read as `.first()`, any length accepted | unbounded |
+| entries not required to be in ascending name order — the `BTreeMap` sorted on the way in, `encode` re-sorted on the way out, so a permuted encoding decoded identically | log2(n!) bits |
+| two sibling directories permitted to share a `dir_id` | breaks subtree capability scoping (SPECS §15.3): the same `DirSecret`, so a capability for one subtree opens the other |
+
+All three are now `TreeError::NonCanonical`, along with an empty `dir_id` (the
+encoder sets `dir_id` from the entry name and `safe_name` forbids an empty
+name, so it can never emit one).
+
+**The rule these enforce, stated once:** *the decoder must reject anything the
+encoder would not emit.* Every degree of freedom a decoder tolerates and an
+encoder never uses is a covert channel, invisible to every reader, and a second
+byte string that means the same thing. It is the same rule as
+`PadError::NonMinimalClass` and as the trailing-field rejection — three
+instances of one bug, in three different parsers.
+
+The sibling `dir_id` case is the one with teeth: it is not merely a channel but
+a **capability-scoping break**, and it was reachable by a semi-trusted writer
+(SPECS §3.3) against a reader holding a subtree capability.
+
+### 8b. What this says about the review
+
+The human review was good — it found four real defects including a
+peer-reachable panic. It read this exact function and did not see the `kind`
+field. Fuzzing and review are not substitutes: review found the *reachability*
+argument for the `Addr::from_hex` panic (that `BlobStore::addrs` feeds it
+peer-controlled names), which no fuzzer would have told me. Fuzzing found the
+input a reviewer's eye slid over.
+
+---
+
+## 9. Multi-node simulation (planned, M1)
 
 Not yet built. The shape, given 16 GB of RAM:
 

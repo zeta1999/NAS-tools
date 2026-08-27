@@ -66,10 +66,14 @@ settled and the work that follows from them.
       `propext` / `Classical.choice` / `Quot.sound`. Both verified to bite.
 - [ ] `LeaseGC.tla` — the write/sweep race against the young-blob grace period
 - [ ] `DeleteQuorum.tla` — quorum, approval replay, cooling-off bypass
-- [ ] `cargo-fuzz` targets for every parser consuming peer bytes. **Raised in
-      priority by the M0 review**: both reachable panics it found were in
-      parsers, and the "never panics" proptests missed them by generating
-      inputs that were rejected before reaching the defective code.
+- [x] `cargo-fuzz` targets for every parser consuming peer bytes — **six**
+      shipped (`fuzz/run.sh`), asserting properties rather than merely absence
+      of panics. Found three canonicalisation defects in 45 seconds that the
+      adversarial human review of the same function missed, one of them a
+      capability-scoping break (MANUAL-TESTING.md §8a).
+- [ ] Add a fuzz target per peer-facing record format as M1 defines them — the
+      five plaintext peer records are format-breaking to change once written
+      (SPECS §20), so they must be fuzzed *while* they are still cheap to fix.
 
 ## M0 — substrate, local only
 

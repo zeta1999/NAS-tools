@@ -51,7 +51,7 @@ use crate::manifest::{Kind, Manifest, ManifestError};
 use crate::object::{read_object, ObjectError, ObjectWriter};
 use nas_core::{decode_fields, encode_fields, Addr, PaddingProfile, ADDR_LEN};
 use nas_crypto::{manifest_key, open, seal, ConvergenceSecret, DirSecret};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 
@@ -87,6 +87,15 @@ pub enum TreeError {
     RaggedEntries {
         fields: usize,
     },
+    /// Well-formed, but not something `encode` would ever emit.
+    ///
+    /// The rule this enforces: **the decoder must reject anything the encoder
+    /// would not produce.** Every degree of freedom a decoder tolerates and an
+    /// encoder never uses is a covert channel, invisible to every reader, and a
+    /// second byte string that means the same thing.
+    NonCanonical {
+        reason: &'static str,
+    },
 }
 
 impl std::fmt::Display for TreeError {
@@ -105,6 +114,7 @@ impl std::fmt::Display for TreeError {
             Self::RaggedEntries { fields } => {
                 write!(f, "{fields} entry fields is not a multiple of 3")
             }
+            Self::NonCanonical { reason } => write!(f, "non-canonical manifest: {reason}"),
         }
     }
 }
@@ -226,27 +236,74 @@ impl DirManifest {
             return Err(TreeError::RaggedEntries { fields: body });
         }
         let mut entries = BTreeMap::new();
+        let mut dir_ids: BTreeSet<Vec<u8>> = BTreeSet::new();
+        let mut prev: Option<&[u8]> = None;
         let mut i = 1;
         while i + 2 < f.len() {
             let name = f[i].to_vec();
             safe_name(&name)?;
+
+            // Entries are emitted in ascending name order, so anything else is
+            // not something `encode` could have produced. Without this the
+            // BTreeMap quietly sorts on the way in and re-sorts on the way out,
+            // so a permuted encoding decodes to an identical manifest --
+            // log2(n!) bits of covert channel, and a second way for two byte
+            // strings to mean the same thing.
+            if let Some(p) = prev {
+                if f[i] <= p {
+                    return Err(TreeError::NonCanonical {
+                        reason: "entries are not in ascending name order",
+                    });
+                }
+            }
+            prev = Some(f[i]);
+
+            // The kind field is one byte. Reading only `kind.first()` accepted
+            // a field of any length and silently discarded the rest -- an
+            // unbounded covert channel that survived a manual review and was
+            // found by the fuzzer in 45 seconds.
             let kind = f[i + 1];
+            if kind.len() != 1 {
+                return Err(TreeError::NonCanonical {
+                    reason: "kind field is not one byte",
+                });
+            }
             let payload = f[i + 2];
-            let e = match kind.first() {
-                Some(0) => Entry::File(Manifest::decode(payload)?),
-                Some(1) => {
+            let e = match kind[0] {
+                0 => Entry::File(Manifest::decode(payload)?),
+                1 => {
                     if payload.len() < ADDR_LEN {
                         return Err(TreeError::BadEntry { value: 1 });
                     }
                     let mut a = [0u8; ADDR_LEN];
                     a.copy_from_slice(&payload[..ADDR_LEN]);
+                    let dir_id = payload[ADDR_LEN..].to_vec();
+                    // The encoder sets `dir_id` from the entry name, and
+                    // `safe_name` forbids an empty name, so an empty dir_id is
+                    // not something `encode` can produce.
+                    if dir_id.is_empty() {
+                        return Err(TreeError::NonCanonical {
+                            reason: "empty dir_id",
+                        });
+                    }
+
+                    // Two siblings sharing a `dir_id` derive the same
+                    // `DirSecret`, so a capability scoped to one subtree would
+                    // open the other -- the scoping SPECS §15.3 says
+                    // per-directory keys exist to provide. Siblings are where
+                    // it matters: the chain mixes in the parent, so the same
+                    // dir_id under different parents is already distinct.
+                    if !dir_ids.insert(dir_id.clone()) {
+                        return Err(TreeError::NonCanonical {
+                            reason: "two sibling directories share a dir_id",
+                        });
+                    }
                     Entry::Dir {
                         addr: Addr::from_bytes(a),
-                        dir_id: payload[ADDR_LEN..].to_vec(),
+                        dir_id,
                     }
                 }
-                Some(v) => return Err(TreeError::BadEntry { value: *v }),
-                None => return Err(TreeError::BadEntry { value: 255 }),
+                v => return Err(TreeError::BadEntry { value: v }),
             };
             if entries.insert(name.clone(), e).is_some() {
                 return Err(TreeError::DuplicateName {
@@ -762,6 +819,107 @@ mod tests {
         assert_eq!(back, dm);
         assert!(back.entries.contains_key(&b"a\xFFb"[..]));
         assert!(back.entries.contains_key(&b"a\xFEb"[..]));
+    }
+
+    #[test]
+    fn a_kind_field_longer_than_one_byte_is_rejected() {
+        // Found by the fuzzer in 45 seconds, after a manual review missed it.
+        // `kind.first()` accepted a field of ANY length and discarded the rest,
+        // so 34 bytes of attacker data rode along invisibly and re-encoding
+        // silently dropped them.
+        let framed = nas_core::encode_fields(&[
+            &DIR_MAGIC[..],
+            b"name",
+            &[1u8, 0xDE, 0xAD, 0xBE, 0xEF], // kind 1, plus smuggled bytes
+            &{
+                let mut p = vec![0u8; ADDR_LEN];
+                p.extend_from_slice(b"id");
+                p
+            },
+        ])
+        .unwrap();
+        assert!(matches!(
+            DirManifest::decode(&framed),
+            Err(TreeError::NonCanonical { .. })
+        ));
+    }
+
+    #[test]
+    fn entries_out_of_order_are_rejected() {
+        // The BTreeMap sorted on the way in and `encode` re-sorted on the way
+        // out, so a permuted encoding decoded to an identical manifest --
+        // log2(n!) bits of covert channel, and a second byte string meaning the
+        // same thing.
+        let entry = |seed: u8, id: &[u8]| {
+            let mut p = vec![seed; ADDR_LEN];
+            p.extend_from_slice(id);
+            p
+        };
+        let mk = |names: [&[u8]; 2]| {
+            let (p0, p1) = (entry(7, b"id-one"), entry(8, b"id-two"));
+            nas_core::encode_fields(&[&DIR_MAGIC[..], names[0], &[1u8], &p0, names[1], &[1u8], &p1])
+                .unwrap()
+        };
+        assert!(DirManifest::decode(&mk([b"a", b"b"])).is_ok());
+        assert!(matches!(
+            DirManifest::decode(&mk([b"b", b"a"])),
+            Err(TreeError::NonCanonical { .. })
+        ));
+        // Equal names too: that is a duplicate, caught by the same ordering rule.
+        assert!(DirManifest::decode(&mk([b"a", b"a"])).is_err());
+    }
+
+    #[test]
+    fn siblings_sharing_a_dir_id_are_rejected() {
+        // Two siblings with the same dir_id derive the same DirSecret, so a
+        // capability scoped to one subtree would open the other -- exactly the
+        // scoping SPECS §15.3 says per-directory keys exist to provide.
+        let mut payload = vec![7u8; ADDR_LEN];
+        payload.extend_from_slice(b"same-id");
+        let mut other = vec![9u8; ADDR_LEN];
+        other.extend_from_slice(b"same-id");
+        let framed = nas_core::encode_fields(&[
+            &DIR_MAGIC[..],
+            b"a",
+            &[1u8],
+            &payload,
+            b"b",
+            &[1u8],
+            &other,
+        ])
+        .unwrap();
+        assert!(matches!(
+            DirManifest::decode(&framed),
+            Err(TreeError::NonCanonical { .. })
+        ));
+    }
+
+    #[test]
+    fn whatever_decode_accepts_re_encodes_to_the_same_bytes() {
+        // The invariant behind all three checks above: the decoder must reject
+        // anything the encoder would not emit. Every tolerated degree of
+        // freedom is a covert channel and a second spelling of one manifest.
+        let dm = sample_dm();
+        let bytes = dm.encode().unwrap();
+        let back = DirManifest::decode(&bytes).unwrap();
+        assert_eq!(back.encode().unwrap(), bytes);
+    }
+
+    #[test]
+    fn a_real_tree_still_round_trips_after_the_canonical_checks() {
+        // The checks must not reject the writer's own output, which is the way
+        // a canonicalisation rule usually goes wrong.
+        let s = Scratch::new("canonical");
+        let src = s.0.join("src");
+        let dst = s.0.join("dst");
+        build_tree(&src);
+        let blobs = BlobStore::open(s.0.join("repo")).unwrap();
+        let cs = ConvergenceSecret::from_bytes([9u8; KEY_LEN]);
+        let ts = TreeStore::new(&blobs, &cs, PaddingProfile::None);
+        let root = DirSecret::root(&[5u8; KEY_LEN]);
+        let addr = ts.write_dir(&root, &src).unwrap();
+        ts.read_dir_to(&root, &addr, &dst).unwrap();
+        assert_eq!(snapshot(&src), snapshot(&dst));
     }
 
     #[test]

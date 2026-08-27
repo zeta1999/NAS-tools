@@ -559,17 +559,46 @@ ck      = BLAKE3::keyed_hash(CS, padded)     # note: over the PADDED bytes
 
 Profiles, per bucket:
 
-| Profile | Chunking | Fingerprint | Dedup | Overhead |
+| Profile | Chunking | Fingerprint | Dedup | Overhead *(measured, M0)* |
 |---|---|---|---|---|
 | `none` *(default)* | CDC | full leak | best | 0% |
-| `classes` | CDC + ladder | coarsened to class sequence | full | measured at M0 |
-| `fixed` | fixed 64 KiB, no CDC | none | brittle — one insertion shifts everything | ~0% |
+| `classes` | CDC + ladder | coarsened to class sequence | full | **+56%** large files, **+97%** many small files |
+| `fixed` | fixed 64 KiB, no CDC | none | brittle — one insertion shifts everything | **+83%** / **+143%**, and dedup falls from 54% to 16% |
 
-**Default is `none`.** Padding defends against an adversary holding a *candidate
-file* who wants to confirm you have it — real, but low-probability unless you are
-individually targeted, and 20–35% of a NAS is a large premium against it. That
-figure is itself an estimate and **must be measured, not assumed** before anyone
-opts in; the measurement is an M0 success criterion (§12).
+**Default is `none`.**
+
+Revision 5 of this document estimated the premium at "20–35%" and required it be
+**measured, not assumed** before anyone opted in. It has now been measured on two
+real corpora (`MANUAL-TESTING.md` §5), and **the estimate was wrong by a factor
+of two to three.** The figures above replace it.
+
+Two causes, neither of which is a tuning problem:
+
+1. **A ×2 ladder costs ~1.5× on any realistic distribution.** Chunks averaged
+   81.7 KiB and padded to the 128 KiB class. There is no corpus on which
+   20–35% was reachable with `{32, 64, 128, 256}`; the estimate was arithmetic
+   that was never done.
+2. **Small files pay the 32 KiB floor regardless of chunking.** In a source-tree
+   corpus, 86% of files sat under 32764 B holding 12% of the bytes, and each
+   still occupied a full class. Padding overhead scales with **file count**, not
+   with content — so the worst case is a document or code repository, precisely
+   the workload a NAS is most often pointed at.
+
+`fixed` was listed at "~0%" overhead. That was true of chunking and false of
+storage: every trailing partial chunk still rounds up to 64 KiB, which on a
+small-file corpus is worse than `classes`.
+
+**This strengthens the default rather than merely confirming it.** The choice was
+originally made against a 20–35% premium; the real premium is 56–97%, against a
+threat (an adversary holding a candidate file and wanting confirmation) that
+remains low-probability unless the user is individually targeted.
+
+> **Open question (M2), not an assumption.** A denser ladder — 1.25× or 1.5×
+> steps rather than ×2 — would cut the premium substantially in exchange for a
+> finer length fingerprint, and a floor below 32 KiB would help the small-file
+> case specifically. Neither is decided here. What is decided is that the
+> trade-off must be argued against measurements, since the last estimate made
+> without them was off by 3×.
 
 The `padding_profile` field is written into every manifest from M0 regardless, so
 enabling it later is a configuration change and never a format break.

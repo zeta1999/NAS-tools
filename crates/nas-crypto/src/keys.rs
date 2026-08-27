@@ -161,6 +161,60 @@ pub fn seal(key: &Key, plaintext: &[u8], aad: &[u8]) -> Result<Vec<u8>, CryptoEr
     }
 }
 
+/// A chunk key recovered from a manifest, usable **only for decryption**.
+///
+/// # Why this is a separate type
+///
+/// A manifest must store `ck` (SPECS §4.3): a reader holds no plaintext and so
+/// cannot re-derive it. That forces a way back from 32 stored bytes to a usable
+/// key — and a naive `Key::from_bytes(.., Derived)` would hand any caller a
+/// deterministic-nonce key over bytes of their choosing. Sealing two different
+/// plaintexts under it would then reuse a `(key, nonce)` pair, which is exactly
+/// the failure this module was written to make unreachable.
+///
+/// The escape is that a stored `ck` is only ever needed to *open*. A writer
+/// always holds the plaintext and calls [`chunk_key`], which re-derives the key
+/// from it. So the reconstruction path yields a type with no [`seal`] at all:
+/// the dangerous operation is not merely discouraged, it is inexpressible.
+#[derive(Zeroize, ZeroizeOnDrop)]
+pub struct ChunkReadKey {
+    bytes: [u8; KEY_LEN],
+}
+
+impl std::fmt::Debug for ChunkReadKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "ChunkReadKey(<redacted>)")
+    }
+}
+
+/// Rebuild a chunk key from the `ck` bytes stored in a manifest.
+///
+/// The result cannot seal. See [`ChunkReadKey`].
+pub fn chunk_key_from_stored(bytes: [u8; KEY_LEN]) -> ChunkReadKey {
+    ChunkReadKey { bytes }
+}
+
+/// Decrypt a chunk using a `ck` recovered from a manifest.
+pub fn open_chunk(key: &ChunkReadKey, sealed: &[u8], aad: &[u8]) -> Result<Vec<u8>, CryptoError> {
+    let n = derived_nonce(&key.bytes);
+    open_with_nonce(&key.bytes, &n, sealed, aad).map_err(|_| CryptoError::Open)
+}
+
+impl Key {
+    /// Expose a **content-derived** key so it can be written into a manifest.
+    ///
+    /// Returns `None` for a random-nonce key. Manifest keys are path-derived
+    /// and reachable from a capability; writing one into a manifest would
+    /// publish it to anyone who could read that manifest, so this path refuses
+    /// rather than trusting the caller to only ask about chunks.
+    pub fn expose_derived(&self) -> Option<&[u8; KEY_LEN]> {
+        match self.policy {
+            NoncePolicy::Derived => Some(&self.bytes),
+            NoncePolicy::Random => None,
+        }
+    }
+}
+
 /// Decrypt data produced by [`seal`] under the same key and AAD.
 pub fn open(key: &Key, sealed: &[u8], aad: &[u8]) -> Result<Vec<u8>, CryptoError> {
     match key.policy {
@@ -184,6 +238,48 @@ mod tests {
 
     fn cs(b: u8) -> ConvergenceSecret {
         ConvergenceSecret::from_bytes([b; KEY_LEN])
+    }
+
+    #[test]
+    fn a_stored_ck_reopens_the_chunk_it_came_from() {
+        // SPECS §4.3: the manifest stores ck because the reader cannot derive
+        // it. This is that round trip.
+        let s = cs(1);
+        let pt = b"a chunk that will be read back later";
+        let k = chunk_key(&s, pt);
+        let sealed = seal(&k, pt, b"aad").unwrap();
+
+        let stored: [u8; KEY_LEN] = *k.expose_derived().expect("chunk keys are derived");
+        let rk = chunk_key_from_stored(stored);
+        assert_eq!(open_chunk(&rk, &sealed, b"aad").unwrap(), pt);
+    }
+
+    #[test]
+    fn a_stored_ck_still_authenticates_the_aad() {
+        let s = cs(1);
+        let pt = b"chunk";
+        let k = chunk_key(&s, pt);
+        let sealed = seal(&k, pt, b"right").unwrap();
+        let rk = chunk_key_from_stored(*k.expose_derived().unwrap());
+        assert_eq!(open_chunk(&rk, &sealed, b"wrong"), Err(CryptoError::Open));
+    }
+
+    #[test]
+    fn a_manifest_key_refuses_to_be_written_into_a_manifest() {
+        // Random-nonce keys are path-derived and reachable from a capability.
+        // Serialising one would publish it to every reader of that manifest.
+        let d = DirSecret::root(&[7u8; KEY_LEN]);
+        assert!(manifest_key(&d).expose_derived().is_none());
+        assert!(chunk_key(&cs(1), b"x").expose_derived().is_some());
+    }
+
+    #[test]
+    fn open_chunk_rejects_a_key_that_did_not_seal_it() {
+        let s = cs(1);
+        let pt = b"chunk";
+        let sealed = seal(&chunk_key(&s, pt), pt, b"").unwrap();
+        let wrong = chunk_key_from_stored([0u8; KEY_LEN]);
+        assert_eq!(open_chunk(&wrong, &sealed, b""), Err(CryptoError::Open));
     }
 
     #[test]

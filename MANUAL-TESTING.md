@@ -182,7 +182,97 @@ everything that reaches it.
 
 ---
 
-## 5. Multi-node simulation (planned, M1)
+## 5. `nas-store` — padding overhead on a real corpus (M0 exit criterion)
+
+SPECS §4.2.1 estimated the padding premium at "20-35%" and required it be
+**measured, not assumed** before anyone enables it. This is that measurement.
+
+```sh
+cargo build --release -p nas-store --example measure
+./target/release/examples/measure ~/work/simple-network ~/work/rust-secure-memory ~/work/NAS-tools
+```
+
+Observed (2026-08-27) — a source-tree corpus, `target/` and `.git/` excluded:
+
+```
+corpus: 12904 files under /Users/.../simple-network, /Users/.../rust-secure-memory, /Users/.../NAS-tools
+
+profile      plaintext B      stored B  overhead  vs none   chunks   dedup
+None           481016592     465203251     -3.3%     0.0%    15712    7.1%
+Classes        481016592     918097920     90.9%    97.4%    15712    7.1%
+Fixed          481016592    1129460960    134.8%   142.8%    18365    6.2%
+
+peak RSS: 9060352 bytes (8.6 MiB)
+```
+
+```sh
+./target/release/examples/measure ~/work/price-master-examples/bin
+```
+
+Observed (2026-08-27) — 27 large binaries, several of which are byte-identical
+splits of the others, so this corpus also exercises deduplication:
+
+```
+corpus: 27 files under /Users/.../price-master-examples/bin
+
+profile      plaintext B      stored B  overhead  vs none   chunks   dedup
+None           631374555     290071832    -54.1%     0.0%     7724   54.1%
+Classes        631374555     451632528    -28.5%    55.7%     7724   54.1%
+Fixed          631374555     529791264    -16.1%    82.6%     9649   16.2%
+
+peak RSS: 5816320 bytes (5.5 MiB)
+```
+
+### 5a. The estimate in the specification was wrong
+
+| | SPECS §4.2.1 estimate | measured, large files | measured, source tree |
+|---|---|---|---|
+| `classes` premium | 20-35% | **+55.7%** | **+97.4%** |
+| `fixed` premium | "~0%" | **+82.6%** | **+142.8%** |
+
+Two separate causes, and both were missed:
+
+1. **On any corpus, the ladder doubles.** Chunks averaged 81.7 KiB on the large
+   corpus and pad to the 128 KiB class — 1.57×, which is exactly the observed
+   figure. A ×2 ladder costs ~1.5× for *any* chunk-size distribution that is not
+   already concentrated just below a class boundary. There was never a corpus on
+   which 20-35% was achievable with this ladder.
+2. **Small files pay the 32 KiB floor.** In the source corpus 11178 of 12904
+   files (86%) are under 32764 B and hold 12% of the bytes; each still occupies a
+   full 32 KiB class. Those files alone account for ~306 MB of the ~453 MB
+   premium. Padding overhead is therefore driven by **file count**, not by
+   content or by CDC tuning.
+
+`fixed` was described as "~0%" overhead in the profile table. That is true of the
+*chunking* — no CDC, so no boundary drift — and false of the storage, because
+every trailing partial chunk still rounds up to 64 KiB. Worse on the source
+corpus than `classes`, since most files are a single short chunk.
+
+**Consequences carried back into SPECS §4.2.1 (revision 6):** the estimate is
+replaced by these figures. `none` remaining the default is reinforced, not
+merely confirmed — the premium is 2-3× what the decision was originally made
+against. A denser ladder (1.25× or 1.5× steps) would cut the premium
+substantially in exchange for a finer length fingerprint; that trade is now a
+recorded open question rather than an assumption.
+
+### 5b. Streaming is real, not claimed
+
+Peak RSS was **5.5 MiB while writing 631 MB** and 8.6 MiB across 12904 files.
+Memory tracks the chunker window (`2 × max`, 512 KiB) plus one chunk in flight,
+not file size. The 44 MB single file in the source corpus did not move the
+figure. Measured with `getrusage(RUSAGE_SELF)`, not estimated.
+
+### 5c. Deduplication works end to end
+
+The large-file corpus is 27 files of which 12 are `.partNN` splits of three
+binaries. Content-defined chunking plus convergent encryption recovered **54.1%**
+of it without being told the files were related. `fixed` recovered only 16.2% on
+the same corpus — the shift-sensitivity the profile table warns about, visible in
+a number.
+
+---
+
+## 6. Multi-node simulation (planned, M1)
 
 Not yet built. The shape, given 16 GB of RAM:
 

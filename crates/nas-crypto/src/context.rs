@@ -75,6 +75,19 @@ pub const NONCE_CHUNK: &[u8] = b"nas-tools/nonce/chunk/v1";
 pub const DIR: &str = "nas-tools/dir/v1";
 /// Directory manifest key (SPECS §3.1).
 pub const DIR_MANIFEST: &str = "nas-tools/dir/manifest/v1";
+/// Root **manifest** key, derived per version (SPECS §3.1, `rk_v`).
+///
+/// Not to be confused with [`NS_ROOT`], whose string differs by one path
+/// segment. `NS_ROOT` produces a namespace's long-lived root *secret* from a
+/// passphrase-mode DEK; this one produces the key that encrypts one *version*
+/// of the root manifest, and the caller must mix in `le64(seq)`. Reaching for
+/// the wrong one would encrypt every root version under a single key, which is
+/// exactly the "may it see two plaintexts" hazard §3.1 exists to prevent.
+///
+/// Unused until the root slot lands in M1; declared here so the next person to
+/// need it does not reach for `NS_ROOT` instead.
+pub const ROOT_MANIFEST: &str = "nas-tools/root/v1";
+
 /// Namespace root secret from a passphrase-mode DEK (SPECS §2.2.2).
 pub const NS_ROOT: &str = "nas-tools/ns/root/v1";
 /// Per-namespace convergence secret from a DEK (SPECS §2.2.2).
@@ -94,6 +107,34 @@ mod tests {
         assert_eq!(SigContext::ALL.len(), 12);
         let set: HashSet<&[u8]> = SigContext::ALL.iter().map(|c| c.as_bytes()).collect();
         assert_eq!(set.len(), 12, "signing contexts must be pairwise distinct");
+    }
+
+    /// Every KDF context string in this module.
+    const KDF_CONTEXTS: [&str; 6] = [
+        DIR,
+        DIR_MANIFEST,
+        ROOT_MANIFEST,
+        NS_ROOT,
+        NS_CONVERGENCE,
+        NS_SLOT,
+    ];
+
+    #[test]
+    fn kdf_contexts_are_distinct_and_prefix_free() {
+        // There was a test for the twelve signature contexts and none for
+        // these, even though ROOT_MANIFEST and NS_ROOT differ by a single path
+        // segment and are the pair most likely to be confused.
+        let set: HashSet<&str> = KDF_CONTEXTS.iter().copied().collect();
+        assert_eq!(set.len(), KDF_CONTEXTS.len(), "two KDF contexts collide");
+        for a in KDF_CONTEXTS {
+            for b in KDF_CONTEXTS {
+                if a != b {
+                    assert!(!b.starts_with(a), "{a:?} is a prefix of {b:?}");
+                }
+            }
+        }
+        // And they must not collide with the nonce context, which is bytes.
+        assert!(!KDF_CONTEXTS.iter().any(|c| c.as_bytes() == NONCE_CHUNK));
     }
 
     #[test]

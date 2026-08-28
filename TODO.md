@@ -127,7 +127,18 @@ settled and the work that follows from them.
       operation. `verify_chain` currently refuses any writer change under that
       regime, which is the recoverable mistake but not the specified behaviour.
 - [ ] `nas-peer`: blob store, slot ordering + history, CAS enforcement
-- [ ] Lease deltas, checkpoints, sweep, young-blob grace, per-holder quotas
+- [x] Lease deltas, checkpoints, sweep, young-blob grace, per-holder quotas.
+      **Measured:** a LeaseDelta is 5337 B fixed + 32 B per address — 8537 B for
+      100 addresses, where signing each address individually would cost
+      334100 B, **39x more**. A LeaseCheckpoint is 5377 B whether it covers 100
+      addresses or ten million. That is SPECS §3.8 and §6.1 in numbers.
+- [ ] **The warn-before-sweep window is only `grace` wide.** SPECS §6.3 says the
+      peer must not sweep until `expiry + grace`, and a returning client inside
+      that window is warned. With the defaults that is a **24-hour** warning
+      after a **90-day** absence, which is not much of a warning. Either the
+      window wants its own (longer) setting, or the warning has to reach the
+      client by some route other than it happening to reconnect. Decide before
+      `nas-peer` starts actually deleting.
 - [ ] Proof-of-possession responder
 - [ ] `--witness` mode: no blobs, no caps, relay only
 - [ ] Push/pull over `simple-network` `pqc` (honest-peer path)

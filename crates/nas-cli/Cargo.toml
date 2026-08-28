@@ -12,5 +12,6 @@ path = "src/main.rs"
 blake3 = { workspace = true }
 nas-core = { path = "../nas-core" }
 nas-crypto = { path = "../nas-crypto" }
+nas-slots = { path = "../nas-slots" }
 nas-store = { path = "../nas-store" }
 nas-vault = { path = "../nas-vault" }

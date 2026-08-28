@@ -77,7 +77,11 @@ listing; lease-based GC with deltas; **three confidentiality modes** (`e2ee`,
   subcommand must never exit 2, or the harness would score unwritten code as a
   passing security control.
 - **`tests/usecases/`** — 83 acceptance assertions, milestone-gated; 53 are
-  M0–M2. **5 passing, 0 failing, 78 pending** at `NAS_MILESTONE=M0`. Verified to
+  M0–M2. **5 passing, 0 failing, 78 pending** at `NAS_MILESTONE=M0` (what CI
+  gates on), and **16 passing, 9 failing, 58 pending** at `NAS_MILESTONE=M1` —
+  UC02, the passphrase use case, is now green end to end. The 9 M1 failures all
+  need `nas-peer`: peer-enforced ACLs, transit-only plaintext, slot publication
+  and cross-tenant checks. Verified to
   bite: a stub that always exits 0 fails the refusal assertion, and one that
   always exits 1 is reported BROKEN rather than refused (MANUAL-TESTING.md §6a).
 
@@ -121,7 +125,8 @@ See `MANUAL-TESTING.md` §5 for the commands and raw output.
   written next to it at 0600. That *relocates* the secret rather than protecting
   it. An OS keychain or a passphrase-derived key is what makes it real; both are
   in TODO. `--mode passphrase` still exits 3 rather than creating a namespace
-  whose config claims a protection it does not have.
+  whose config claims a protection it does not have — **passphrase mode is now
+  wired through the CLI** and stores *nothing* locally that opens a namespace.
 - **Names are not separately encrypted.** SPECS §4.4 specifies Cryptomator-style
   per-segment encryption; that design exists because Cryptomator maps segments
   onto *server filenames*. Here the peer sees `blobs/<ab>/<hex>` and names live

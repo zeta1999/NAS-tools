@@ -166,9 +166,10 @@ pub fn roundtrip(ns: &str, src: &str) -> i32 {
         ));
     }
     println!(
-        "roundtrip ok: {} entries, mode {:?}, padding {:?}, root {}",
+        "roundtrip ok: {} entries, mode {:?}, key_scheme {:?}, padding {:?}, root {}",
         a.len(),
         repo.mode,
+        repo.key_scheme,
         repo.padding,
         addr.to_hex()
     );
@@ -328,4 +329,360 @@ fn attacker_addrs(
 pub fn unimplemented(what: &str, milestone: &str) -> i32 {
     eprintln!("unimplemented: `{what}` is specified and lands in {milestone}");
     exit::UNIMPLEMENTED
+}
+
+// ── Passphrase mode (SPECS §2.2.2) ──────────────────────────────────────
+
+use nas_vault::{Argon2Params, WrapPolicy, WrapRecord};
+
+/// Parse `256MiB`, `262144KiB`, or a bare number of MiB.
+fn parse_mem(s: &str) -> Option<u32> {
+    let t = s.trim();
+    if let Some(n) = t.strip_suffix("MiB").or_else(|| t.strip_suffix("M")) {
+        n.trim().parse::<u32>().ok().map(|m| m * 1024)
+    } else if let Some(n) = t.strip_suffix("KiB").or_else(|| t.strip_suffix("K")) {
+        n.trim().parse::<u32>().ok()
+    } else {
+        t.parse::<u32>().ok().map(|m| m * 1024)
+    }
+}
+
+/// `nas test argon2-params <ns> --min-mem 256MiB --min-time 3`
+///
+/// Reads the parameters **from the stored wrap record**, not from a constant in
+/// this binary. A test that checked the constant would pass on a namespace
+/// written by a weaker build, which is exactly the case that matters.
+pub fn argon2_params(ns: &str, min_mem: &str, min_time: u32) -> i32 {
+    let Some(min_kib) = parse_mem(min_mem) else {
+        return err(format!("could not parse --min-mem {min_mem:?}"));
+    };
+    let root = crate::repo::path_of(ns);
+    let seq = match Repo::latest_wrap_seq(&root) {
+        Ok(s) => s,
+        Err(e) => return err(format!("{ns}: {e}")),
+    };
+    let w = match Repo::load_wrap(&root, seq) {
+        Ok(w) => w,
+        Err(e) => return err(e),
+    };
+    let policy = WrapPolicy {
+        min_memory_kib: min_kib,
+        min_iterations: min_time,
+    };
+    match w.params.check(&policy) {
+        Ok(()) => {
+            println!(
+                "argon2id m={} KiB, t={}, p={} — meets the {} KiB / t={} floor",
+                w.params.memory_kib, w.params.iterations, w.params.parallelism, min_kib, min_time
+            );
+            exit::OK
+        }
+        Err(e) => err(format!(
+            "stored parameters are below the required floor: {e}"
+        )),
+    }
+}
+
+/// `nas test peer-no-plaintext <ns>` — SPECS §1, §12.2.
+///
+/// Writes a canary through the real pipeline, then scans every stored blob for
+/// it. In `transit-only` the expectation is inverted (§12.2), which is why the
+/// mode is consulted rather than assumed.
+pub fn peer_no_plaintext(ns: &str) -> i32 {
+    let repo = match Repo::open_with(ns, crate::repo::passphrase_from(None)) {
+        Ok(r) => r,
+        Err(e) => return err(format!("namespace {ns}: {e}")),
+    };
+    let blobs = match BlobStore::open(repo.blobs_root()) {
+        Ok(b) => b,
+        Err(e) => return err(e),
+    };
+    let needle = b"CANARY-PLAINTEXT-MUST-NOT-APPEAR";
+    let mut data = bytes(300 << 10, "nas-tools/test/canary");
+    data.splice(4096..4096 + needle.len(), needle.iter().copied());
+
+    let cs = repo.convergence_secret();
+    let w = match ObjectWriter::with_defaults(&blobs, &cs, repo.padding) {
+        Ok(w) => w,
+        Err(e) => return err(e),
+    };
+    if let Err(e) = w.write(Kind::File, &data[..]) {
+        return err(e);
+    }
+
+    let mut found = 0usize;
+    for a in blobs.addrs().unwrap_or_default() {
+        if let Ok(ct) = blobs.get(&a) {
+            if ct.windows(needle.len()).any(|x| x == needle) {
+                found += 1;
+            }
+        }
+    }
+    let expect_plaintext = repo.mode.peer_reads_plaintext();
+    match (found > 0, expect_plaintext) {
+        (false, false) => {
+            println!("no plaintext canary in any blob ({:?})", repo.mode);
+            exit::OK
+        }
+        (true, true) => {
+            println!("plaintext present as {:?} requires", repo.mode);
+            exit::OK
+        }
+        (true, false) => err(format!("LEAK: canary found in {found} blob(s)")),
+        (false, true) => err(format!(
+            "{:?} should store plaintext and does not",
+            repo.mode
+        )),
+    }
+}
+
+/// `nas test open-with-passphrase <ns>`
+pub fn open_with_passphrase(ns: &str) -> i32 {
+    let Some(pw) = crate::repo::passphrase_from(None) else {
+        return err("set $NAS_PASSPHRASE");
+    };
+    match Repo::open_with(ns, Some(pw)) {
+        Ok(r) => {
+            println!("opened {ns} from the passphrase alone (mode {:?})", r.mode);
+            exit::OK
+        }
+        Err(e) => err(e),
+    }
+}
+
+/// `nas test recovery-has-freshness-anchor <ns>` — SPECS §2.2.2, review C4.
+///
+/// The gap this closes: a client recovering from a passphrase holds no
+/// capability, so under revision 4 it had no anchor at all — reopening the
+/// bootstrapping rollback hole §5.3(1) exists to close. The wrap record must
+/// therefore carry the floor, and it must be the *current* floor, not zero.
+pub fn recovery_has_freshness_anchor(ns: &str) -> i32 {
+    let Some(pw) = crate::repo::passphrase_from(None) else {
+        return err("set $NAS_PASSPHRASE");
+    };
+    let root = crate::repo::path_of(ns);
+
+    // Publish a new anchor by re-wrapping at the next sequence.
+    let seq = match Repo::latest_wrap_seq(&root) {
+        Ok(s) => s,
+        Err(e) => return err(e),
+    };
+    let old = match Repo::load_wrap(&root, seq) {
+        Ok(w) => w,
+        Err(e) => return err(e),
+    };
+    let advanced = nas_slots::Anchor {
+        seq: 42,
+        sig_hash: [0xA5; 32],
+    };
+    let next = match old.rewrap(
+        &pw,
+        &pw,
+        Argon2Params::SPEC,
+        &WrapPolicy::SPEC,
+        seq + 1,
+        advanced,
+    ) {
+        Ok(w) => w,
+        Err(e) => return err(e),
+    };
+    if let Err(e) = publish_wrap(&root, &next) {
+        return err(e);
+    }
+
+    // Now recover from the passphrase alone and check the floor came with it.
+    let r = match Repo::open_with(ns, Some(pw.clone())) {
+        Ok(r) => r,
+        Err(e) => return err(e),
+    };
+    match r.recovered_anchor() {
+        Some(a) if a == advanced => {
+            println!("recovery yielded the published anchor: seq {}", a.seq);
+            exit::OK
+        }
+        Some(a) => err(format!(
+            "recovered anchor is seq {}, expected {}",
+            a.seq, advanced.seq
+        )),
+        None => err("recovery produced no freshness anchor"),
+    }
+}
+
+/// `nas test passphrase-change-is-rewrap <ns>` and
+/// `nas test no-reencrypt-on-passphrase-change <ns>` — SPECS §2.2.2.
+///
+/// One operation, two assertions: the wrap changes, and not one stored byte
+/// does. That is what the KEK/DEK indirection buys.
+pub fn passphrase_change(ns: &str, check_blobs: bool) -> i32 {
+    let Some(pw) = crate::repo::passphrase_from(None) else {
+        return err("set $NAS_PASSPHRASE");
+    };
+    let root = crate::repo::path_of(ns);
+    let repo = match Repo::open_with(ns, Some(pw.clone())) {
+        Ok(r) => r,
+        Err(e) => return err(e),
+    };
+    let blobs = match BlobStore::open(repo.blobs_root()) {
+        Ok(b) => b,
+        Err(e) => return err(e),
+    };
+
+    // Put something in the namespace so "nothing was re-encrypted" has content
+    // to be true about. An empty namespace would pass vacuously.
+    let cs = repo.convergence_secret();
+    if let Ok(w) = ObjectWriter::with_defaults(&blobs, &cs, repo.padding) {
+        let _ = w.write(Kind::File, &bytes(400 << 10, "nas-tools/test/rewrap")[..]);
+    }
+    let before: Vec<(String, u64)> = snapshot_blobs(&blobs);
+    if before.is_empty() {
+        return err("no blobs stored; the assertion would pass vacuously");
+    }
+
+    let seq = match Repo::latest_wrap_seq(&root) {
+        Ok(s) => s,
+        Err(e) => return err(e),
+    };
+    let old = match Repo::load_wrap(&root, seq) {
+        Ok(w) => w,
+        Err(e) => return err(e),
+    };
+    let new_pw = b"a completely different passphrase entirely".to_vec();
+    let next = match old.rewrap(
+        &pw,
+        &new_pw,
+        Argon2Params::SPEC,
+        &WrapPolicy::SPEC,
+        seq + 1,
+        old.anchor,
+    ) {
+        Ok(w) => w,
+        Err(e) => return err(e),
+    };
+    if let Err(e) = publish_wrap(&root, &next) {
+        return err(e);
+    }
+    let after = snapshot_blobs(&blobs);
+    if check_blobs && after != before {
+        return err(format!(
+            "a passphrase change touched stored data: {} blobs before, {} after",
+            before.len(),
+            after.len()
+        ));
+    }
+
+    // The new passphrase opens it, the old one does not, and the data is intact.
+    let reopened = match Repo::open_with(ns, Some(new_pw.clone())) {
+        Ok(r) => r,
+        Err(e) => return err(format!("the new passphrase does not open it: {e}")),
+    };
+    if reopened.convergence_secret_fingerprint() != repo.convergence_secret_fingerprint() {
+        return err("re-wrapping changed the namespace secrets");
+    }
+    if Repo::open_with(ns, Some(pw.clone())).is_ok() {
+        return err("the OLD passphrase still opens the namespace after a change");
+    }
+
+    // Change back, so the namespace is left as it was found.
+    //
+    // An acceptance assertion that mutates shared state breaks whichever
+    // assertion happens to run after it -- which is exactly what this one did:
+    // it left the namespace on a passphrase nothing else knew, and the next two
+    // assertions in UC02 failed for a reason that had nothing to do with what
+    // they were testing. Assertions have to be order-independent.
+    let restored = match next.rewrap(
+        &new_pw,
+        &pw,
+        Argon2Params::SPEC,
+        &WrapPolicy::SPEC,
+        next.seq + 1,
+        next.anchor,
+    ) {
+        Ok(w) => w,
+        Err(e) => return err(format!("could not restore the original passphrase: {e}")),
+    };
+    if let Err(e) = publish_wrap(&root, &restored) {
+        return err(e);
+    }
+    if Repo::open_with(ns, Some(pw)).is_err() {
+        return err("failed to restore the original passphrase");
+    }
+
+    let after_restore = snapshot_blobs(&blobs);
+    if check_blobs && after_restore != before {
+        return err("restoring the passphrase touched stored data");
+    }
+
+    println!(
+        "re-wrapped 32 bytes twice (change and restore); {} blobs unchanged ({} B)",
+        before.len(),
+        before.iter().map(|(_, n)| n).sum::<u64>()
+    );
+    exit::OK
+}
+
+/// `nas test old-wrap-deleted <ns>` — SPECS §2.2.2.
+pub fn old_wrap_deleted(ns: &str) -> i32 {
+    let root = crate::repo::path_of(ns);
+    let seq = match Repo::latest_wrap_seq(&root) {
+        Ok(s) => s,
+        Err(e) => return err(e),
+    };
+    if seq == 0 {
+        return err("no passphrase change has happened yet; nothing to supersede");
+    }
+    let mut lingering = Vec::new();
+    for old in 0..seq {
+        if crate::repo::wrap_path(&root, old).exists() {
+            lingering.push(old);
+        }
+    }
+    if lingering.is_empty() {
+        println!(
+            "wrap {seq} is current; {seq} superseded record(s) removed. \
+             Note: against a hostile peer this is best-effort — it may keep a copy."
+        );
+        exit::OK
+    } else {
+        err(format!(
+            "superseded wrap records still present: {lingering:?}"
+        ))
+    }
+}
+
+/// Publish a wrap record and retire every earlier one.
+///
+/// The retirement is part of publishing rather than a separate step a caller
+/// might forget -- and one did: the re-anchor path left wrap 0 on disk, and
+/// `old-wrap-deleted` caught it. SPECS §2.2.2 wants superseded wraps gone
+/// because each one is a standing brute-force target against the passphrase it
+/// was made with, and it still unwraps the same DEK.
+///
+/// Against a hostile peer this is best-effort: it may keep a copy, and nothing
+/// here can stop it. Genuinely retiring a compromised passphrase means rotating
+/// the DEK and re-encrypting (§3.9c).
+fn publish_wrap(root: &Path, w: &WrapRecord) -> Result<(), String> {
+    let bytes = w.encode().map_err(|e| e.to_string())?;
+    fs::create_dir_all(root.join("wraps")).map_err(|e| e.to_string())?;
+    crate::repo::write_private_pub(&crate::repo::wrap_path(root, w.seq), &bytes)
+        .map_err(|e| e.to_string())?;
+    for old in 0..w.seq {
+        let _ = fs::remove_file(crate::repo::wrap_path(root, old));
+    }
+    Ok(())
+}
+
+fn snapshot_blobs(st: &BlobStore) -> Vec<(String, u64)> {
+    let mut v: Vec<(String, u64)> = st
+        .addrs()
+        .unwrap_or_default()
+        .iter()
+        .map(|a| {
+            (
+                a.to_hex(),
+                fs::metadata(st.path(a)).map(|m| m.len()).unwrap_or(0),
+            )
+        })
+        .collect();
+    v.sort();
+    v
 }

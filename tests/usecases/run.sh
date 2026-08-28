@@ -18,6 +18,12 @@ fi
 # that compress to nothing and would bloat every clone.
 [ -d fixtures/tree ] || ./fixtures/make.sh >/dev/null
 
+# Passphrase-mode assertions need a passphrase and there is no tty here. A fixed
+# test value, set in the harness rather than defaulted inside the binary -- a
+# binary that invented a passphrase when none was given would be worse than one
+# that refused.
+export NAS_PASSPHRASE="${NAS_PASSPHRASE:-acceptance suite five diceware words}"
+
 tp=0; tf=0; tpend=0; rc=0
 for f in uc*.sh; do
   out=$(bash "$f" 2>&1); status=$?      # capture the SCRIPT's status, not echo's

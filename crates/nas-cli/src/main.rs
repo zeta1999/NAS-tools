@@ -5,6 +5,7 @@
 //! code contract (see [`exit`]), which is easier to hold exactly with a parser
 //! that has no opinions of its own.
 
+mod aclcmd;
 mod exit;
 mod repo;
 mod testcmds;
@@ -18,6 +19,8 @@ nas — NAS-tools command line
   nas ns create <name> [--mode e2ee|passphrase|transit-only]
                        [--padding none|classes|fixed]
   nas ns list
+  nas acl grant|revoke|check <ns> --subject <s> --right <r>
+  nas acl list <ns>
   nas test roundtrip <ns> <path>
   nas test dedup-ratio <ns> --shared <pct> --max-transfer <pct>
   nas test confirmation-attack <ns> --with-cs|--without-cs
@@ -103,7 +106,7 @@ fn run(argv: &[String]) -> i32 {
         "ns" => ns(rest),
         "test" => test(rest),
         // Recognised in SPECS, not built. Never REFUSED — see exit.rs.
-        "acl" => testcmds::unimplemented("acl", "M1 (§15)"),
+        "acl" => acl(rest),
         "peer" => testcmds::unimplemented("peer", "M1 (§10)"),
         "gateway" => testcmds::unimplemented("gateway", "M3 (§2.1)"),
         "mirror" => testcmds::unimplemented("mirror", "M5 (§7.6)"),
@@ -111,6 +114,38 @@ fn run(argv: &[String]) -> i32 {
         other => {
             eprintln!("unknown command {other:?}\n");
             eprint!("{USAGE}");
+            exit::ERROR
+        }
+    }
+}
+
+fn acl(args: &[String]) -> i32 {
+    let pos = positional(args);
+    let right = || match opt(args, "--right") {
+        Some(r) => nas_peer::Right::parse(r).ok_or_else(|| format!("unknown right {r:?}")),
+        None => Err("missing --right".to_string()),
+    };
+    let subject = || opt(args, "--subject").ok_or_else(|| "missing --subject".to_string());
+
+    let (Some(verb), Some(ns)) = (pos.first().copied(), pos.get(1).copied()) else {
+        eprintln!("usage: nas acl grant|revoke|check|list <ns> [--subject <s>] [--right <r>]");
+        return exit::ERROR;
+    };
+    match verb {
+        "list" => aclcmd::list(ns),
+        "grant" | "revoke" | "check" => match (subject(), right()) {
+            (Ok(s), Ok(r)) => match verb {
+                "grant" => aclcmd::grant(ns, s, r),
+                "revoke" => aclcmd::revoke(ns, s, r),
+                _ => aclcmd::check(ns, s, r),
+            },
+            (Err(e), _) | (_, Err(e)) => {
+                eprintln!("{e}");
+                exit::ERROR
+            }
+        },
+        other => {
+            eprintln!("unknown acl verb {other:?}");
             exit::ERROR
         }
     }

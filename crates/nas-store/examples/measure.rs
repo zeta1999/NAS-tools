@@ -94,7 +94,7 @@ fn main() {
     ] {
         let dir = root.join(format!("{profile:?}"));
         let st = BlobStore::open(&dir).unwrap();
-        let w = ObjectWriter::with_defaults(&st, &cs, profile).unwrap();
+        let w = ObjectWriter::convergent(&st, &cs, profile).unwrap();
 
         // Count only what was actually written. Summing metadata over the
         // whole file list instead would divide stored bytes by a plaintext

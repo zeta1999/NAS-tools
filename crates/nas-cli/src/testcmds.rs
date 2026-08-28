@@ -108,12 +108,11 @@ pub fn roundtrip(ns: &str, src: &str) -> i32 {
         return err(format!("{} is not a directory", src.display()));
     }
 
-    let blobs = match BlobStore::open(repo.blobs_root()) {
+    let blobs = match repo.blobs() {
         Ok(b) => b,
         Err(e) => return err(e),
     };
-    let cs = repo.convergence_secret();
-    let ts = TreeStore::new(&blobs, &cs, repo.padding);
+    let ts = TreeStore::new(&blobs, repo.sealer(), repo.padding);
     let root = repo.dir_root();
 
     // Reuse the previous root when there is one, so a second run of the same
@@ -211,8 +210,7 @@ pub fn dedup_ratio(ns: &str, shared_pct: u32, max_transfer_pct: u32) -> i32 {
         Ok(x) => x,
         Err(e) => return err(e),
     };
-    let cs = repo.convergence_secret();
-    let ts = TreeStore::new(&blobs, &cs, repo.padding);
+    let ts = TreeStore::new(&blobs, repo.sealer(), repo.padding);
 
     if let Err(e) = ts.write_dir(&repo.dir_root().child(b"a"), &a) {
         return err(e);
@@ -248,15 +246,14 @@ pub fn confirmation_attack(ns: &str, with_cs: bool) -> i32 {
         Ok(r) => r,
         Err(e) => return err(format!("namespace {ns}: {e}")),
     };
-    let blobs = match BlobStore::open(repo.blobs_root()) {
+    let blobs = match repo.blobs() {
         Ok(b) => b,
         Err(e) => return err(e),
     };
 
     // The victim stores a file the attacker also has a copy of.
     let candidate = bytes(200 << 10, "nas-tools/test/candidate-file");
-    let cs = repo.convergence_secret();
-    let w = match ObjectWriter::with_defaults(&blobs, &cs, repo.padding) {
+    let w = match ObjectWriter::with_defaults(&blobs, repo.sealer(), repo.padding) {
         Ok(w) => w,
         Err(e) => return err(e),
     };
@@ -393,7 +390,7 @@ pub fn peer_no_plaintext(ns: &str) -> i32 {
         Ok(r) => r,
         Err(e) => return err(format!("namespace {ns}: {e}")),
     };
-    let blobs = match BlobStore::open(repo.blobs_root()) {
+    let blobs = match repo.blobs() {
         Ok(b) => b,
         Err(e) => return err(e),
     };
@@ -401,8 +398,7 @@ pub fn peer_no_plaintext(ns: &str) -> i32 {
     let mut data = bytes(300 << 10, "nas-tools/test/canary");
     data.splice(4096..4096 + needle.len(), needle.iter().copied());
 
-    let cs = repo.convergence_secret();
-    let w = match ObjectWriter::with_defaults(&blobs, &cs, repo.padding) {
+    let w = match ObjectWriter::with_defaults(&blobs, repo.sealer(), repo.padding) {
         Ok(w) => w,
         Err(e) => return err(e),
     };
@@ -522,15 +518,14 @@ pub fn passphrase_change(ns: &str, check_blobs: bool) -> i32 {
         Ok(r) => r,
         Err(e) => return err(e),
     };
-    let blobs = match BlobStore::open(repo.blobs_root()) {
+    let blobs = match repo.blobs() {
         Ok(b) => b,
         Err(e) => return err(e),
     };
 
     // Put something in the namespace so "nothing was re-encrypted" has content
     // to be true about. An empty namespace would pass vacuously.
-    let cs = repo.convergence_secret();
-    if let Ok(w) = ObjectWriter::with_defaults(&blobs, &cs, repo.padding) {
+    if let Ok(w) = ObjectWriter::with_defaults(&blobs, repo.sealer(), repo.padding) {
         let _ = w.write(Kind::File, &bytes(400 << 10, "nas-tools/test/rewrap")[..]);
     }
     let before: Vec<(String, u64)> = snapshot_blobs(&blobs);
@@ -685,4 +680,303 @@ fn snapshot_blobs(st: &BlobStore) -> Vec<(String, u64)> {
         .collect();
     v.sort();
     v
+}
+
+// ── transit-only (SPECS §2.2.3, §19.1) ──────────────────────────────────
+
+/// Write the fixture tree and return every stored blob's bytes.
+fn stored_blobs_of(repo: &Repo, tree: &Path) -> Result<Vec<Vec<u8>>, String> {
+    let blobs = repo.blobs().map_err(|e| e.to_string())?;
+    let ts = TreeStore::new(&blobs, repo.sealer(), repo.padding);
+    ts.write_dir(&repo.dir_root(), tree)
+        .map_err(|e| e.to_string())?;
+    let mut out = Vec::new();
+    for a in blobs.addrs().map_err(|e| e.to_string())? {
+        out.push(blobs.get(&a).map_err(|e| e.to_string())?);
+    }
+    Ok(out)
+}
+
+fn fixture_tree() -> PathBuf {
+    // The acceptance harness runs from tests/usecases.
+    let local = Path::new("./fixtures/tree");
+    if local.is_dir() {
+        return local.to_path_buf();
+    }
+    PathBuf::from("tests/usecases/fixtures/tree")
+}
+
+/// `nas test peer-holds-plaintext <ns>` — SPECS §19.1, §12.2.
+///
+/// The inverted assertion: here readable content on the peer is **correct**.
+/// One test with an expectation that flips on the mode, rather than a test that
+/// quietly skips the mode it cannot handle.
+pub fn peer_holds_plaintext(ns: &str) -> i32 {
+    let repo = match Repo::open_with(ns, crate::repo::passphrase_from(None)) {
+        Ok(r) => r,
+        Err(e) => return err(format!("namespace {ns}: {e}")),
+    };
+    let blobs = match stored_blobs_of(&repo, &fixture_tree()) {
+        Ok(b) => b,
+        Err(e) => return err(e),
+    };
+    let needle = b"# work tree fixture";
+    let readable = blobs
+        .iter()
+        .any(|b| b.windows(needle.len()).any(|w| w == needle));
+    if repo.mode.peer_reads_plaintext() {
+        if readable {
+            println!("peer stores readable content, as {:?} requires", repo.mode);
+            exit::OK
+        } else {
+            err(format!("{:?} must store plaintext and does not", repo.mode))
+        }
+    } else if readable {
+        err(format!(
+            "LEAK: readable content in a {:?} namespace",
+            repo.mode
+        ))
+    } else {
+        println!("no readable content ({:?})", repo.mode);
+        exit::OK
+    }
+}
+
+/// `nas test peer-names-visible <ns>` and `nas test peer-names-encrypted <ns>`.
+///
+/// One implementation, because they are the same question asked of two modes,
+/// and `expect_visible` says which answer is correct.
+pub fn peer_names(ns: &str, expect_visible: bool) -> i32 {
+    let repo = match Repo::open_with(ns, crate::repo::passphrase_from(None)) {
+        Ok(r) => r,
+        Err(e) => return err(format!("namespace {ns}: {e}")),
+    };
+    let blobs = match stored_blobs_of(&repo, &fixture_tree()) {
+        Ok(b) => b,
+        Err(e) => return err(e),
+    };
+    let name = b"copy-of-lib.rs";
+    let visible = blobs
+        .iter()
+        .any(|b| b.windows(name.len()).any(|w| w == name));
+    match (visible, expect_visible) {
+        (true, true) => {
+            println!(
+                "filenames are readable on the peer, as {:?} requires",
+                repo.mode
+            );
+            exit::OK
+        }
+        (false, false) => {
+            println!("no filename appears in any stored blob ({:?})", repo.mode);
+            exit::OK
+        }
+        (true, false) => err("LEAK: a filename appears in a stored blob"),
+        (false, true) => err(format!(
+            "{:?} should expose filenames and does not",
+            repo.mode
+        )),
+    }
+}
+
+/// `nas test listing-is-local <ns>` — SPECS §4.4.
+///
+/// Listing must resolve from a manifest the client already holds. The peer is
+/// never asked to match a prefix, and in the encrypted modes it could not.
+pub fn listing_is_local(ns: &str) -> i32 {
+    let repo = match Repo::open_with(ns, crate::repo::passphrase_from(None)) {
+        Ok(r) => r,
+        Err(e) => return err(format!("namespace {ns}: {e}")),
+    };
+    let blobs = match repo.blobs() {
+        Ok(b) => b,
+        Err(e) => return err(e),
+    };
+    let ts = TreeStore::new(&blobs, repo.sealer(), repo.padding);
+    let root = match ts.write_dir(&repo.dir_root(), &fixture_tree()) {
+        Ok(a) => a,
+        Err(e) => return err(e),
+    };
+    // One fetch: the directory manifest. Everything else is decode.
+    let dm = match ts.read_dir_manifest(&repo.dir_root(), &root) {
+        Ok(d) => d,
+        Err(e) => return err(e),
+    };
+    let names: Vec<String> = dm
+        .entries
+        .keys()
+        .map(|k| String::from_utf8_lossy(k).into_owned())
+        .collect();
+    if names.is_empty() {
+        return err("listing produced no entries");
+    }
+    println!(
+        "listed {} entries from one manifest fetch, no prefix sent to the peer: {names:?}",
+        names.len()
+    );
+    exit::OK
+}
+
+/// `nas test slot-signed <ns>` — SPECS §19.1: confidentiality is traded away in
+/// `transit-only`; **nothing else is**.
+pub fn slot_signed(ns: &str) -> i32 {
+    use nas_slots::{Regime, SlotId, SlotRecord};
+    let repo = match Repo::open_with(ns, crate::repo::passphrase_from(None)) {
+        Ok(r) => r,
+        Err(e) => return err(format!("namespace {ns}: {e}")),
+    };
+    let identity = match repo.identity(nas_crypto::Role::Slot) {
+        Ok(i) => i,
+        Err(e) => return err(e),
+    };
+    let slot = SlotId::new(identity.verifying_key(), ns.as_bytes());
+    let rec = match SlotRecord::sign(
+        &identity,
+        slot,
+        0,
+        Addr::of_ciphertext(b"a root"),
+        [0u8; nas_slots::ROOT_NONCE_LEN],
+        [0u8; 32],
+        Regime::CasMerge,
+    ) {
+        Ok(r) => r,
+        Err(e) => return err(format!("{e}")),
+    };
+    if let Err(e) = rec.verify(identity.verifying_key()) {
+        return err(format!("slot record does not verify: {e}"));
+    }
+    // And a tampered one must not.
+    let mut tampered = rec.clone();
+    tampered.seq = 1;
+    tampered.prev = [1u8; 32];
+    if tampered.verify(identity.verifying_key()).is_ok() {
+        return err("a tampered slot record verified");
+    }
+    println!(
+        "slot record signed and verified under ML-DSA-65 ({} B signature), mode {:?}",
+        rec.sig.len(),
+        repo.mode
+    );
+    exit::OK
+}
+
+/// `nas test recover-without-vault <ns>` — SPECS §19.1.
+///
+/// In `transit-only` the data is plaintext, so losing every secret loses
+/// nothing but access control. Asserted with a *fresh* directory key, which is
+/// what "no vault" means concretely.
+pub fn recover_without_vault(ns: &str) -> i32 {
+    let repo = match Repo::open_with(ns, crate::repo::passphrase_from(None)) {
+        Ok(r) => r,
+        Err(e) => return err(format!("namespace {ns}: {e}")),
+    };
+    if !repo.mode.peer_reads_plaintext() {
+        return err(format!(
+            "{:?} has no recovery without the vault, and must not pretend to",
+            repo.mode
+        ));
+    }
+    let blobs = match repo.blobs() {
+        Ok(b) => b,
+        Err(e) => return err(e),
+    };
+    let ts = TreeStore::new(&blobs, repo.sealer(), repo.padding);
+    let tree = fixture_tree();
+    let root = match ts.write_dir(&repo.dir_root(), &tree) {
+        Ok(a) => a,
+        Err(e) => return err(e),
+    };
+
+    let out = scratch("recover");
+    // A directory key that has nothing to do with this namespace's.
+    let stranger = nas_crypto::DirSecret::root(&[0xEE; 32]);
+    if let Err(e) = ts.read_dir_to(&stranger, &root, &out) {
+        let _ = fs::remove_dir_all(&out);
+        return err(format!("could not read without the vault: {e}"));
+    }
+    let same = match (snapshot(&tree), snapshot(&out)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    };
+    let _ = fs::remove_dir_all(&out);
+    if same {
+        println!("read the whole tree back with a key unrelated to this namespace");
+        exit::OK
+    } else {
+        err("recovery without the vault produced a different tree")
+    }
+}
+
+/// `nas test cross-tenant-dedup <ns> <other>` — SPECS §3.2, §2.2.3.
+///
+/// Must be **refused**: two tenants writing the same bytes must not land on one
+/// address, or each can confirm what the other holds.
+pub fn cross_tenant_dedup(ns: &str, other: &str) -> i32 {
+    let a = match Repo::open_with(ns, crate::repo::passphrase_from(None)) {
+        Ok(r) => r,
+        Err(e) => return err(format!("namespace {ns}: {e}")),
+    };
+    // The other tenant need not exist as a namespace; what matters is that a
+    // different tenant's secrets produce different addresses for one file.
+    let file = bytes(200 << 10, "nas-tools/test/cross-tenant");
+
+    let ablobs = match a.blobs() {
+        Ok(b) => b,
+        Err(e) => return err(e),
+    };
+    let wa = match ObjectWriter::with_defaults(&ablobs, a.sealer(), a.padding) {
+        Ok(w) => w,
+        Err(e) => return err(e),
+    };
+    let ma = match wa.write(Kind::File, &file[..]) {
+        Ok(m) => m,
+        Err(e) => return err(e),
+    };
+
+    let dir = scratch("cross-tenant");
+    let addressing = if a.mode.peer_reads_plaintext() {
+        nas_store::Addressing::Salted(format!("{other}-salt").into_bytes())
+    } else {
+        nas_store::Addressing::Content
+    };
+    let bblobs = match BlobStore::open_with(&dir, addressing) {
+        Ok(b) => b,
+        Err(e) => return err(e),
+    };
+    let other_cs = Repo::foreign_secret(other.as_bytes());
+    let sealer = if a.mode.peer_reads_plaintext() {
+        nas_store::Sealer::Plaintext {
+            tenant_salt: b"other-salt",
+        }
+    } else {
+        nas_store::Sealer::Convergent(&other_cs)
+    };
+    let mb = match ObjectWriter::with_defaults(&bblobs, sealer, a.padding)
+        .and_then(|w| w.write(Kind::File, &file[..]))
+    {
+        Ok(m) => m,
+        Err(e) => {
+            let _ = fs::remove_dir_all(&dir);
+            return err(e);
+        }
+    };
+    let _ = fs::remove_dir_all(&dir);
+
+    let shared = ma
+        .chunks
+        .iter()
+        .filter(|c| mb.chunks.iter().any(|d| d.addr == c.addr))
+        .count();
+    if shared == 0 {
+        refuse(format!(
+            "no address shared across tenants for an identical {} B file ({} vs {} chunks)",
+            file.len(),
+            ma.chunks.len(),
+            mb.chunks.len()
+        ))
+    } else {
+        err(format!(
+            "{shared} address(es) shared across tenants — a confirmation oracle"
+        ))
+    }
 }

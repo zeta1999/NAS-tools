@@ -259,6 +259,7 @@ impl Manifest {
         let key_scheme = match one("key_scheme", f[2])? {
             0 => KeyScheme::Convergent,
             1 => KeyScheme::IndexedRandom,
+            2 => KeyScheme::Plaintext,
             v => {
                 return Err(ManifestError::BadDiscriminant {
                     field: "key_scheme",
@@ -401,7 +402,11 @@ mod tests {
     fn the_key_scheme_survives_the_round_trip() {
         // SPECS §20.3: the convergent-vs-indexed decision stays revisable on
         // disk rather than welded into the format.
-        for k in [KeyScheme::Convergent, KeyScheme::IndexedRandom] {
+        for k in [
+            KeyScheme::Convergent,
+            KeyScheme::IndexedRandom,
+            KeyScheme::Plaintext,
+        ] {
             let mut m = sample();
             m.key_scheme = k;
             assert_eq!(

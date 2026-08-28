@@ -254,6 +254,17 @@ fn ns(args: &[String]) -> i32 {
     }
 }
 
+/// Every `nas test <check> <ns>` command has the same shape.
+fn one_ns(pos: &[&str], f: impl Fn(&str) -> i32) -> i32 {
+    match pos.get(1) {
+        Some(ns) => f(ns),
+        None => {
+            eprintln!("usage: nas test {} <ns>", pos.first().unwrap_or(&"<check>"));
+            exit::ERROR
+        }
+    }
+}
+
 fn test(args: &[String]) -> i32 {
     let pos = positional(args);
     match pos.first().copied() {
@@ -352,6 +363,19 @@ fn test(args: &[String]) -> i32 {
             Some(ns) => testcmds::old_wrap_deleted(ns),
             None => {
                 eprintln!("usage: nas test old-wrap-deleted <ns>");
+                exit::ERROR
+            }
+        },
+        Some("peer-holds-plaintext") => one_ns(&pos, testcmds::peer_holds_plaintext),
+        Some("peer-names-visible") => one_ns(&pos, |n| testcmds::peer_names(n, true)),
+        Some("peer-names-encrypted") => one_ns(&pos, |n| testcmds::peer_names(n, false)),
+        Some("listing-is-local") => one_ns(&pos, testcmds::listing_is_local),
+        Some("slot-signed") => one_ns(&pos, testcmds::slot_signed),
+        Some("recover-without-vault") => one_ns(&pos, testcmds::recover_without_vault),
+        Some("cross-tenant-dedup") => match (pos.get(1), pos.get(2)) {
+            (Some(ns), Some(other)) => testcmds::cross_tenant_dedup(ns, other),
+            _ => {
+                eprintln!("usage: nas test cross-tenant-dedup <ns> <other>");
                 exit::ERROR
             }
         },

@@ -80,6 +80,13 @@ listing; lease-based GC with deltas; **three confidentiality modes** (`e2ee`,
   proof-of-possession responder — and `Hostility`, which is a flag on the real
   peer rather than a mock, so the attack path and the honest path share their
   parsing and bookkeeping. **35 tests green.**
+- **`crates/nas-transfer`** — SPECS §14. A bounded request/response protocol
+  over `simple-network`'s **synchronous** PQC handshake, so NAS-tools needs no
+  async runtime of its own. Every frame is size-checked *before* allocation —
+  otherwise a peer answers with `0xFFFFFFFF` and the client reserves four
+  gigabytes for four bytes of effort. **Eight integration tests cross a real
+  socket**, and they exist to prove the client-side defences still fire against
+  a networked peer rather than only an in-process one. **23 tests green.**
 - **`crates/nas-cli`** — the `nas` binary. Exit codes are a *contract*: 0 ok,
   1 error, 2 refused by policy, **3 unimplemented**. A specified-but-unbuilt
   subcommand must never exit 2, or the harness would score unwritten code as a
@@ -94,10 +101,10 @@ listing; lease-based GC with deltas; **three confidentiality modes** (`e2ee`,
 
 ## Fuzzing
 
-Eleven targets under `fuzz/`, one per parser that consumes bytes it did not
+Twelve targets under `fuzz/`, one per parser that consumes bytes it did not
 write: `decode_fields`, `addr_from_hex`, `unpad`, `manifest_decode`,
 `dir_manifest_decode`, `aead_open`, `slot_record_decode`, `witness_decode`,
-`lease_decode`, `wrap_decode`.
+`lease_decode`, `wrap_decode`, `wire_decode`.
 The last two were added **with** the formats they parse, not after — SPECS §20
 lists the peer's plaintext records as format-breaking to change once written. They assert *properties* — injectivity,
 canonical re-encoding, and that attacker bytes never open — not merely absence
@@ -149,7 +156,7 @@ M1 remainder: the two remaining
 confidentiality modes, `nas-transfer`, and `nas-peer` built hostile from day
 one. `ci.sh` is green end to end today: 97 Rust tests, 11 Lean theorems verified
 with a clean axiom gate, TLC green with its three sanity checks still failing as
-required, and 5 acceptance assertions actually passing at M0 (25 at M1). 319 Rust tests total.
+required, and 5 acceptance assertions actually passing at M0 (25 at M1). 342 Rust tests total.
 
 > The TLA+ model constrains SPECS §5, which is **M2** code. It is assurance
 > about the design, not about anything shipped in M0.

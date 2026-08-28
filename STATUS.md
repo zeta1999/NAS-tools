@@ -62,6 +62,10 @@ listing; lease-based GC with deltas; **three confidentiality modes** (`e2ee`,
   client accept logic that is the Rust counterpart of `SlotConsistency.tla` —
   `AnchorFloor`, `MonotonicPins` and `ForkDetected` each map to a specific
   rejection or alarm. **57 tests green.**
+- **`crates/nas-lease`** — SPECS §6. Deltas and checkpoints, a count-committed
+  Merkle root, chain replay, and the sweep decision — the only code in the
+  system that deletes user data, so every guard §6.2–§6.4 names is a separate
+  named reason rather than one folded boolean. **45 tests green.**
 - **`crates/nas-cli`** — the `nas` binary. Exit codes are a *contract*: 0 ok,
   1 error, 2 refused by policy, **3 unimplemented**. A specified-but-unbuilt
   subcommand must never exit 2, or the harness would score unwritten code as a
@@ -73,9 +77,10 @@ listing; lease-based GC with deltas; **three confidentiality modes** (`e2ee`,
 
 ## Fuzzing
 
-Eight targets under `fuzz/`, one per parser that consumes bytes it did not
+Nine targets under `fuzz/`, one per parser that consumes bytes it did not
 write: `decode_fields`, `addr_from_hex`, `unpad`, `manifest_decode`,
-`dir_manifest_decode`, `aead_open`, `slot_record_decode`, `witness_decode`.
+`dir_manifest_decode`, `aead_open`, `slot_record_decode`, `witness_decode`,
+`lease_decode`.
 The last two were added **with** the formats they parse, not after — SPECS §20
 lists the peer's plaintext records as format-breaking to change once written. They assert *properties* — injectivity,
 canonical re-encoding, and that attacker bytes never open — not merely absence
@@ -121,11 +126,11 @@ See `MANUAL-TESTING.md` §5 for the commands and raw output.
 
 ## Not built
 
-M1 remainder: `nas-lease`, `nas-vault`, the two remaining
+M1 remainder: `nas-vault`, the two remaining
 confidentiality modes, `nas-transfer`, and `nas-peer` built hostile from day
 one. `ci.sh` is green end to end today: 97 Rust tests, 11 Lean theorems verified
 with a clean axiom gate, TLC green with its three sanity checks still failing as
-required, and 5 acceptance assertions actually passing. 180 Rust tests total.
+required, and 5 acceptance assertions actually passing. 225 Rust tests total.
 
 > The TLA+ model constrains SPECS §5, which is **M2** code. It is assurance
 > about the design, not about anything shipped in M0.

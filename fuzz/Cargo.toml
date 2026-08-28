@@ -16,6 +16,7 @@ cargo-fuzz = true
 libfuzzer-sys = "0.4"
 nas-core = { path = "../crates/nas-core" }
 nas-crypto = { path = "../crates/nas-crypto" }
+nas-lease = { path = "../crates/nas-lease" }
 nas-slots = { path = "../crates/nas-slots" }
 nas-store = { path = "../crates/nas-store" }
 
@@ -67,5 +68,11 @@ doc = false
 [[bin]]
 name = "witness_decode"
 path = "fuzz_targets/witness_decode.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "lease_decode"
+path = "fuzz_targets/lease_decode.rs"
 test = false
 doc = false

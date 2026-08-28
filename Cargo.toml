@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/nas-core", "crates/nas-crypto", "crates/nas-store", "crates/nas-cli", "crates/nas-slots"]
+members = ["crates/nas-core", "crates/nas-crypto", "crates/nas-store", "crates/nas-cli", "crates/nas-slots", "crates/nas-lease"]
 
 [workspace.package]
 edition = "2021"

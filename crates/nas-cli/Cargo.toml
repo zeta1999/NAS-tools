@@ -13,3 +13,4 @@ blake3 = { workspace = true }
 nas-core = { path = "../nas-core" }
 nas-crypto = { path = "../nas-crypto" }
 nas-store = { path = "../nas-store" }
+nas-vault = { path = "../nas-vault" }

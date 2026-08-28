@@ -19,6 +19,7 @@ nas-crypto = { path = "../crates/nas-crypto" }
 nas-lease = { path = "../crates/nas-lease" }
 nas-slots = { path = "../crates/nas-slots" }
 nas-store = { path = "../crates/nas-store" }
+nas-vault = { path = "../crates/nas-vault" }
 
 [profile.release]
 debug = 1
@@ -74,5 +75,11 @@ doc = false
 [[bin]]
 name = "lease_decode"
 path = "fuzz_targets/lease_decode.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "wrap_decode"
+path = "fuzz_targets/wrap_decode.rs"
 test = false
 doc = false

@@ -389,6 +389,7 @@ dependencies = [
  "nas-lease",
  "nas-slots",
  "nas-store",
+ "nas-vault",
 ]
 
 [[package]]
@@ -416,6 +417,18 @@ dependencies = [
  "blake3",
  "nas-core",
  "nas-crypto",
+ "zeroize",
+]
+
+[[package]]
+name = "nas-vault"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "nas-core",
+ "nas-crypto",
+ "nas-slots",
+ "secure-memory",
  "zeroize",
 ]
 

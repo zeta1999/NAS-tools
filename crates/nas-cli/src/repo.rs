@@ -7,33 +7,45 @@
 //! $NAS_HOME/<ns>/state/HEAD       the root directory manifest address
 //! ```
 //!
-//! # The vault is not a vault yet
+//! # The vault
 //!
-//! SPECS §3.1 puts `CS` and the identity keys in `vault.bin`, held by `nasd`
-//! and never written in the clear. At M0 there is no daemon and no key
-//! derivation from a passphrase, so this file stores the secrets **unencrypted
-//! at 0600**. That is a real weakness and it is written here rather than
-//! discovered later: `nas-vault` is M1 step 7, and until it lands a namespace
-//! is only as safe as the local disk.
+//! `vault.bin` is a sealed [`nas_vault::Vault`] (SPECS §3.1): one 32-byte seed
+//! from which every role identity derives, plus the convergence-secret
+//! generations and the pinned peers. Sealed with XChaCha20-Poly1305 under a
+//! **vault key**, and written 0600 as well — the file permission is a second
+//! line, not the only one.
+//!
+//! Where the vault key comes from is the mode's business (SPECS §2.2). `e2ee`
+//! takes a high-entropy key the user holds; `passphrase` derives one with
+//! Argon2id. M1 stores the `e2ee` key in `vault.key` beside the vault, which is
+//! **not yet meaningful protection** — it moves the secret rather than
+//! protecting it — and that is stated in [`VAULT_WARNING`] rather than left to
+//! be discovered. An OS keychain or a passphrase-derived key is what makes it
+//! real, and both are recorded in TODO.md.
+//!
+//! What *has* changed since M0 is that the convergence secret and the namespace
+//! root are no longer on disk in the clear, the identity is derived from a seed
+//! rather than absent, and the container is versioned and authenticated.
 //!
 //! `state/` is local-only and never shipped to a peer (SPECS §4).
 
 use nas_core::{KeyScheme, Mode, PaddingProfile};
-use nas_crypto::{ConvergenceSecret, DirSecret, KEY_LEN};
+use nas_crypto::{random, ConvergenceSecret, DirSecret, Identity, Role, KEY_LEN};
+use nas_vault::Vault;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-pub const VAULT_WARNING: &str =
-    "M0: secrets are stored UNENCRYPTED at 0600. nas-vault (M1) replaces this.";
+pub const VAULT_WARNING: &str = "M1: the vault is sealed, but its key sits beside it in vault.key \
+     (0600). That relocates the secret rather than protecting it — an OS keychain \
+     or a passphrase-derived key is what makes it real.";
 
 pub struct Repo {
     pub root: PathBuf,
     pub mode: Mode,
     pub key_scheme: KeyScheme,
     pub padding: PaddingProfile,
-    cs: [u8; KEY_LEN],
-    ns_root: [u8; KEY_LEN],
+    vault: Vault,
 }
 
 fn home() -> PathBuf {
@@ -84,18 +96,11 @@ pub fn parse_padding(s: &str) -> Option<PaddingProfile> {
 
 /// 32 bytes from the OS CSPRNG.
 ///
-/// Read straight from `/dev/urandom` rather than through a crate. This is the
-/// one place M0 needs randomness and the requirement is exactly "the kernel's
-/// CSPRNG"; a short read is a hard error, never silently padded with zeros.
+/// Delegates to `nas_crypto::random`, which is the single place entropy enters
+/// the system — including the all-zero check, so it exists once rather than in
+/// each caller that remembers to write it.
 pub fn random_secret() -> io::Result<[u8; KEY_LEN]> {
-    use io::Read;
-    let mut f = fs::File::open("/dev/urandom")?;
-    let mut b = [0u8; KEY_LEN];
-    f.read_exact(&mut b)?;
-    if b == [0u8; KEY_LEN] {
-        return Err(io::Error::other("CSPRNG returned all zeros"));
-    }
-    Ok(b)
+    random::array()
 }
 
 #[cfg(unix)]
@@ -130,8 +135,8 @@ impl Repo {
     ) -> io::Result<Self> {
         let root = path_of(ns);
         fs::create_dir_all(root.join("state"))?;
-        let cs = random_secret()?;
-        let ns_root = random_secret()?;
+        let vault = Vault::create().map_err(|e| io::Error::other(e.to_string()))?;
+        let vault_key = random_secret()?;
 
         fs::write(
             root.join("config"),
@@ -146,20 +151,18 @@ impl Repo {
             ),
         )?;
 
-        let mut vault = Vec::with_capacity(64 + VAULT_WARNING.len());
-        vault.extend_from_slice(VAULT_WARNING.as_bytes());
-        vault.push(b'\n');
-        vault.extend_from_slice(&cs);
-        vault.extend_from_slice(&ns_root);
-        write_private(&root.join("vault"), &vault)?;
+        let sealed = vault
+            .seal_with(vault_key)
+            .map_err(|e| io::Error::other(e.to_string()))?;
+        write_private(&root.join("vault.bin"), &sealed)?;
+        write_private(&root.join("vault.key"), &vault_key)?;
 
         Ok(Self {
             root,
             mode,
             key_scheme,
             padding,
-            cs,
-            ns_root,
+            vault,
         })
     }
 
@@ -185,31 +188,37 @@ impl Repo {
             }
         }
 
-        let vault = fs::read(root.join("vault"))?;
-        let nl = vault
-            .iter()
-            .position(|&b| b == b'\n')
-            .ok_or_else(|| io::Error::other("malformed vault"))?;
-        let secrets = &vault[nl + 1..];
-        if secrets.len() < KEY_LEN * 2 {
-            return Err(io::Error::other("truncated vault"));
-        }
-        let mut cs = [0u8; KEY_LEN];
-        let mut ns_root = [0u8; KEY_LEN];
-        cs.copy_from_slice(&secrets[..KEY_LEN]);
-        ns_root.copy_from_slice(&secrets[KEY_LEN..KEY_LEN * 2]);
+        let sealed = fs::read(root.join("vault.bin"))?;
+        let key_bytes = fs::read(root.join("vault.key"))?;
+        let vault_key: [u8; KEY_LEN] = key_bytes
+            .as_slice()
+            .try_into()
+            .map_err(|_| io::Error::other("vault.key is not 32 bytes"))?;
+        let vault =
+            Vault::open_with(&sealed, vault_key).map_err(|e| io::Error::other(e.to_string()))?;
         Ok(Self {
             root,
             mode,
             key_scheme,
             padding,
-            cs,
-            ns_root,
+            vault,
         })
     }
 
+    /// A role identity from the vault seed (SPECS §3.1).
+    pub fn identity(&self, role: Role) -> io::Result<Identity> {
+        self.vault
+            .identity(role)
+            .map_err(|e| io::Error::other(e.to_string()))
+    }
+
+    /// The convergence-secret generation new writes use (SPECS §3.9c).
+    pub fn generation(&self) -> u32 {
+        self.vault.current_generation().number
+    }
+
     pub fn convergence_secret(&self) -> ConvergenceSecret {
-        ConvergenceSecret::from_bytes(self.cs)
+        self.vault.current_generation().convergence_secret()
     }
 
     /// A convergence secret that is **not** this namespace's — for modelling an
@@ -218,8 +227,9 @@ impl Repo {
         ConvergenceSecret::from_bytes(blake3::derive_key("nas-tools/test/foreign-cs/v1", tag))
     }
 
+    /// Root of the per-directory key chain (SPECS §3.1, §15.3).
     pub fn dir_root(&self) -> DirSecret {
-        DirSecret::root(&self.ns_root)
+        self.vault.dir_root()
     }
 
     pub fn blobs_root(&self) -> PathBuf {

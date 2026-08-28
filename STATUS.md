@@ -66,6 +66,12 @@ listing; lease-based GC with deltas; **three confidentiality modes** (`e2ee`,
   Merkle root, chain replay, and the sweep decision — the only code in the
   system that deletes user data, so every guard §6.2–§6.4 names is a separate
   named reason rather than one folded boolean. **45 tests green.**
+- **`crates/nas-vault`** — SPECS §2.2.2 and §3.9. Argon2id parameters with the
+  floor as an explicit *policy* rather than a constructor constant (so tests
+  cannot quietly weaken production); `NamespaceSecrets` derived from a DEK; the
+  `WrapRecord` that **is** the capability for passphrase mode, carrying the
+  freshness anchor; and the sealed local vault with `CS` generations and pinned
+  peers. **42 tests green.**
 - **`crates/nas-cli`** — the `nas` binary. Exit codes are a *contract*: 0 ok,
   1 error, 2 refused by policy, **3 unimplemented**. A specified-but-unbuilt
   subcommand must never exit 2, or the harness would score unwritten code as a
@@ -77,10 +83,10 @@ listing; lease-based GC with deltas; **three confidentiality modes** (`e2ee`,
 
 ## Fuzzing
 
-Nine targets under `fuzz/`, one per parser that consumes bytes it did not
+Eleven targets under `fuzz/`, one per parser that consumes bytes it did not
 write: `decode_fields`, `addr_from_hex`, `unpad`, `manifest_decode`,
 `dir_manifest_decode`, `aead_open`, `slot_record_decode`, `witness_decode`,
-`lease_decode`.
+`lease_decode`, `wrap_decode`.
 The last two were added **with** the formats they parse, not after — SPECS §20
 lists the peer's plaintext records as format-breaking to change once written. They assert *properties* — injectivity,
 canonical re-encoding, and that attacker bytes never open — not merely absence
@@ -110,11 +116,12 @@ See `MANUAL-TESTING.md` §5 for the commands and raw output.
 
 ## Known weaknesses, stated rather than discovered later
 
-- **The vault is not a vault yet.** `nas ns create` writes `CS` and the
-  namespace root secret **unencrypted at 0600**. There is no daemon and no
-  passphrase KDF at M0; `nas-vault` is M1 step 7. Until it lands a namespace is
-  only as safe as the local disk. `--mode passphrase` exits 3 rather than
-  creating a namespace whose config claims a protection it does not have.
+- **The vault key sits beside the vault.** `vault.bin` is now sealed and
+  authenticated (that was the M0 weakness, and it is closed), but `vault.key` is
+  written next to it at 0600. That *relocates* the secret rather than protecting
+  it. An OS keychain or a passphrase-derived key is what makes it real; both are
+  in TODO. `--mode passphrase` still exits 3 rather than creating a namespace
+  whose config claims a protection it does not have.
 - **Names are not separately encrypted.** SPECS §4.4 specifies Cryptomator-style
   per-segment encryption; that design exists because Cryptomator maps segments
   onto *server filenames*. Here the peer sees `blobs/<ab>/<hex>` and names live
@@ -126,11 +133,11 @@ See `MANUAL-TESTING.md` §5 for the commands and raw output.
 
 ## Not built
 
-M1 remainder: `nas-vault`, the two remaining
+M1 remainder: the two remaining
 confidentiality modes, `nas-transfer`, and `nas-peer` built hostile from day
 one. `ci.sh` is green end to end today: 97 Rust tests, 11 Lean theorems verified
 with a clean axiom gate, TLC green with its three sanity checks still failing as
-required, and 5 acceptance assertions actually passing. 225 Rust tests total.
+required, and 5 acceptance assertions actually passing. 270 Rust tests total.
 
 > The TLA+ model constrains SPECS §5, which is **M2** code. It is assurance
 > about the design, not about anything shipped in M0.

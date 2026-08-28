@@ -100,8 +100,16 @@ settled and the work that follows from them.
       the peer legitimately reads plaintext and names must be *visible*. M1.
 - [ ] **Store symlinks.** Currently skipped: following them lets a tree escape
       its own root, and storing them needs a manifest field that does not exist.
-- [ ] **`nas-vault` (M1 step 7) replaces the M0 plaintext vault.** `ns create`
-      writes `CS` and the namespace root secret unencrypted at 0600 today.
+- [x] **`nas-vault` replaces the M0 plaintext vault.** `vault.bin` is sealed and
+      authenticated; the seed derives every role identity; `CS` generations are
+      kept on rotation so revocation is not a data-loss event.
+- [ ] **The vault key still sits beside the vault** in `vault.key` (0600), which
+      relocates the secret rather than protecting it. Needs an OS keychain
+      (Keychain / Secret Service) or a passphrase-derived vault key. Until then
+      `e2ee` at rest is only as strong as the local disk.
+- [ ] Wire `--mode passphrase` through the CLI now that `WrapRecord` exists:
+      `ns create --mode passphrase`, `ns open --passphrase`, and the six M1
+      assertions in `uc02` that depend on them.
 - [ ] **The root manifest key `rk_v` is unbuilt.** SPECS §3.1 specifies
       per-version derivation `derive_key("nas-tools/root/v1", root_secret ‖
       le64(seq))`; M0 uses a local `state/HEAD` file and never derives it. The

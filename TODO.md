@@ -112,6 +112,9 @@ settled and the work that follows from them.
       record rather than from a constant in the binary, the wrong-passphrase
       refusal at exit 2, re-wrap without re-encryption, recovery carrying the
       freshness anchor, and superseded wraps removed.
+- [x] **`transit-only` mode** (SPECS §2.2.3): plaintext at rest, per-tenant
+      salted addressing, visible filenames, directory manifests stored
+      unsealed. UC01 is green but for the two peer-enforced ACL assertions.
 - [ ] Interactive passphrase prompt. There is none: the CLI takes
       `--passphrase` or `$NAS_PASSPHRASE` and refuses otherwise, because a
       prompt that silently fell back to a default would be worse than none.

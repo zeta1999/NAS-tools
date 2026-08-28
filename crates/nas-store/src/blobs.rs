@@ -4,6 +4,20 @@
 //! plaintext (SPECS §3.4). That is what lets an untrusted peer run exactly this
 //! code: verifying a blob needs no key, so integrity checking can be delegated
 //! to a machine that is handed nothing readable.
+//!
+//! # Two addressing schemes, one property
+//!
+//! `transit-only` stores plaintext and addresses `BLAKE3(tenant_salt ‖ bytes)`
+//! (SPECS §2.2.3), so the store has to know which scheme it is running. It is a
+//! property of the store rather than an argument to each call, because a store
+//! that could be asked to file one blob one way and the next another would
+//! produce a directory in which `get` cannot verify anything.
+//!
+//! The property that matters survives both: **verification still needs no
+//! secret.** The tenant salt is not secret — it only has to be unshared — so a
+//! peer holding it can check every blob it stores without being able to read
+//! any of them in the encrypted modes, and without gaining anything it did not
+//! already have in `transit-only`.
 
 use nas_core::Addr;
 use std::fs;
@@ -48,25 +62,67 @@ impl From<io::Error> for StoreError {
     }
 }
 
+/// How a blob's address is derived from its bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Addressing {
+    /// `addr = BLAKE3(bytes)`. The encrypted modes, where the bytes are
+    /// ciphertext (SPECS §3.4).
+    Content,
+    /// `addr = BLAKE3(len(salt) ‖ salt ‖ bytes)`. `transit-only`, where the
+    /// bytes are plaintext and an unsalted address would hand every co-tenant
+    /// on a shared peer a confirmation oracle (SPECS §2.2.3).
+    Salted(Vec<u8>),
+}
+
+impl Addressing {
+    pub fn addr_of(&self, bytes: &[u8]) -> Addr {
+        match self {
+            Self::Content => Addr::of_ciphertext(bytes),
+            Self::Salted(salt) => {
+                let mut h = blake3::Hasher::new();
+                h.update(&(salt.len() as u64).to_le_bytes());
+                h.update(salt);
+                h.update(bytes);
+                Addr::from_bytes(*h.finalize().as_bytes())
+            }
+        }
+    }
+
+    pub fn verifies(&self, addr: &Addr, bytes: &[u8]) -> bool {
+        self.addr_of(bytes) == *addr
+    }
+}
+
 /// A directory of blobs.
 #[derive(Debug)]
 pub struct BlobStore {
     root: PathBuf,
+    addressing: Addressing,
     /// Makes temporary names unique within a process. Two processes are
     /// separated by the pid also in the name.
     seq: AtomicU64,
 }
 
 impl BlobStore {
-    /// Open (creating if absent) a blob store rooted at `root`.
+    /// Open (creating if absent) a content-addressed blob store.
     pub fn open(root: impl Into<PathBuf>) -> Result<Self, StoreError> {
+        Self::open_with(root, Addressing::Content)
+    }
+
+    /// Open a store with an explicit addressing scheme.
+    pub fn open_with(root: impl Into<PathBuf>, addressing: Addressing) -> Result<Self, StoreError> {
         let root = root.into();
         fs::create_dir_all(root.join("blobs"))?;
         fs::create_dir_all(root.join("tmp"))?;
         Ok(Self {
             root,
+            addressing,
             seq: AtomicU64::new(0),
         })
+    }
+
+    pub fn addressing(&self) -> &Addressing {
+        &self.addressing
     }
 
     pub fn root(&self) -> &Path {
@@ -96,12 +152,12 @@ impl BlobStore {
     /// turn a corrupt local blob into permanent silent data loss the moment a
     /// second copy of the same chunk was offered and discarded.
     pub fn put(&self, ciphertext: &[u8]) -> Result<Addr, StoreError> {
-        let addr = Addr::of_ciphertext(ciphertext);
+        let addr = self.addressing.addr_of(ciphertext);
         let dest = self.path(&addr);
 
         if dest.exists() {
             match fs::read(&dest) {
-                Ok(existing) if addr.verifies(&existing) => return Ok(addr),
+                Ok(existing) if self.addressing.verifies(&addr, &existing) => return Ok(addr),
                 Ok(_) | Err(_) => { /* fall through and rewrite it */ }
             }
         }
@@ -140,10 +196,10 @@ impl BlobStore {
             }
             Err(e) => return Err(StoreError::Io(e)),
         };
-        if !addr.verifies(&bytes) {
+        if !self.addressing.verifies(addr, &bytes) {
             return Err(StoreError::Corrupt {
                 addr: *addr,
-                found: Addr::of_ciphertext(&bytes),
+                found: self.addressing.addr_of(&bytes),
             });
         }
         Ok(bytes)
@@ -313,6 +369,50 @@ mod tests {
         fs::write(s.0.join("blobs").join(&shard).join("not-an-address"), b"x").unwrap();
         fs::create_dir_all(s.0.join("blobs").join("zz")).unwrap();
         assert_eq!(st.addrs().unwrap(), vec![a]);
+    }
+
+    #[test]
+    fn a_salted_store_addresses_and_verifies_consistently() {
+        let s = Scratch::new("salted");
+        let st = BlobStore::open_with(&s.0, Addressing::Salted(b"tenant-a".to_vec())).unwrap();
+        let a = st.put(b"plaintext at rest").unwrap();
+        assert_eq!(st.get(&a).unwrap(), b"plaintext at rest");
+        // Integrity still checks without any secret.
+        fs::write(st.path(&a), b"plaintext at rezt").unwrap();
+        assert!(matches!(st.get(&a), Err(StoreError::Corrupt { .. })));
+    }
+
+    #[test]
+    fn two_tenants_do_not_share_an_address_for_one_file() {
+        // SPECS §2.2.3: an unsalted address hands every co-tenant on a shared
+        // peer a confirmation oracle -- upload a candidate, watch for the
+        // dedup skip, learn somebody else holds it.
+        let a = Addressing::Salted(b"tenant-a".to_vec());
+        let b = Addressing::Salted(b"tenant-b".to_vec());
+        let file = b"a candidate file an attacker also has";
+        assert_ne!(a.addr_of(file), b.addr_of(file));
+        // And neither matches the unsalted address, so a Content store and a
+        // Salted store never collide either.
+        assert_ne!(a.addr_of(file), Addressing::Content.addr_of(file));
+    }
+
+    #[test]
+    fn salt_boundaries_are_unambiguous() {
+        // Without the length prefix, salts "ab"+"c" and "a"+"bc" would put two
+        // tenants back in one dedup pool and reinstate the oracle.
+        let x = Addressing::Salted(b"ab".to_vec()).addr_of(b"c-payload");
+        let y = Addressing::Salted(b"a".to_vec()).addr_of(b"bc-payload");
+        assert_ne!(x, y);
+    }
+
+    #[test]
+    fn a_salted_store_still_deduplicates_within_the_tenant() {
+        let s = Scratch::new("salted-dedup");
+        let st = BlobStore::open_with(&s.0, Addressing::Salted(b"t".to_vec())).unwrap();
+        let a = st.put(b"same chunk").unwrap();
+        let b = st.put(b"same chunk").unwrap();
+        assert_eq!(a, b);
+        assert_eq!(st.addrs().unwrap().len(), 1);
     }
 
     #[test]

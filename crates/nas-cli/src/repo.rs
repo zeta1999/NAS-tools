@@ -58,6 +58,14 @@ pub struct Repo {
     pub key_scheme: KeyScheme,
     pub padding: PaddingProfile,
     secrets: Secrets,
+    /// Materialised once at open, so [`sealer`](Self::sealer) can hand out a
+    /// borrow rather than every caller re-deriving it.
+    cs_holder: ConvergenceSecret,
+    /// `transit-only` only (SPECS §2.2.3). **Not secret** — it only has to be
+    /// unshared, which is why it lives in the plaintext config rather than in
+    /// the vault. Its job is to keep two tenants on one peer out of a shared
+    /// dedup pool, not to hide anything.
+    tenant_salt: Vec<u8>,
 }
 
 /// Where wrap records live. Named per sequence so a superseded one can be
@@ -103,6 +111,27 @@ pub fn parse_mode(s: &str) -> Option<Mode> {
         "transit-only" => Some(Mode::TransitOnly),
         _ => None,
     }
+}
+
+fn key_scheme_str(k: KeyScheme) -> &'static str {
+    match k {
+        KeyScheme::Convergent => "convergent",
+        KeyScheme::IndexedRandom => "indexed-random",
+        KeyScheme::Plaintext => "plaintext",
+    }
+}
+
+fn hex(b: &[u8]) -> String {
+    b.iter().map(|x| format!("{x:02x}")).collect()
+}
+
+fn unhex(s: &str) -> Option<Vec<u8>> {
+    if !s.len().is_multiple_of(2) {
+        return None;
+    }
+    (0..s.len() / 2)
+        .map(|i| u8::from_str_radix(s.get(i * 2..i * 2 + 2)?, 16).ok())
+        .collect()
 }
 
 fn padding_str(p: PaddingProfile) -> &'static str {
@@ -208,17 +237,24 @@ impl Repo {
         let root = path_of(ns);
         fs::create_dir_all(root.join("state"))?;
         fs::create_dir_all(root.join("wraps"))?;
+        // Fresh per namespace. Not secret, so it goes in the plaintext config.
+        let tenant_salt = random_secret()?.to_vec();
+        // The key scheme follows the mode: transit-only has no chunk keys at
+        // all (SPECS §2.2.3), so recording "convergent" there would make every
+        // manifest claim a protection the blobs do not have.
+        let key_scheme = match mode {
+            Mode::TransitOnly => KeyScheme::Plaintext,
+            Mode::E2ee | Mode::Passphrase => key_scheme,
+        };
 
         fs::write(
             root.join("config"),
             format!(
-                "version 1\nmode {}\nkey_scheme {}\npadding_profile {}\n",
+                "version 1\nmode {}\nkey_scheme {}\npadding_profile {}\ntenant_salt {}\n",
                 mode_str(mode),
-                match key_scheme {
-                    KeyScheme::Convergent => "convergent",
-                    KeyScheme::IndexedRandom => "indexed-random",
-                },
+                key_scheme_str(key_scheme),
                 padding_str(padding),
+                hex(&tenant_salt),
             ),
         )?;
 
@@ -264,12 +300,15 @@ impl Repo {
             }
         };
 
+        let cs_holder = secrets_convergence(&secrets);
         Ok(Self {
             root,
             mode,
             key_scheme,
             padding,
             secrets,
+            cs_holder,
+            tenant_salt,
         })
     }
 
@@ -303,6 +342,7 @@ impl Repo {
         let mut mode = Mode::E2ee;
         let mut key_scheme = KeyScheme::Convergent;
         let mut padding = PaddingProfile::None;
+        let mut tenant_salt: Vec<u8> = Vec::new();
         for line in cfg.lines() {
             let mut it = line.split_whitespace();
             match (it.next(), it.next()) {
@@ -315,8 +355,21 @@ impl Repo {
                 (Some("key_scheme"), Some("indexed-random")) => {
                     key_scheme = KeyScheme::IndexedRandom
                 }
+                (Some("key_scheme"), Some("plaintext")) => key_scheme = KeyScheme::Plaintext,
+                (Some("tenant_salt"), Some(v)) => {
+                    tenant_salt =
+                        unhex(v).ok_or_else(|| io::Error::other("malformed tenant_salt"))?
+                }
                 _ => {}
             }
+        }
+        // A transit-only namespace with no salt would put every tenant on the
+        // peer into one dedup pool -- the confirmation oracle SPECS §2.2.3
+        // closes. Refuse rather than silently defaulting to empty.
+        if mode == Mode::TransitOnly && tenant_salt.is_empty() {
+            return Err(io::Error::other(
+                "transit-only namespace has no tenant_salt in its config",
+            ));
         }
 
         let secrets = match mode {
@@ -343,12 +396,15 @@ impl Repo {
                 Secrets::Vault(Box::new(vault))
             }
         };
+        let cs_holder = secrets_convergence(&secrets);
         Ok(Self {
             root,
             mode,
             key_scheme,
             padding,
             secrets,
+            cs_holder,
+            tenant_salt,
         })
     }
 
@@ -401,19 +457,33 @@ impl Repo {
     }
 
     pub fn convergence_secret(&self) -> ConvergenceSecret {
-        match &self.secrets {
-            Secrets::Vault(v) => v.current_generation().convergence_secret(),
-            // SPECS §2.2.2: per-namespace, not tenant-wide. Otherwise a
-            // passphrase namespace would need a vault secret to write and
-            // "recoverable from memory alone" would be false.
-            Secrets::Passphrase(ns, _) => ns.convergence_secret(),
-        }
+        self.cs_holder.clone()
     }
 
     /// A convergence secret that is **not** this namespace's — for modelling an
     /// attacker who lacks it (SPECS §3.2, §12.5).
     pub fn foreign_secret(tag: &[u8]) -> ConvergenceSecret {
         ConvergenceSecret::from_bytes(blake3::derive_key("nas-tools/test/foreign-cs/v1", tag))
+    }
+
+    /// How this namespace protects chunks at rest.
+    pub fn sealer(&self) -> nas_store::Sealer<'_> {
+        match self.mode {
+            Mode::TransitOnly => nas_store::Sealer::Plaintext {
+                tenant_salt: &self.tenant_salt,
+            },
+            Mode::E2ee | Mode::Passphrase => nas_store::Sealer::Convergent(&self.cs_holder),
+        }
+    }
+
+    /// The blob store, opened with the addressing this mode requires.
+    pub fn blobs(&self) -> Result<nas_store::BlobStore, io::Error> {
+        let addressing = match self.mode {
+            Mode::TransitOnly => nas_store::Addressing::Salted(self.tenant_salt.clone()),
+            Mode::E2ee | Mode::Passphrase => nas_store::Addressing::Content,
+        };
+        nas_store::BlobStore::open_with(self.blobs_root(), addressing)
+            .map_err(|e| io::Error::other(e.to_string()))
     }
 
     /// Root of the per-directory key chain (SPECS §3.1, §15.3).
@@ -436,5 +506,15 @@ impl Repo {
 
     pub fn set_head(&self, addr: &str) -> io::Result<()> {
         fs::write(self.root.join("state/HEAD"), format!("{addr}\n"))
+    }
+}
+
+/// SPECS §2.2.2: per-namespace convergence, not tenant-wide. Otherwise a
+/// passphrase namespace would need a vault secret in order to write, and
+/// "recoverable from memory alone" would be false.
+fn secrets_convergence(s: &Secrets) -> ConvergenceSecret {
+    match s {
+        Secrets::Vault(v) => v.current_generation().convergence_secret(),
+        Secrets::Passphrase(ns, _) => ns.convergence_secret(),
     }
 }

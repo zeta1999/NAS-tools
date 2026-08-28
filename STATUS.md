@@ -79,9 +79,10 @@ listing; lease-based GC with deltas; **three confidentiality modes** (`e2ee`,
 - **`tests/usecases/`** — 83 acceptance assertions, milestone-gated; 53 are
   M0–M2. **5 passing, 0 failing, 78 pending** at `NAS_MILESTONE=M0` (what CI
   gates on), and **16 passing, 9 failing, 58 pending** at `NAS_MILESTONE=M1` —
-  UC02, the passphrase use case, is now green end to end. The 9 M1 failures all
-  need `nas-peer`: peer-enforced ACLs, transit-only plaintext, slot publication
-  and cross-tenant checks. Verified to
+  UC02 (passphrase) and UC03 (e2ee) are green end to end, and UC01
+  (transit-only) is green but for two peer-enforced ACL assertions — the only
+  two M1 failures left, and both genuinely need `nas-peer`. They report exit 3
+  (unimplemented), which the harness scores as BROKEN rather than as a pass. Verified to
   bite: a stub that always exits 0 fails the refusal assertion, and one that
   always exits 1 is reported BROKEN rather than refused (MANUAL-TESTING.md §6a).
 

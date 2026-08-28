@@ -48,7 +48,7 @@
 use crate::blobs::{BlobStore, StoreError};
 use crate::chunker::ChunkerConfig;
 use crate::manifest::{Kind, Manifest, ManifestError};
-use crate::object::{read_object, ObjectError, ObjectWriter};
+use crate::object::{read_object, ObjectError, ObjectWriter, Sealer};
 use nas_core::{decode_fields, encode_fields, Addr, PaddingProfile, ADDR_LEN};
 use nas_crypto::{manifest_key, open, seal, ConvergenceSecret, DirSecret};
 use std::collections::{BTreeMap, BTreeSet};
@@ -320,18 +320,44 @@ impl DirManifest {
 /// Writes and reads whole directory trees.
 pub struct TreeStore<'a> {
     pub blobs: &'a BlobStore,
-    pub cs: &'a ConvergenceSecret,
+    pub sealer: Sealer<'a>,
     pub profile: PaddingProfile,
     pub cfg: ChunkerConfig,
 }
 
 impl<'a> TreeStore<'a> {
-    pub fn new(blobs: &'a BlobStore, cs: &'a ConvergenceSecret, profile: PaddingProfile) -> Self {
+    pub fn new(blobs: &'a BlobStore, sealer: Sealer<'a>, profile: PaddingProfile) -> Self {
         Self {
             blobs,
-            cs,
+            sealer,
             profile,
             cfg: ChunkerConfig::for_profile(profile, ChunkerConfig::default()),
+        }
+    }
+
+    /// Convenience for the encrypted modes.
+    pub fn convergent(
+        blobs: &'a BlobStore,
+        cs: &'a ConvergenceSecret,
+        profile: PaddingProfile,
+    ) -> Self {
+        Self::new(blobs, Sealer::Convergent(cs), profile)
+    }
+
+    /// Store a directory manifest.
+    ///
+    /// In `transit-only` it goes down as plaintext, which is what makes
+    /// filenames visible on the peer and server-side browsing possible at all
+    /// (SPECS §2.2.3). In the encrypted modes it is sealed under the
+    /// directory's manifest key.
+    fn put_dir_manifest(&self, dir: &DirSecret, plain: &[u8]) -> Result<Addr, TreeError> {
+        match self.sealer {
+            Sealer::Convergent(_) => {
+                let key = manifest_key(dir);
+                let sealed = seal(&key, plain, DIR_AAD)?;
+                Ok(self.blobs.put(&sealed)?)
+            }
+            Sealer::Plaintext { .. } => Ok(self.blobs.put(plain)?),
         }
     }
 
@@ -369,7 +395,7 @@ impl<'a> TreeStore<'a> {
         // an old version is still intact.
         let old = prev.and_then(|a| self.read_dir_manifest(dir, a).ok());
         let mut dm = DirManifest::default();
-        let w = ObjectWriter::new(self.blobs, self.cs, self.profile, self.cfg)?;
+        let w = ObjectWriter::new(self.blobs, self.sealer, self.profile, self.cfg)?;
 
         let mut names: Vec<(Vec<u8>, PathBuf, bool)> = Vec::new();
         for e in fs::read_dir(src)? {
@@ -410,9 +436,7 @@ impl<'a> TreeStore<'a> {
         }
 
         let plain = dm.encode()?;
-        let key = manifest_key(dir);
-        let sealed = seal(&key, &plain, DIR_AAD)?;
-        Ok(self.blobs.put(&sealed)?)
+        self.put_dir_manifest(dir, &plain)
     }
 
     /// Read a directory manifest back.
@@ -421,10 +445,16 @@ impl<'a> TreeStore<'a> {
         dir: &DirSecret,
         addr: &Addr,
     ) -> Result<DirManifest, TreeError> {
-        let sealed = self.blobs.get(addr)?;
-        let key = manifest_key(dir);
-        let plain = open(&key, &sealed, DIR_AAD)?;
-        DirManifest::decode(&plain)
+        let stored = self.blobs.get(addr)?;
+        match self.sealer {
+            Sealer::Convergent(_) => {
+                let key = manifest_key(dir);
+                let plain = open(&key, &stored, DIR_AAD)?;
+                DirManifest::decode(&plain)
+            }
+            // Plaintext at rest: nothing to open, and no key needed to read.
+            Sealer::Plaintext { .. } => DirManifest::decode(&stored),
+        }
     }
 
     /// Materialise a stored tree into `dst`.
@@ -459,6 +489,7 @@ impl<'a> TreeStore<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::blobs::Addressing;
     use nas_crypto::KEY_LEN;
 
     struct Scratch(PathBuf);
@@ -543,7 +574,7 @@ mod tests {
 
         let blobs = BlobStore::open(s.0.join("repo")).unwrap();
         let cs = ConvergenceSecret::from_bytes([9u8; KEY_LEN]);
-        let ts = TreeStore::new(&blobs, &cs, PaddingProfile::None);
+        let ts = TreeStore::convergent(&blobs, &cs, PaddingProfile::None);
         let root = DirSecret::root(&[5u8; KEY_LEN]);
 
         let addr = ts.write_dir(&root, &src).unwrap();
@@ -568,7 +599,7 @@ mod tests {
             build_tree(&src);
             let blobs = BlobStore::open(s.0.join("repo")).unwrap();
             let cs = ConvergenceSecret::from_bytes([9u8; KEY_LEN]);
-            let ts = TreeStore::new(&blobs, &cs, *p);
+            let ts = TreeStore::convergent(&blobs, &cs, *p);
             let root = DirSecret::root(&[5u8; KEY_LEN]);
             let addr = ts.write_dir(&root, &src).unwrap();
             ts.read_dir_to(&root, &addr, &dst).unwrap();
@@ -587,7 +618,7 @@ mod tests {
         build_tree(&src);
         let blobs = BlobStore::open(s.0.join("repo")).unwrap();
         let cs = ConvergenceSecret::from_bytes([9u8; KEY_LEN]);
-        let ts = TreeStore::new(&blobs, &cs, PaddingProfile::None);
+        let ts = TreeStore::convergent(&blobs, &cs, PaddingProfile::None);
         let root = DirSecret::root(&[5u8; KEY_LEN]);
 
         let a = ts.write_dir(&root, &src).unwrap();
@@ -609,7 +640,7 @@ mod tests {
         build_tree(&src);
         let blobs = BlobStore::open(s.0.join("repo")).unwrap();
         let cs = ConvergenceSecret::from_bytes([9u8; KEY_LEN]);
-        let ts = TreeStore::new(&blobs, &cs, PaddingProfile::None);
+        let ts = TreeStore::convergent(&blobs, &cs, PaddingProfile::None);
         let root = DirSecret::root(&[5u8; KEY_LEN]);
 
         let a = ts.write_dir(&root, &src).unwrap();
@@ -630,7 +661,7 @@ mod tests {
         build_tree(&src);
         let blobs = BlobStore::open(s.0.join("repo")).unwrap();
         let cs = ConvergenceSecret::from_bytes([9u8; KEY_LEN]);
-        let ts = TreeStore::new(&blobs, &cs, PaddingProfile::None);
+        let ts = TreeStore::convergent(&blobs, &cs, PaddingProfile::None);
         let root = DirSecret::root(&[5u8; KEY_LEN]);
 
         let a = ts.write_dir(&root, &src).unwrap();
@@ -659,7 +690,7 @@ mod tests {
         build_tree(&src);
         let blobs = BlobStore::open(s.0.join("repo")).unwrap();
         let cs = ConvergenceSecret::from_bytes([9u8; KEY_LEN]);
-        let ts = TreeStore::new(&blobs, &cs, PaddingProfile::None);
+        let ts = TreeStore::convergent(&blobs, &cs, PaddingProfile::None);
         let root = DirSecret::root(&[5u8; KEY_LEN]);
         let addr = ts.write_dir(&root, &src).unwrap();
 
@@ -688,7 +719,7 @@ mod tests {
         build_tree(&src);
         let blobs = BlobStore::open(s.0.join("repo")).unwrap();
         let cs = ConvergenceSecret::from_bytes([9u8; KEY_LEN]);
-        let ts = TreeStore::new(&blobs, &cs, PaddingProfile::None);
+        let ts = TreeStore::convergent(&blobs, &cs, PaddingProfile::None);
 
         let a = ts
             .write_dir(&DirSecret::root(&[5u8; KEY_LEN]), &src)
@@ -705,6 +736,127 @@ mod tests {
             added <= 5,
             "{added} new blobs for a duplicate tree (manifests only: 5 dirs)"
         );
+    }
+
+    #[test]
+    fn transit_only_stores_plaintext_and_visible_names() {
+        // SPECS §2.2.3: plaintext at rest is what makes server-side browsing
+        // possible, and visible filenames are the point rather than a leak to
+        // be apologised for. The inverted expectation is asserted directly
+        // instead of the mode being skipped.
+        let s = Scratch::new("transit");
+        let src = s.0.join("src");
+        let dst = s.0.join("dst");
+        build_tree(&src);
+        fs::write(src.join("holiday-photo.jpg"), b"JPEG-CANARY-BYTES").unwrap();
+
+        let blobs =
+            BlobStore::open_with(s.0.join("repo"), Addressing::Salted(b"tenant-a".to_vec()))
+                .unwrap();
+        let ts = TreeStore::new(
+            &blobs,
+            Sealer::Plaintext {
+                tenant_salt: b"tenant-a",
+            },
+            PaddingProfile::None,
+        );
+        let root = DirSecret::root(&[5u8; KEY_LEN]);
+        let addr = ts.write_dir(&root, &src).unwrap();
+
+        let all: Vec<Vec<u8>> = blobs
+            .addrs()
+            .unwrap()
+            .iter()
+            .map(|a| blobs.get(a).unwrap())
+            .collect();
+        assert!(
+            all.iter()
+                .any(|b| b.windows(17).any(|w| w == b"JPEG-CANARY-BYTES")),
+            "transit-only must store readable content"
+        );
+        assert!(
+            all.iter()
+                .any(|b| b.windows(17).any(|w| w == b"holiday-photo.jpg")),
+            "transit-only must store readable filenames"
+        );
+
+        ts.read_dir_to(&root, &addr, &dst).unwrap();
+        assert_eq!(snapshot(&src), snapshot(&dst));
+    }
+
+    #[test]
+    fn transit_only_needs_no_key_to_read() {
+        // "Loss of the vault does NOT lose the photos" (SPECS §19.1): the data
+        // is plaintext, so a completely different DirSecret still reads it.
+        let s = Scratch::new("transit-nokey");
+        let src = s.0.join("src");
+        let dst = s.0.join("dst");
+        build_tree(&src);
+
+        let blobs =
+            BlobStore::open_with(s.0.join("repo"), Addressing::Salted(b"t".to_vec())).unwrap();
+        let ts = TreeStore::new(
+            &blobs,
+            Sealer::Plaintext { tenant_salt: b"t" },
+            PaddingProfile::None,
+        );
+        let addr = ts
+            .write_dir(&DirSecret::root(&[1u8; KEY_LEN]), &src)
+            .unwrap();
+
+        // A reader who lost the vault entirely, holding only the root address.
+        ts.read_dir_to(&DirSecret::root(&[99u8; KEY_LEN]), &addr, &dst)
+            .unwrap();
+        assert_eq!(snapshot(&src), snapshot(&dst));
+    }
+
+    #[test]
+    fn an_unchanged_transit_only_tree_has_a_stable_address() {
+        // Unlike the encrypted modes, nothing here is sealed under a random
+        // nonce, so re-writing an unchanged tree is naturally a no-op -- no
+        // incremental bookkeeping needed.
+        let s = Scratch::new("transit-stable");
+        let src = s.0.join("src");
+        build_tree(&src);
+        let blobs =
+            BlobStore::open_with(s.0.join("repo"), Addressing::Salted(b"t".to_vec())).unwrap();
+        let ts = TreeStore::new(
+            &blobs,
+            Sealer::Plaintext { tenant_salt: b"t" },
+            PaddingProfile::None,
+        );
+        let root = DirSecret::root(&[1u8; KEY_LEN]);
+        let a = ts.write_dir(&root, &src).unwrap();
+        let before = blobs.addrs().unwrap().len();
+        let b = ts.write_dir(&root, &src).unwrap();
+        assert_eq!(a, b);
+        assert_eq!(blobs.addrs().unwrap().len(), before);
+    }
+
+    #[test]
+    fn two_tenants_in_transit_only_share_no_addresses() {
+        // The confirmation oracle SPECS §2.2.3 closes: without a per-tenant
+        // salt, a co-tenant uploads a candidate file and watches for the dedup
+        // skip to learn somebody else on this peer holds it.
+        let s = Scratch::new("transit-tenants");
+        let src = s.0.join("src");
+        build_tree(&src);
+        let root = DirSecret::root(&[1u8; KEY_LEN]);
+
+        let mut addrs = Vec::new();
+        for salt in [&b"tenant-a"[..], &b"tenant-b"[..]] {
+            let dir = s.0.join(format!("repo-{}", salt[7] as char));
+            let blobs = BlobStore::open_with(dir, Addressing::Salted(salt.to_vec())).unwrap();
+            let ts = TreeStore::new(
+                &blobs,
+                Sealer::Plaintext { tenant_salt: salt },
+                PaddingProfile::None,
+            );
+            ts.write_dir(&root, &src).unwrap();
+            addrs.push(blobs.addrs().unwrap());
+        }
+        let shared = addrs[0].iter().filter(|a| addrs[1].contains(a)).count();
+        assert_eq!(shared, 0, "{shared} addresses shared between tenants");
     }
 
     #[test]
@@ -915,7 +1067,7 @@ mod tests {
         build_tree(&src);
         let blobs = BlobStore::open(s.0.join("repo")).unwrap();
         let cs = ConvergenceSecret::from_bytes([9u8; KEY_LEN]);
-        let ts = TreeStore::new(&blobs, &cs, PaddingProfile::None);
+        let ts = TreeStore::convergent(&blobs, &cs, PaddingProfile::None);
         let root = DirSecret::root(&[5u8; KEY_LEN]);
         let addr = ts.write_dir(&root, &src).unwrap();
         ts.read_dir_to(&root, &addr, &dst).unwrap();

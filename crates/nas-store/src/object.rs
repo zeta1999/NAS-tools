@@ -18,6 +18,22 @@
 //! The binding that a per-chunk AAD would have provided is done instead by the
 //! manifest, which lists the chunks in order and is itself authenticated.
 //!
+//! # Two at-rest shapes, one pipeline
+//!
+//! [`Sealer`] is the only place the confidentiality modes differ. `e2ee` and
+//! `passphrase` seal each chunk convergently and address the **ciphertext**;
+//! `transit-only` stores plaintext and addresses `BLAKE3(tenant_salt ‖ plaintext)`.
+//!
+//! The salt is why `transit-only` is not simply "no encryption". Revision 4 of
+//! the spec used bare `BLAKE3(plaintext)` and called global dedup harmless
+//! because there is no confidentiality claim to leak — which considered only
+//! the peer as a reader. On a **shared** peer it hands every co-tenant a
+//! confirmation oracle: upload a candidate file into your own namespace, watch
+//! for the dedup skip, and learn that somebody else on this box holds it. "Not
+//! secret from my own NAS" is a very different statement from "confirmable by
+//! anyone who rents space beside me". A per-tenant salt restores tenant-scoped
+//! dedup and removes the oracle. It is not secret; it only has to be unshared.
+//!
 //! # Memory
 //!
 //! Both directions are streaming. Peak resident bytes are bounded by the
@@ -69,6 +85,12 @@ pub enum ObjectError {
     UnsupportedKeyScheme {
         scheme: KeyScheme,
     },
+    /// The writer's salt and the store's disagree. Blobs written this way would
+    /// be unverifiable by any reader, and the failure would otherwise be silent.
+    AddressingMismatch {
+        expected: Addr,
+        got: Addr,
+    },
 }
 
 impl std::fmt::Display for ObjectError {
@@ -95,6 +117,12 @@ impl std::fmt::Display for ObjectError {
             Self::UnsupportedKeyScheme { scheme } => {
                 write!(f, "key scheme {scheme:?} is not implemented")
             }
+            Self::AddressingMismatch { expected, got } => write!(
+                f,
+                "writer expected address {} but the store filed {}: salts disagree",
+                expected.to_hex(),
+                got.to_hex()
+            ),
         }
     }
 }
@@ -108,10 +136,50 @@ macro_rules! from_err {
 from_err!(io::Error => Io, PadError => Pad, CryptoError => Crypto,
           StoreError => Store, ManifestError => Manifest, ConfigError => Config);
 
+/// How chunks are protected at rest, and therefore how they are addressed.
+///
+/// Not a boolean: the two arms carry different material and produce different
+/// addresses, and a `bool` would leave the salt and the secret to be threaded
+/// separately and mismatched.
+#[derive(Clone, Copy)]
+pub enum Sealer<'a> {
+    /// `e2ee` / `passphrase`: convergent encryption, `addr = BLAKE3(ciphertext)`.
+    Convergent(&'a ConvergenceSecret),
+    /// `transit-only`: plaintext at rest, `addr = BLAKE3(tenant_salt ‖ plaintext)`.
+    Plaintext { tenant_salt: &'a [u8] },
+}
+
+impl Sealer<'_> {
+    pub fn key_scheme(&self) -> KeyScheme {
+        match self {
+            Self::Convergent(_) => KeyScheme::Convergent,
+            Self::Plaintext { .. } => KeyScheme::Plaintext,
+        }
+    }
+
+    /// Whether the bytes written to the store are readable.
+    pub fn stores_plaintext(&self) -> bool {
+        matches!(self, Self::Plaintext { .. })
+    }
+}
+
+/// `BLAKE3(len(salt) ‖ salt ‖ plaintext)` — the `transit-only` address.
+///
+/// Length-prefixed so two tenants whose salts differ only by a boundary cannot
+/// collide, which would put them back in one dedup pool and reinstate the
+/// oracle the salt exists to remove.
+pub fn salted_addr(tenant_salt: &[u8], plaintext: &[u8]) -> Addr {
+    let mut h = blake3::Hasher::new();
+    h.update(&(tenant_salt.len() as u64).to_le_bytes());
+    h.update(tenant_salt);
+    h.update(plaintext);
+    Addr::from_bytes(*h.finalize().as_bytes())
+}
+
 /// Turns plaintext into blobs plus a manifest.
 pub struct ObjectWriter<'a> {
     store: &'a BlobStore,
-    cs: &'a ConvergenceSecret,
+    sealer: Sealer<'a>,
     chunker: Chunker,
     profile: PaddingProfile,
 }
@@ -120,7 +188,7 @@ impl<'a> ObjectWriter<'a> {
     /// Build a writer, refusing a chunker and profile that cannot agree.
     pub fn new(
         store: &'a BlobStore,
-        cs: &'a ConvergenceSecret,
+        sealer: Sealer<'a>,
         profile: PaddingProfile,
         cfg: ChunkerConfig,
     ) -> Result<Self, ObjectError> {
@@ -134,7 +202,7 @@ impl<'a> ObjectWriter<'a> {
         }
         Ok(Self {
             store,
-            cs,
+            sealer,
             chunker: Chunker::new(cfg)?,
             profile,
         })
@@ -143,34 +211,63 @@ impl<'a> ObjectWriter<'a> {
     /// A writer with a chunker configuration derived from the profile.
     pub fn with_defaults(
         store: &'a BlobStore,
-        cs: &'a ConvergenceSecret,
+        sealer: Sealer<'a>,
         profile: PaddingProfile,
     ) -> Result<Self, ObjectError> {
         Self::new(
             store,
-            cs,
+            sealer,
             profile,
             ChunkerConfig::for_profile(profile, ChunkerConfig::default()),
         )
     }
 
+    /// Convenience for the encrypted modes, which are the common case.
+    pub fn convergent(
+        store: &'a BlobStore,
+        cs: &'a ConvergenceSecret,
+        profile: PaddingProfile,
+    ) -> Result<Self, ObjectError> {
+        Self::with_defaults(store, Sealer::Convergent(cs), profile)
+    }
+
     /// Chunk, pad, encrypt and store `reader`, returning its manifest.
     pub fn write<R: Read>(&self, kind: Kind, reader: R) -> Result<Manifest, ObjectError> {
-        let mut m = Manifest::new(kind, KeyScheme::Convergent, self.profile);
+        let mut m = Manifest::new(kind, self.sealer.key_scheme(), self.profile);
         for chunk in self.chunker.stream(reader) {
             let plain = chunk?;
             let padded = padding::pad(self.profile, &plain)?;
 
-            // §4.2.1: keyed over the PADDED bytes. §3.1's table says "plaintext
-            // chunk", which is the same thing when the profile is `none` and
-            // is the looser statement of the two.
-            let key = chunk_key(self.cs, &padded);
-            let sealed = seal(&key, &padded, CHUNK_AAD)?;
-            let addr = self.store.put(&sealed)?;
+            let (addr, ck) = match self.sealer {
+                Sealer::Convergent(cs) => {
+                    // §4.2.1: keyed over the PADDED bytes. §3.1's table says
+                    // "plaintext chunk", which is the same thing when the
+                    // profile is `none` and is the looser of the two.
+                    let key = chunk_key(cs, &padded);
+                    let sealed = seal(&key, &padded, CHUNK_AAD)?;
+                    let ck: [u8; KEY_LEN] = *key
+                        .expose_derived()
+                        .expect("chunk_key always yields a content-derived key");
+                    (self.store.put(&sealed)?, ck)
+                }
+                Sealer::Plaintext { tenant_salt } => {
+                    // The store knows its own addressing scheme, so `put`
+                    // already salts. Checking the two agree here would be
+                    // cheap, but disagreeing is the interesting case: a writer
+                    // salting one way and a store the other would produce blobs
+                    // no reader could verify, silently.
+                    let expected = salted_addr(tenant_salt, &padded);
+                    let addr = self.store.put(&padded)?;
+                    if addr != expected {
+                        return Err(ObjectError::AddressingMismatch {
+                            expected,
+                            got: addr,
+                        });
+                    }
+                    (addr, [0u8; KEY_LEN])
+                }
+            };
 
-            let ck: [u8; KEY_LEN] = *key
-                .expose_derived()
-                .expect("chunk_key always yields a content-derived key");
             m.chunks.push(ChunkRef {
                 addr,
                 ck,
@@ -196,7 +293,7 @@ pub fn read_object<W: Write>(
     m: &Manifest,
     out: &mut W,
 ) -> Result<u64, ObjectError> {
-    if m.key_scheme != KeyScheme::Convergent {
+    if m.key_scheme == KeyScheme::IndexedRandom {
         return Err(ObjectError::UnsupportedKeyScheme {
             scheme: m.key_scheme,
         });
@@ -204,10 +301,21 @@ pub fn read_object<W: Write>(
     m.validate()?;
     let mut written = 0u64;
     for c in &m.chunks {
-        let sealed = store.get(&c.addr)?;
-        let key = chunk_key_from_stored(c.ck);
-        let padded = open_chunk(&key, &sealed, CHUNK_AAD)?;
-        let plain = padding::unpad(m.padding_profile, &padded)?;
+        let stored = store.get(&c.addr)?;
+        let opened;
+        let padded: &[u8] = match m.key_scheme {
+            KeyScheme::Convergent => {
+                let key = chunk_key_from_stored(c.ck);
+                opened = open_chunk(&key, &stored, CHUNK_AAD)?;
+                &opened
+            }
+            // Nothing to decrypt. `pt_hash` below is then the whole integrity
+            // story -- there is no AEAD tag to fall back on, which is exactly
+            // why the manifest stores it.
+            KeyScheme::Plaintext => &stored,
+            KeyScheme::IndexedRandom => unreachable!("rejected above"),
+        };
+        let plain = padding::unpad(m.padding_profile, padded)?;
 
         if plain.len() != c.len as usize {
             return Err(ObjectError::LengthMismatch {
@@ -262,7 +370,7 @@ mod tests {
         let s = Scratch::new(tag);
         let st = BlobStore::open(&s.0).unwrap();
         let c = cs();
-        let w = ObjectWriter::with_defaults(&st, &c, profile).unwrap();
+        let w = ObjectWriter::convergent(&st, &c, profile).unwrap();
         let m = w.write(Kind::File, data).unwrap();
         assert_eq!(m.size, data.len() as u64, "{tag}: size");
         assert_eq!(m.padding_profile, profile);
@@ -311,7 +419,7 @@ mod tests {
         let mut data = corpus(200 << 10, 3);
         data.splice(1000..1000 + needle.len(), needle.iter().copied());
 
-        let w = ObjectWriter::with_defaults(&st, &c, PaddingProfile::None).unwrap();
+        let w = ObjectWriter::convergent(&st, &c, PaddingProfile::None).unwrap();
         w.write(Kind::File, &data[..]).unwrap();
 
         for a in st.addrs().unwrap() {
@@ -330,7 +438,7 @@ mod tests {
         let st = BlobStore::open(&s.0).unwrap();
         let c = cs();
         let data = corpus(2 << 20, 4);
-        let w = ObjectWriter::with_defaults(&st, &c, PaddingProfile::None).unwrap();
+        let w = ObjectWriter::convergent(&st, &c, PaddingProfile::None).unwrap();
 
         let a = w.write(Kind::File, &data[..]).unwrap();
         let before = st.addrs().unwrap().len();
@@ -349,7 +457,7 @@ mod tests {
         let s = Scratch::new("incremental");
         let st = BlobStore::open(&s.0).unwrap();
         let c = cs();
-        let w = ObjectWriter::with_defaults(&st, &c, PaddingProfile::None).unwrap();
+        let w = ObjectWriter::convergent(&st, &c, PaddingProfile::None).unwrap();
 
         let base = corpus(2 << 20, 5);
         let m1 = w.write(Kind::File, &base[..]).unwrap();
@@ -380,11 +488,11 @@ mod tests {
         let data = corpus(512 << 10, 6);
         let (a, b) = (cs(), ConvergenceSecret::from_bytes([43u8; KEY_LEN]));
 
-        let ma = ObjectWriter::with_defaults(&st, &a, PaddingProfile::None)
+        let ma = ObjectWriter::convergent(&st, &a, PaddingProfile::None)
             .unwrap()
             .write(Kind::File, &data[..])
             .unwrap();
-        let mb = ObjectWriter::with_defaults(&st, &b, PaddingProfile::None)
+        let mb = ObjectWriter::convergent(&st, &b, PaddingProfile::None)
             .unwrap()
             .write(Kind::File, &data[..])
             .unwrap();
@@ -409,7 +517,7 @@ mod tests {
         let s = Scratch::new("swap");
         let st = BlobStore::open(&s.0).unwrap();
         let c = cs();
-        let w = ObjectWriter::with_defaults(&st, &c, PaddingProfile::None).unwrap();
+        let w = ObjectWriter::convergent(&st, &c, PaddingProfile::None).unwrap();
         let mut m = w.write(Kind::File, &corpus(1 << 20, 7)[..]).unwrap();
         assert!(m.chunks.len() >= 2);
 
@@ -432,7 +540,7 @@ mod tests {
         let s = Scratch::new("tamper");
         let st = BlobStore::open(&s.0).unwrap();
         let c = cs();
-        let w = ObjectWriter::with_defaults(&st, &c, PaddingProfile::None).unwrap();
+        let w = ObjectWriter::convergent(&st, &c, PaddingProfile::None).unwrap();
         let m = w.write(Kind::File, &corpus(100 << 10, 8)[..]).unwrap();
 
         let p = st.path(&m.chunks[0].addr);
@@ -452,7 +560,12 @@ mod tests {
         let s = Scratch::new("mismatch");
         let st = BlobStore::open(&s.0).unwrap();
         let c = cs();
-        match ObjectWriter::new(&st, &c, PaddingProfile::Classes, ChunkerConfig::default()) {
+        match ObjectWriter::new(
+            &st,
+            Sealer::Convergent(&c),
+            PaddingProfile::Classes,
+            ChunkerConfig::default(),
+        ) {
             Err(ObjectError::ProfileMismatch { .. }) => {}
             other => panic!("mismatch accepted: {:?}", other.map(|_| "writer")),
         }
@@ -471,7 +584,7 @@ mod tests {
         for profile in [PaddingProfile::None, PaddingProfile::Classes] {
             let sub = s.0.join(format!("{profile:?}"));
             let st2 = BlobStore::open(&sub).unwrap();
-            ObjectWriter::with_defaults(&st2, &c, profile)
+            ObjectWriter::convergent(&st2, &c, profile)
                 .unwrap()
                 .write(Kind::File, &data[..])
                 .unwrap();

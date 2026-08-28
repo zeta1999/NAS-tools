@@ -11,9 +11,9 @@ pub mod object;
 pub mod padding;
 pub mod tree;
 
-pub use blobs::{BlobStore, StoreError};
+pub use blobs::{Addressing, BlobStore, StoreError};
 pub use chunker::{Chunker, ChunkerConfig, ConfigError};
 pub use manifest::{ChunkRef, Kind, Manifest, ManifestError};
-pub use object::{read_object, ObjectError, ObjectWriter, CHUNK_AAD};
+pub use object::{read_object, salted_addr, ObjectError, ObjectWriter, Sealer, CHUNK_AAD};
 pub use padding::{pad, unpad, PadError, FIXED_CHUNK, FIXED_CLASS, HEADER, LADDER};
 pub use tree::{DirManifest, Entry, TreeError, TreeStore};

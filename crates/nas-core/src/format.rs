@@ -23,6 +23,13 @@ pub enum KeyScheme {
     /// Random per-chunk keys plus a client-side encrypted index. No oracle;
     /// costs an index to sync, merge and recover.
     IndexedRandom = 1,
+    /// No chunk keys at all: `transit-only` stores plaintext at rest (SPECS
+    /// §2.2.3), so there is nothing to derive.
+    ///
+    /// A distinct variant rather than a zeroed `ck` under `Convergent`, because
+    /// a reader must be able to tell "this chunk is not encrypted" from "this
+    /// chunk's key is all zeros" — and the second is a plausible corruption.
+    Plaintext = 2,
 }
 
 /// Chunk padding profile (SPECS §4.2.1). Defaults to `None`.
@@ -88,6 +95,14 @@ impl Mode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_key_scheme_says_whether_there_is_a_key_at_all() {
+        // Plaintext must be its own variant: a zeroed ck under Convergent is a
+        // plausible corruption, and a reader has to tell the two apart.
+        assert_ne!(KeyScheme::Plaintext as u8, KeyScheme::Convergent as u8);
+        assert_ne!(KeyScheme::Plaintext as u8, KeyScheme::IndexedRandom as u8);
+    }
 
     #[test]
     fn padding_defaults_to_none() {

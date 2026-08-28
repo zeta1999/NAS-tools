@@ -242,6 +242,71 @@ impl WrapRecord {
         Ok((secrets, self.anchor))
     }
 
+    /// Change the passphrase without touching stored data.
+    ///
+    /// # Why this exists instead of a `recover_dek`
+    ///
+    /// Re-wrapping needs the DEK, and an API that handed it back would put the
+    /// root key of the namespace in the caller's hands — where it would be
+    /// copied, logged, or left un-zeroized by whichever caller was in a hurry.
+    /// Keeping the whole operation inside this module means the DEK is
+    /// recovered, used and wiped without ever crossing the boundary.
+    ///
+    /// The `anchor` is a parameter rather than carried over, because the two
+    /// reasons to re-wrap are a passphrase change *and* publishing a newer
+    /// freshness floor, and folding them into one operation is what keeps the
+    /// wrap chain the single place the floor lives.
+    #[allow(clippy::too_many_arguments)]
+    pub fn rewrap(
+        &self,
+        old_passphrase: &[u8],
+        new_passphrase: &[u8],
+        params: Argon2Params,
+        policy: &WrapPolicy,
+        seq: u64,
+        anchor: Anchor,
+    ) -> Result<Self, WrapError> {
+        let mut dek = self.recover_dek(old_passphrase, policy)?;
+        let out = Self::create(
+            new_passphrase,
+            &dek,
+            params,
+            policy,
+            seq,
+            anchor,
+            self.chain_hash(),
+        );
+        dek.zeroize();
+        out
+    }
+
+    /// Recover the raw DEK.
+    ///
+    /// Private: see [`rewrap`](Self::rewrap) for why the DEK does not leave
+    /// this module. The caller inside it is responsible for zeroizing.
+    fn recover_dek(&self, passphrase: &[u8], policy: &WrapPolicy) -> Result<[u8; 32], WrapError> {
+        self.params.check(policy)?;
+        check_genesis(self.seq, &self.prev)?;
+        if self.salt.len() < MIN_SALT {
+            return Err(WrapError::SaltTooShort {
+                got: self.salt.len(),
+            });
+        }
+        let mut kek = self.params.derive(passphrase, &self.salt)?;
+        let key = wrapping_key(kek);
+        kek.zeroize();
+        let a = aad(&self.salt, &self.params, self.seq, &self.anchor, &self.prev);
+        let mut plain = open(&key, &self.wrapped_dek, &a)?;
+        if plain.len() != 32 {
+            plain.zeroize();
+            return Err(WrapError::Unwrap);
+        }
+        let mut dek = [0u8; 32];
+        dek.copy_from_slice(&plain);
+        plain.zeroize();
+        Ok(dek)
+    }
+
     /// Verify the signature using secrets already recovered.
     pub fn verify_with(&self, secrets: &NamespaceSecrets) -> Result<(), WrapError> {
         let identity = secrets.slot_identity()?;
@@ -499,6 +564,85 @@ mod tests {
             .unwrap(b"a new passphrase entirely", &WrapPolicy::FAST)
             .unwrap();
         assert_eq!(sa, sb, "re-wrapping changed the namespace secrets");
+    }
+
+    #[test]
+    fn rewrapping_changes_the_passphrase_not_the_secrets() {
+        // The whole point of the KEK/DEK split: 32 bytes are re-wrapped and a
+        // terabyte is not re-encrypted.
+        let a = make(0, [0u8; 32], anchor(3));
+        let (sa, _) = a.unwrap(PW, &WrapPolicy::FAST).unwrap();
+
+        let new_pw = b"a completely different passphrase";
+        let b = a
+            .rewrap(
+                PW,
+                new_pw,
+                Argon2Params::WEAK_FOR_TESTS,
+                &WrapPolicy::FAST,
+                1,
+                anchor(3),
+            )
+            .unwrap();
+        let (sb, anch) = b.unwrap(new_pw, &WrapPolicy::FAST).unwrap();
+        assert_eq!(sa, sb, "re-wrapping changed the namespace secrets");
+        assert_eq!(anch, anchor(3));
+        assert_eq!(
+            b.prev,
+            a.chain_hash(),
+            "the new wrap does not chain to the old"
+        );
+    }
+
+    #[test]
+    fn the_new_wrap_does_not_open_under_the_old_passphrase() {
+        let a = make(0, [0u8; 32], anchor(3));
+        let new_pw = b"a completely different passphrase";
+        let b = a
+            .rewrap(
+                PW,
+                new_pw,
+                Argon2Params::WEAK_FOR_TESTS,
+                &WrapPolicy::FAST,
+                1,
+                anchor(3),
+            )
+            .unwrap();
+        assert_eq!(b.unwrap(PW, &WrapPolicy::FAST), Err(WrapError::Unwrap));
+    }
+
+    #[test]
+    fn rewrapping_can_advance_the_anchor() {
+        // The second reason to re-wrap: publishing a newer freshness floor.
+        let a = make(0, [0u8; 32], anchor(3));
+        let b = a
+            .rewrap(
+                PW,
+                PW,
+                Argon2Params::WEAK_FOR_TESTS,
+                &WrapPolicy::FAST,
+                1,
+                anchor(99),
+            )
+            .unwrap();
+        let (_, anch) = b.unwrap(PW, &WrapPolicy::FAST).unwrap();
+        assert_eq!(anch, anchor(99));
+    }
+
+    #[test]
+    fn rewrapping_with_the_wrong_old_passphrase_fails() {
+        let a = make(0, [0u8; 32], anchor(3));
+        assert_eq!(
+            a.rewrap(
+                b"wrong",
+                b"new",
+                Argon2Params::WEAK_FOR_TESTS,
+                &WrapPolicy::FAST,
+                1,
+                anchor(3)
+            ),
+            Err(WrapError::Unwrap)
+        );
     }
 
     #[test]

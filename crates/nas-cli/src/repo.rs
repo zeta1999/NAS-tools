@@ -31,7 +31,8 @@
 
 use nas_core::{KeyScheme, Mode, PaddingProfile};
 use nas_crypto::{random, ConvergenceSecret, DirSecret, Identity, Role, KEY_LEN};
-use nas_vault::Vault;
+use nas_slots::Anchor;
+use nas_vault::{Argon2Params, NamespaceSecrets, Vault, WrapPolicy, WrapRecord};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -40,12 +41,39 @@ pub const VAULT_WARNING: &str = "M1: the vault is sealed, but its key sits besid
      (0600). That relocates the secret rather than protecting it — an OS keychain \
      or a passphrase-derived key is what makes it real.";
 
+/// Where a namespace's secrets come from.
+///
+/// The two modes differ in exactly this and nothing else: `e2ee` holds a vault
+/// on disk, `passphrase` reconstructs its secrets from a passphrase and a wrap
+/// record and keeps **nothing** locally that would let anyone else do the same.
+/// That is what "recoverable from memory alone" has to mean to be true.
+enum Secrets {
+    Vault(Box<Vault>),
+    Passphrase(Box<NamespaceSecrets>, Anchor),
+}
+
 pub struct Repo {
     pub root: PathBuf,
     pub mode: Mode,
     pub key_scheme: KeyScheme,
     pub padding: PaddingProfile,
-    vault: Vault,
+    secrets: Secrets,
+}
+
+/// Where wrap records live. Named per sequence so a superseded one can be
+/// deleted and its absence noticed (SPECS §2.2.2).
+pub fn wrap_path(root: &Path, seq: u64) -> PathBuf {
+    root.join("wraps").join(format!("{seq}.bin"))
+}
+
+/// The passphrase, from `--passphrase` or `$NAS_PASSPHRASE`.
+///
+/// No interactive prompt yet: this runs under a harness with no tty, and a
+/// prompt that silently fell back to a default would be worse than none.
+pub fn passphrase_from(explicit: Option<&str>) -> Option<Vec<u8>> {
+    explicit
+        .map(|s| s.as_bytes().to_vec())
+        .or_else(|| std::env::var("NAS_PASSPHRASE").ok().map(String::into_bytes))
 }
 
 fn home() -> PathBuf {
@@ -103,6 +131,11 @@ pub fn random_secret() -> io::Result<[u8; KEY_LEN]> {
     random::array()
 }
 
+/// Exposed so sibling modules can write wrap records with the same care.
+pub fn write_private_pub(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    write_private(path, bytes)
+}
+
 #[cfg(unix)]
 fn write_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
     use std::io::Write;
@@ -122,7 +155,45 @@ fn write_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
     fs::write(path, bytes)
 }
 
+/// What a namespace declares about itself, readable **without any secret**.
+///
+/// Listing namespaces must not require unlocking them: a passphrase namespace
+/// would otherwise have to be opened — and its Argon2id derivation run — just to
+/// print its name, which is both slow and wrong.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Description {
+    pub mode: Mode,
+    pub key_scheme: KeyScheme,
+    pub padding: PaddingProfile,
+}
+
 impl Repo {
+    /// Read the config alone. No secrets are touched.
+    pub fn describe(ns: &str) -> io::Result<Description> {
+        let cfg = fs::read_to_string(path_of(ns).join("config"))?;
+        let mut d = Description {
+            mode: Mode::E2ee,
+            key_scheme: KeyScheme::Convergent,
+            padding: PaddingProfile::None,
+        };
+        for line in cfg.lines() {
+            let mut it = line.split_whitespace();
+            match (it.next(), it.next()) {
+                (Some("mode"), Some(v)) => {
+                    d.mode = parse_mode(v).ok_or_else(|| io::Error::other("bad mode"))?
+                }
+                (Some("padding_profile"), Some(v)) => {
+                    d.padding = parse_padding(v).ok_or_else(|| io::Error::other("bad padding"))?
+                }
+                (Some("key_scheme"), Some("indexed-random")) => {
+                    d.key_scheme = KeyScheme::IndexedRandom
+                }
+                _ => {}
+            }
+        }
+        Ok(d)
+    }
+
     pub fn exists(ns: &str) -> bool {
         path_of(ns).join("config").exists()
     }
@@ -132,11 +203,11 @@ impl Repo {
         mode: Mode,
         key_scheme: KeyScheme,
         padding: PaddingProfile,
+        passphrase: Option<Vec<u8>>,
     ) -> io::Result<Self> {
         let root = path_of(ns);
         fs::create_dir_all(root.join("state"))?;
-        let vault = Vault::create().map_err(|e| io::Error::other(e.to_string()))?;
-        let vault_key = random_secret()?;
+        fs::create_dir_all(root.join("wraps"))?;
 
         fs::write(
             root.join("config"),
@@ -151,22 +222,82 @@ impl Repo {
             ),
         )?;
 
-        let sealed = vault
-            .seal_with(vault_key)
-            .map_err(|e| io::Error::other(e.to_string()))?;
-        write_private(&root.join("vault.bin"), &sealed)?;
-        write_private(&root.join("vault.key"), &vault_key)?;
+        let secrets = match mode {
+            Mode::Passphrase => {
+                let pw = passphrase.ok_or_else(|| {
+                    io::Error::other("passphrase mode needs --passphrase or $NAS_PASSPHRASE")
+                })?;
+                let dek = random_secret()?;
+                // At creation there is no slot history, so the floor is
+                // genuinely zero -- there is nothing to be rolled back to. It
+                // rises with the first published record; the wrap chain exists
+                // for exactly that.
+                let anchor = Anchor {
+                    seq: 0,
+                    sig_hash: [0u8; 32],
+                };
+                let w = WrapRecord::create(
+                    &pw,
+                    &dek,
+                    Argon2Params::SPEC,
+                    &WrapPolicy::SPEC,
+                    0,
+                    anchor,
+                    [0u8; 32],
+                )
+                .map_err(|e| io::Error::other(e.to_string()))?;
+                write_private(
+                    &wrap_path(&root, 0),
+                    &w.encode().map_err(|e| io::Error::other(e.to_string()))?,
+                )?;
+                Secrets::Passphrase(Box::new(NamespaceSecrets::from_dek(&dek)), anchor)
+            }
+            Mode::E2ee | Mode::TransitOnly => {
+                let vault = Vault::create().map_err(|e| io::Error::other(e.to_string()))?;
+                let vault_key = random_secret()?;
+                let sealed = vault
+                    .seal_with(vault_key)
+                    .map_err(|e| io::Error::other(e.to_string()))?;
+                write_private(&root.join("vault.bin"), &sealed)?;
+                write_private(&root.join("vault.key"), &vault_key)?;
+                Secrets::Vault(Box::new(vault))
+            }
+        };
 
         Ok(Self {
             root,
             mode,
             key_scheme,
             padding,
-            vault,
+            secrets,
         })
     }
 
+    /// The highest wrap sequence present on disk.
+    pub fn latest_wrap_seq(root: &Path) -> io::Result<u64> {
+        let mut best: Option<u64> = None;
+        for e in fs::read_dir(root.join("wraps"))? {
+            let name = e?.file_name().to_string_lossy().into_owned();
+            if let Some(n) = name
+                .strip_suffix(".bin")
+                .and_then(|n| n.parse::<u64>().ok())
+            {
+                best = Some(best.map_or(n, |b: u64| b.max(n)));
+            }
+        }
+        best.ok_or_else(|| io::Error::other("no wrap record"))
+    }
+
+    pub fn load_wrap(root: &Path, seq: u64) -> io::Result<WrapRecord> {
+        let bytes = fs::read(wrap_path(root, seq))?;
+        WrapRecord::decode(&bytes).map_err(|e| io::Error::other(e.to_string()))
+    }
+
     pub fn open(ns: &str) -> io::Result<Self> {
+        Self::open_with(ns, None)
+    }
+
+    pub fn open_with(ns: &str, passphrase: Option<Vec<u8>>) -> io::Result<Self> {
         let root = path_of(ns);
         let cfg = fs::read_to_string(root.join("config"))?;
         let mut mode = Mode::E2ee;
@@ -188,37 +319,95 @@ impl Repo {
             }
         }
 
-        let sealed = fs::read(root.join("vault.bin"))?;
-        let key_bytes = fs::read(root.join("vault.key"))?;
-        let vault_key: [u8; KEY_LEN] = key_bytes
-            .as_slice()
-            .try_into()
-            .map_err(|_| io::Error::other("vault.key is not 32 bytes"))?;
-        let vault =
-            Vault::open_with(&sealed, vault_key).map_err(|e| io::Error::other(e.to_string()))?;
+        let secrets = match mode {
+            Mode::Passphrase => {
+                let pw = passphrase.ok_or_else(|| {
+                    io::Error::other("passphrase mode needs --passphrase or $NAS_PASSPHRASE")
+                })?;
+                let seq = Self::latest_wrap_seq(&root)?;
+                let w = Self::load_wrap(&root, seq)?;
+                let (ns, anchor) = w
+                    .unwrap(&pw, &WrapPolicy::SPEC)
+                    .map_err(|e| io::Error::other(e.to_string()))?;
+                Secrets::Passphrase(Box::new(ns), anchor)
+            }
+            Mode::E2ee | Mode::TransitOnly => {
+                let sealed = fs::read(root.join("vault.bin"))?;
+                let key_bytes = fs::read(root.join("vault.key"))?;
+                let vault_key: [u8; KEY_LEN] = key_bytes
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| io::Error::other("vault.key is not 32 bytes"))?;
+                let vault = Vault::open_with(&sealed, vault_key)
+                    .map_err(|e| io::Error::other(e.to_string()))?;
+                Secrets::Vault(Box::new(vault))
+            }
+        };
         Ok(Self {
             root,
             mode,
             key_scheme,
             padding,
-            vault,
+            secrets,
         })
     }
 
-    /// A role identity from the vault seed (SPECS §3.1).
+    /// The freshness anchor a passphrase recovery yields (SPECS §2.2.2).
+    ///
+    /// `None` for vault-backed modes, where the capability carries it instead.
+    pub fn recovered_anchor(&self) -> Option<Anchor> {
+        match &self.secrets {
+            Secrets::Passphrase(_, a) => Some(*a),
+            Secrets::Vault(_) => None,
+        }
+    }
+
+    /// A role identity (SPECS §3.1).
     pub fn identity(&self, role: Role) -> io::Result<Identity> {
-        self.vault
-            .identity(role)
-            .map_err(|e| io::Error::other(e.to_string()))
+        match &self.secrets {
+            Secrets::Vault(v) => v
+                .identity(role)
+                .map_err(|e| io::Error::other(e.to_string())),
+            // A passphrase namespace has one seed and no vault, so both roles
+            // derive from it -- still distinct keypairs, by role separation.
+            Secrets::Passphrase(ns, _) => match role {
+                Role::Lease => ns.lease_identity(),
+                _ => ns.slot_identity(),
+            }
+            .map_err(|e| io::Error::other(e.to_string())),
+        }
     }
 
     /// The convergence-secret generation new writes use (SPECS §3.9c).
+    ///
+    /// Passphrase namespaces have no generation table: rotating `CS` there
+    /// would mean changing the DEK, which is a re-encryption rather than a
+    /// vault edit (§3.9c), so the answer is always 0.
     pub fn generation(&self) -> u32 {
-        self.vault.current_generation().number
+        match &self.secrets {
+            Secrets::Vault(v) => v.current_generation().number,
+            Secrets::Passphrase(..) => 0,
+        }
+    }
+
+    /// A hash of the convergence secret, for comparing two namespaces without
+    /// exposing the secret itself.
+    pub fn convergence_secret_fingerprint(&self) -> [u8; 32] {
+        use nas_crypto::{chunk_key, seal};
+        let probe = b"nas-tools/fingerprint-probe/v1";
+        let sealed =
+            seal(&chunk_key(&self.convergence_secret(), probe), probe, b"").unwrap_or_default();
+        *blake3::hash(&sealed).as_bytes()
     }
 
     pub fn convergence_secret(&self) -> ConvergenceSecret {
-        self.vault.current_generation().convergence_secret()
+        match &self.secrets {
+            Secrets::Vault(v) => v.current_generation().convergence_secret(),
+            // SPECS §2.2.2: per-namespace, not tenant-wide. Otherwise a
+            // passphrase namespace would need a vault secret to write and
+            // "recoverable from memory alone" would be false.
+            Secrets::Passphrase(ns, _) => ns.convergence_secret(),
+        }
     }
 
     /// A convergence secret that is **not** this namespace's — for modelling an
@@ -229,7 +418,10 @@ impl Repo {
 
     /// Root of the per-directory key chain (SPECS §3.1, §15.3).
     pub fn dir_root(&self) -> DirSecret {
-        self.vault.dir_root()
+        match &self.secrets {
+            Secrets::Vault(v) => v.dir_root(),
+            Secrets::Passphrase(ns, _) => ns.dir_root(),
+        }
     }
 
     pub fn blobs_root(&self) -> PathBuf {

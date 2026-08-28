@@ -403,6 +403,7 @@ dependencies = [
  "blake3",
  "nas-core",
  "nas-crypto",
+ "nas-slots",
  "nas-store",
  "nas-vault",
 ]

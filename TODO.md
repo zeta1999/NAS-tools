@@ -107,9 +107,14 @@ settled and the work that follows from them.
       relocates the secret rather than protecting it. Needs an OS keychain
       (Keychain / Secret Service) or a passphrase-derived vault key. Until then
       `e2ee` at rest is only as strong as the local disk.
-- [ ] Wire `--mode passphrase` through the CLI now that `WrapRecord` exists:
-      `ns create --mode passphrase`, `ns open --passphrase`, and the six M1
-      assertions in `uc02` that depend on them.
+- [x] Wire `--mode passphrase` through the CLI. **UC02 is green end to end**:
+      all 9 assertions pass, including the Argon2id floor read from the *stored*
+      record rather than from a constant in the binary, the wrong-passphrase
+      refusal at exit 2, re-wrap without re-encryption, recovery carrying the
+      freshness anchor, and superseded wraps removed.
+- [ ] Interactive passphrase prompt. There is none: the CLI takes
+      `--passphrase` or `$NAS_PASSPHRASE` and refuses otherwise, because a
+      prompt that silently fell back to a default would be worse than none.
 - [ ] **The root manifest key `rk_v` is unbuilt.** SPECS §3.1 specifies
       per-version derivation `derive_key("nas-tools/root/v1", root_secret ‖
       le64(seq))`; M0 uses a local `state/HEAD` file and never derives it. The

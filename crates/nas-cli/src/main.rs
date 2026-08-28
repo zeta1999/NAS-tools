@@ -134,12 +134,6 @@ fn ns(args: &[String]) -> i32 {
                     }
                 },
             };
-            // SPECS §2.2.2: the passphrase mode needs Argon2id KEK wrapping and
-            // a WrapRecord. Creating one without them would produce a namespace
-            // whose config claims a protection it does not have.
-            if mode == Mode::Passphrase {
-                return testcmds::unimplemented("--mode passphrase", "M1 (§2.2.2, nas-vault)");
-            }
             let padding = match opt(args, "--padding") {
                 None => PaddingProfile::default(),
                 Some(p) => match repo::parse_padding(p) {
@@ -159,7 +153,12 @@ fn ns(args: &[String]) -> i32 {
                 eprintln!("namespace {name} already exists");
                 return exit::ERROR;
             }
-            match Repo::create(name, mode, KeyScheme::Convergent, padding) {
+            let passphrase = repo::passphrase_from(opt(args, "--passphrase"));
+            if mode == Mode::Passphrase && passphrase.is_none() {
+                eprintln!("passphrase mode needs --passphrase or $NAS_PASSPHRASE");
+                return exit::ERROR;
+            }
+            match Repo::create(name, mode, KeyScheme::Convergent, padding, passphrase) {
                 Ok(r) => {
                     println!("created {name} at {}", r.root.display());
                     println!(
@@ -180,7 +179,16 @@ fn ns(args: &[String]) -> i32 {
                         ),
                         Err(e) => eprintln!("  warning: could not derive identity: {e}"),
                     }
-                    println!("  {}", repo::VAULT_WARNING);
+                    // Only vault-backed modes have a key file to warn about.
+                    // A passphrase namespace stores nothing that opens it.
+                    if mode == Mode::Passphrase {
+                        println!(
+                            "  no key material on disk: this namespace opens only from the \
+                             passphrase. Losing it loses the data (SPECS §2.2.2)."
+                        );
+                    } else {
+                        println!("  {}", repo::VAULT_WARNING);
+                    }
                     exit::OK
                 }
                 Err(e) => {
@@ -200,13 +208,13 @@ fn ns(args: &[String]) -> i32 {
                         .collect();
                     names.sort();
                     for n in names {
-                        match Repo::open(&n) {
-                            Ok(r) => println!(
-                                "{n}\tmode={:?}\tkey_scheme={:?}\tpadding={:?}\tgeneration={}",
-                                r.mode,
-                                r.key_scheme,
-                                r.padding,
-                                r.generation()
+                        // describe() reads the config only: listing must not
+                        // require unlocking, or naming a passphrase namespace
+                        // would mean running Argon2id over 256 MiB first.
+                        match Repo::describe(&n) {
+                            Ok(d) => println!(
+                                "{n}\tmode={:?}\tkey_scheme={:?}\tpadding={:?}",
+                                d.mode, d.key_scheme, d.padding
                             ),
                             Err(e) => println!("{n}\tUNREADABLE: {e}"),
                         }
@@ -216,7 +224,29 @@ fn ns(args: &[String]) -> i32 {
                 Err(_) => exit::OK, // no namespaces yet is not an error
             }
         }
-        Some("open") => testcmds::unimplemented("ns open", "M1 (§2.2.2)"),
+        Some("open") => {
+            let Some(name) = pos.get(1) else {
+                eprintln!("usage: nas ns open <name> [--passphrase <pw>]");
+                return exit::ERROR;
+            };
+            let pw = repo::passphrase_from(opt(args, "--passphrase"));
+            match Repo::open_with(name, pw) {
+                Ok(r) => {
+                    println!("opened {name} (mode {:?})", r.mode);
+                    if let Some(a) = r.recovered_anchor() {
+                        println!("  freshness anchor: seq {}", a.seq);
+                    }
+                    exit::OK
+                }
+                // A wrong passphrase is a POLICY refusal, not a breakage: the
+                // harness distinguishes exit 2 from every other non-zero code
+                // precisely so a broken binary cannot pass this assertion.
+                Err(e) => {
+                    eprintln!("refused: {e}");
+                    exit::REFUSED
+                }
+            }
+        }
         _ => {
             eprintln!("usage: nas ns create|list");
             exit::ERROR
@@ -268,6 +298,63 @@ fn test(args: &[String]) -> i32 {
             }
             testcmds::confirmation_attack(ns, with)
         }
+        Some("argon2-params") => {
+            let Some(ns) = pos.get(1) else {
+                eprintln!("usage: nas test argon2-params <ns> --min-mem 256MiB --min-time 3");
+                return exit::ERROR;
+            };
+            let min_mem = opt(args, "--min-mem").unwrap_or("256MiB");
+            let min_time = match pct(args, "--min-time", 3) {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("{e}");
+                    return exit::ERROR;
+                }
+            };
+            testcmds::argon2_params(ns, min_mem, min_time)
+        }
+        Some("peer-no-plaintext") => match pos.get(1) {
+            Some(ns) => testcmds::peer_no_plaintext(ns),
+            None => {
+                eprintln!("usage: nas test peer-no-plaintext <ns>");
+                exit::ERROR
+            }
+        },
+        Some("open-with-passphrase") => match pos.get(1) {
+            Some(ns) => testcmds::open_with_passphrase(ns),
+            None => {
+                eprintln!("usage: nas test open-with-passphrase <ns>");
+                exit::ERROR
+            }
+        },
+        Some("recovery-has-freshness-anchor") => match pos.get(1) {
+            Some(ns) => testcmds::recovery_has_freshness_anchor(ns),
+            None => {
+                eprintln!("usage: nas test recovery-has-freshness-anchor <ns>");
+                exit::ERROR
+            }
+        },
+        Some("passphrase-change-is-rewrap") => match pos.get(1) {
+            Some(ns) => testcmds::passphrase_change(ns, false),
+            None => {
+                eprintln!("usage: nas test passphrase-change-is-rewrap <ns>");
+                exit::ERROR
+            }
+        },
+        Some("no-reencrypt-on-passphrase-change") => match pos.get(1) {
+            Some(ns) => testcmds::passphrase_change(ns, true),
+            None => {
+                eprintln!("usage: nas test no-reencrypt-on-passphrase-change <ns>");
+                exit::ERROR
+            }
+        },
+        Some("old-wrap-deleted") => match pos.get(1) {
+            Some(ns) => testcmds::old_wrap_deleted(ns),
+            None => {
+                eprintln!("usage: nas test old-wrap-deleted <ns>");
+                exit::ERROR
+            }
+        },
         Some(other) => testcmds::unimplemented(&format!("test {other}"), "a later milestone"),
         None => {
             eprintln!("usage: nas test <check> …");

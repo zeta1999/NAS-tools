@@ -113,6 +113,19 @@ settled and the work that follows from them.
 
 ## M1 — the peer
 
+- [x] `nas-slots`: signed records, both regimes, hash chain, roster, chain
+      walking, anchors, pins, witnesses, publishable fork proofs. **ML-DSA
+      record sizes measured while the structs were designed** (PLAN step 6):
+      a SlotRecord is 3502 B of which 3309 B is signature — **103x the 32-byte
+      root address it authenticates**, which is the number behind SPECS §3.8.
+      A witness is 5365 B, so a fork proof costs 10730 B.
+- [ ] Skip-chain checkpoints (SPECS §5.5): retain-N=1024 with a signed
+      checkpoint every 256 records, so a client 100k updates behind walks ~400
+      checkpoints rather than 100k records. The degraded path already exists
+      (`Verdict::Degraded`); the checkpoints that avoid needing it do not.
+- [ ] Single-writer ownership handoff (SPECS §5.1) — an explicit signed
+      operation. `verify_chain` currently refuses any writer change under that
+      regime, which is the recoverable mistake but not the specified behaviour.
 - [ ] `nas-peer`: blob store, slot ordering + history, CAS enforcement
 - [ ] Lease deltas, checkpoints, sweep, young-blob grace, per-holder quotas
 - [ ] Proof-of-possession responder

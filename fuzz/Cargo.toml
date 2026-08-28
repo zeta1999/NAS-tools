@@ -16,6 +16,7 @@ cargo-fuzz = true
 libfuzzer-sys = "0.4"
 nas-core = { path = "../crates/nas-core" }
 nas-crypto = { path = "../crates/nas-crypto" }
+nas-slots = { path = "../crates/nas-slots" }
 nas-store = { path = "../crates/nas-store" }
 
 [profile.release]
@@ -54,5 +55,17 @@ doc = false
 [[bin]]
 name = "aead_open"
 path = "fuzz_targets/aead_open.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "slot_record_decode"
+path = "fuzz_targets/slot_record_decode.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "witness_decode"
+path = "fuzz_targets/witness_decode.rs"
 test = false
 doc = false

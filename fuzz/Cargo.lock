@@ -386,7 +386,17 @@ dependencies = [
  "libfuzzer-sys",
  "nas-core",
  "nas-crypto",
+ "nas-slots",
  "nas-store",
+]
+
+[[package]]
+name = "nas-slots"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "nas-core",
+ "nas-crypto",
 ]
 
 [[package]]

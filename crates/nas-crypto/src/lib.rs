@@ -6,9 +6,11 @@
 
 pub mod context;
 pub mod keys;
+pub mod sign;
 
 pub use context::SigContext;
 pub use keys::{
     chunk_key, chunk_key_from_stored, manifest_key, open, open_chunk, seal, ChunkReadKey,
     ConvergenceSecret, CryptoError, DirSecret, Key, KEY_LEN, NONCE_LEN,
 };
+pub use sign::{key_id, verify, Identity, Role, SignError, SIGNATURE_LEN, VERIFYING_KEY_LEN};

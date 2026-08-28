@@ -57,6 +57,11 @@ listing; lease-based GC with deltas; **three confidentiality modes** (`e2ee`,
   key chain and incremental writes. Entry names are **raw bytes**, not `String`:
   a POSIX filename need not be UTF-8, and `to_string_lossy` collided distinct
   names into one. That is a format decision, made before M1 freezes the layout.
+- **`crates/nas-slots`** — SPECS §5. Signed, hash-chained slot records in both
+  regimes; roster; chain walking; witnesses and publishable fork proofs; and the
+  client accept logic that is the Rust counterpart of `SlotConsistency.tla` —
+  `AnchorFloor`, `MonotonicPins` and `ForkDetected` each map to a specific
+  rejection or alarm. **57 tests green.**
 - **`crates/nas-cli`** — the `nas` binary. Exit codes are a *contract*: 0 ok,
   1 error, 2 refused by policy, **3 unimplemented**. A specified-but-unbuilt
   subcommand must never exit 2, or the harness would score unwritten code as a
@@ -68,9 +73,11 @@ listing; lease-based GC with deltas; **three confidentiality modes** (`e2ee`,
 
 ## Fuzzing
 
-Six targets under `fuzz/`, one per parser that consumes bytes it did not write:
-`decode_fields`, `addr_from_hex`, `unpad`, `manifest_decode`,
-`dir_manifest_decode`, `aead_open`. They assert *properties* — injectivity,
+Eight targets under `fuzz/`, one per parser that consumes bytes it did not
+write: `decode_fields`, `addr_from_hex`, `unpad`, `manifest_decode`,
+`dir_manifest_decode`, `aead_open`, `slot_record_decode`, `witness_decode`.
+The last two were added **with** the formats they parse, not after — SPECS §20
+lists the peer's plaintext records as format-breaking to change once written. They assert *properties* — injectivity,
 canonical re-encoding, and that attacker bytes never open — not merely absence
 of panics. ~102 M executions clean at 60 s per target.
 
@@ -114,11 +121,11 @@ See `MANUAL-TESTING.md` §5 for the commands and raw output.
 
 ## Not built
 
-M1 in full: `nas-slots`, `nas-lease`, `nas-vault`, the two remaining
+M1 remainder: `nas-lease`, `nas-vault`, the two remaining
 confidentiality modes, `nas-transfer`, and `nas-peer` built hostile from day
 one. `ci.sh` is green end to end today: 97 Rust tests, 11 Lean theorems verified
 with a clean axiom gate, TLC green with its three sanity checks still failing as
-required, and 5 acceptance assertions actually passing.
+required, and 5 acceptance assertions actually passing. 180 Rust tests total.
 
 > The TLA+ model constrains SPECS §5, which is **M2** code. It is assurance
 > about the design, not about anything shipped in M0.

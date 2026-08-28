@@ -146,11 +146,13 @@ settled and the work that follows from them.
       roster checks, retention holds, PoP responder, the rights vocabulary and
       a peer-evaluated ACL, and **all six `--hostile` behaviours as branches in
       the real peer** rather than as a mock.
-- [ ] Serve it over the network (`nas-transfer` on `simple-network` `pqc`) and
-      run the three-process localhost simulation. The peer is a library today;
-      nothing crosses a socket yet.
+- [x] Serve it over the network — `nas-transfer` on `simple-network` `pqc`,
+      synchronous handshake so no async runtime enters NAS-tools. Eight
+      integration tests cross a real socket, including the tamper, dedup-lie
+      and rollback defences and the peer-key pin.
+- [ ] The three-process localhost simulation, then containers.
+- [ ] Wire `nas-transfer` into the CLI: `nas peer serve` / `nas peer sync`.
 - [ ] `nas-peer --witness`: no blobs, no caps, relay only.
-- [ ] Old: `nas-peer`: blob store, slot ordering + history, CAS enforcement
 - [x] Lease deltas, checkpoints, sweep, young-blob grace, per-holder quotas.
       **Measured:** a LeaseDelta is 5337 B fixed + 32 B per address — 8537 B for
       100 addresses, where signing each address individually would cost
@@ -165,7 +167,7 @@ settled and the work that follows from them.
       `nas-peer` starts actually deleting.
 - [ ] Proof-of-possession responder
 - [ ] `--witness` mode: no blobs, no caps, relay only
-- [ ] Push/pull over `simple-network` `pqc` (honest-peer path)
+- [x] Push/pull over `simple-network` `pqc` (honest-peer path)
 
 ## M2 — adversarial hardening
 

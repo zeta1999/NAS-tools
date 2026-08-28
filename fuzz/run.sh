@@ -13,7 +13,8 @@ cd "$(dirname "$0")"
 SECS="${SECS:-60}"
 TARGETS=("$@")
 if [ ${#TARGETS[@]} -eq 0 ]; then
-  TARGETS=(decode_fields addr_from_hex unpad manifest_decode dir_manifest_decode aead_open)
+  TARGETS=(decode_fields addr_from_hex unpad manifest_decode dir_manifest_decode aead_open
+           slot_record_decode witness_decode)
 fi
 
 fail=0

@@ -19,7 +19,7 @@ const LEN_PREFIX: usize = 4;
 /// Largest field this encoding can represent.
 pub const MAX_FIELD: usize = u32::MAX as usize;
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DecodeError {
     /// Input ended in the middle of a length prefix or a field body.
     Truncated,

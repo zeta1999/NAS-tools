@@ -72,6 +72,14 @@ listing; lease-based GC with deltas; **three confidentiality modes** (`e2ee`,
   `WrapRecord` that **is** the capability for passphrase mode, carrying the
   freshness anchor; and the sealed local vault with `CS` generations and pinned
   peers. **42 tests green.**
+- **`crates/nas-peer`** — SPECS §10, §15. The rights vocabulary and a
+  peer-evaluated ACL whose answer has **four** outcomes, not two: `NotEnforceable`
+  exists because in an encrypted mode the peer has no read control to offer, and
+  reporting allow-or-deny there would describe a control that does not exist.
+  Slot ordering with compare-and-swap, roster checks, retention holds, the
+  proof-of-possession responder — and `Hostility`, which is a flag on the real
+  peer rather than a mock, so the attack path and the honest path share their
+  parsing and bookkeeping. **35 tests green.**
 - **`crates/nas-cli`** — the `nas` binary. Exit codes are a *contract*: 0 ok,
   1 error, 2 refused by policy, **3 unimplemented**. A specified-but-unbuilt
   subcommand must never exit 2, or the harness would score unwritten code as a
@@ -79,10 +87,8 @@ listing; lease-based GC with deltas; **three confidentiality modes** (`e2ee`,
 - **`tests/usecases/`** — 83 acceptance assertions, milestone-gated; 53 are
   M0–M2. **5 passing, 0 failing, 78 pending** at `NAS_MILESTONE=M0` (what CI
   gates on), and **16 passing, 9 failing, 58 pending** at `NAS_MILESTONE=M1` —
-  UC02 (passphrase) and UC03 (e2ee) are green end to end, and UC01
-  (transit-only) is green but for two peer-enforced ACL assertions — the only
-  two M1 failures left, and both genuinely need `nas-peer`. They report exit 3
-  (unimplemented), which the harness scores as BROKEN rather than as a pass. Verified to
+  and **25 passing, 0 failing, 58 pending** at `NAS_MILESTONE=M1` — UC01
+  (transit-only), UC02 (passphrase) and UC03 (e2ee) are all green end to end. Verified to
   bite: a stub that always exits 0 fails the refusal assertion, and one that
   always exits 1 is reported BROKEN rather than refused (MANUAL-TESTING.md §6a).
 
@@ -143,7 +149,7 @@ M1 remainder: the two remaining
 confidentiality modes, `nas-transfer`, and `nas-peer` built hostile from day
 one. `ci.sh` is green end to end today: 97 Rust tests, 11 Lean theorems verified
 with a clean axiom gate, TLC green with its three sanity checks still failing as
-required, and 5 acceptance assertions actually passing. 270 Rust tests total.
+required, and 5 acceptance assertions actually passing at M0 (25 at M1). 319 Rust tests total.
 
 > The TLA+ model constrains SPECS §5, which is **M2** code. It is assurance
 > about the design, not about anything shipped in M0.

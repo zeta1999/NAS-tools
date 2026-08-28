@@ -142,7 +142,15 @@ settled and the work that follows from them.
 - [ ] Single-writer ownership handoff (SPECS §5.1) — an explicit signed
       operation. `verify_chain` currently refuses any writer change under that
       regime, which is the recoverable mistake but not the specified behaviour.
-- [ ] `nas-peer`: blob store, slot ordering + history, CAS enforcement
+- [x] `nas-peer` core: blob store, slot ordering + history, CAS enforcement,
+      roster checks, retention holds, PoP responder, the rights vocabulary and
+      a peer-evaluated ACL, and **all six `--hostile` behaviours as branches in
+      the real peer** rather than as a mock.
+- [ ] Serve it over the network (`nas-transfer` on `simple-network` `pqc`) and
+      run the three-process localhost simulation. The peer is a library today;
+      nothing crosses a socket yet.
+- [ ] `nas-peer --witness`: no blobs, no caps, relay only.
+- [ ] Old: `nas-peer`: blob store, slot ordering + history, CAS enforcement
 - [x] Lease deltas, checkpoints, sweep, young-blob grace, per-holder quotas.
       **Measured:** a LeaseDelta is 5337 B fixed + 32 B per address — 8537 B for
       100 addresses, where signing each address individually would cost

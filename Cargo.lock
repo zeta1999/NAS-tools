@@ -403,6 +403,7 @@ dependencies = [
  "blake3",
  "nas-core",
  "nas-crypto",
+ "nas-peer",
  "nas-slots",
  "nas-store",
  "nas-vault",
@@ -433,6 +434,19 @@ dependencies = [
  "blake3",
  "nas-core",
  "nas-crypto",
+ "proptest",
+]
+
+[[package]]
+name = "nas-peer"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "nas-core",
+ "nas-crypto",
+ "nas-lease",
+ "nas-slots",
+ "nas-store",
  "proptest",
 ]
 

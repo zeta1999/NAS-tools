@@ -3,6 +3,20 @@
 uc_begin UC01 "Family photos on the home NAS" "SPECS §19.1, §2.2.3" "M1"
 # The inverse of every other test: here plaintext on the peer is CORRECT.
 check         "namespace is created in transit-only mode"        $NAS ns create photos --mode transit-only
+# SETUP, not an assertion. SPECS §19.1 declares the access list as part of the
+# namespace definition:
+#     access:
+#       - { subject: family,  rights: [read] }
+#       - { subject: renaud,  rights: [read, write, admin] }
+# `ns create` above does not carry it, so it is established here. The
+# assertions that follow test that the peer EVALUATES this list -- granting
+# read and denying write -- not that a namespace invents a family by itself.
+[ -z "$NAS" ] || {
+  $NAS acl grant photos --subject family --right read   >/dev/null 2>&1
+  $NAS acl grant photos --subject renaud --right read   >/dev/null 2>&1
+  $NAS acl grant photos --subject renaud --right write  >/dev/null 2>&1
+  $NAS acl grant photos --subject renaud --right admin  >/dev/null 2>&1
+}
 check         "peer stores plaintext — readable by the NAS"      $NAS test peer-holds-plaintext photos
 check         "filenames are visible on the peer"                $NAS test peer-names-visible photos
 check M6      "thumbnails are PERMITTED by the mode (feature deferred, §19.1)" $NAS peer feature-permitted photos thumbnails

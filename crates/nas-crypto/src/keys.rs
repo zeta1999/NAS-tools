@@ -24,7 +24,7 @@ use zeroize::{Zeroize, ZeroizeOnDrop};
 pub const KEY_LEN: usize = 32;
 pub const NONCE_LEN: usize = 24;
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CryptoError {
     /// AEAD open failed: wrong key, tampered ciphertext, or wrong AAD. The
     /// three are deliberately indistinguishable to the caller.
@@ -130,6 +130,28 @@ pub fn chunk_key(cs: &ConvergenceSecret, plaintext: &[u8]) -> Key {
 pub fn manifest_key(dir: &DirSecret) -> Key {
     Key {
         bytes: blake3::derive_key(context::DIR_MANIFEST, &dir.0),
+        policy: NoncePolicy::Random,
+    }
+}
+
+/// A key-encryption key built from bytes a caller already holds.
+///
+/// # Why this is not the hole [`ChunkReadKey`] exists to avoid
+///
+/// The dangerous pairing is *a deterministic nonce over caller-chosen bytes*:
+/// two different plaintexts under one such key reuse a keystream. This
+/// constructor produces a [`NoncePolicy::Random`] key, where every message
+/// carries a fresh 24-byte nonce, so the pairing is safe no matter where the
+/// bytes came from. That is precisely why the nonce policy is a property of the
+/// derivation rather than of the caller: the answer differs per derivation, and
+/// only the derivation knows it.
+///
+/// The intended input is an Argon2id output (SPECS §2.2.2's `KEK`), which wraps
+/// one DEK and may re-wrap it on every passphrase change — many plaintexts under
+/// one key, which is exactly the case that mandates a random nonce.
+pub fn wrapping_key(bytes: [u8; KEY_LEN]) -> Key {
+    Key {
+        bytes,
         policy: NoncePolicy::Random,
     }
 }

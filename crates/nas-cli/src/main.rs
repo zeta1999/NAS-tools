@@ -163,10 +163,23 @@ fn ns(args: &[String]) -> i32 {
                 Ok(r) => {
                     println!("created {name} at {}", r.root.display());
                     println!(
-                        "  mode {}, padding {:?}",
+                        "  mode {}, padding {:?}, generation {}",
                         opt(args, "--mode").unwrap_or("e2ee"),
-                        padding
+                        padding,
+                        r.generation()
                     );
+                    // The writer id is what goes on a roster, so print it at
+                    // creation rather than making the user derive it later.
+                    match r.identity(nas_crypto::Role::Slot) {
+                        Ok(id) => println!(
+                            "  slot writer id {}",
+                            id.id()
+                                .iter()
+                                .map(|b| format!("{b:02x}"))
+                                .collect::<String>()
+                        ),
+                        Err(e) => eprintln!("  warning: could not derive identity: {e}"),
+                    }
                     println!("  {}", repo::VAULT_WARNING);
                     exit::OK
                 }
@@ -189,8 +202,11 @@ fn ns(args: &[String]) -> i32 {
                     for n in names {
                         match Repo::open(&n) {
                             Ok(r) => println!(
-                                "{n}\tmode={:?}\tkey_scheme={:?}\tpadding={:?}",
-                                r.mode, r.key_scheme, r.padding
+                                "{n}\tmode={:?}\tkey_scheme={:?}\tpadding={:?}\tgeneration={}",
+                                r.mode,
+                                r.key_scheme,
+                                r.padding,
+                                r.generation()
                             ),
                             Err(e) => println!("{n}\tUNREADABLE: {e}"),
                         }

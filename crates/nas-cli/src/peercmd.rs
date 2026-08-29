@@ -41,7 +41,7 @@ use crate::repo::{self, Repo};
 use nas_core::{Addr, Mode};
 use nas_crypto::{Identity, Role};
 use nas_peer::{Acl, Hostility, Peer, Right};
-use nas_slots::{Regime, SlotId, SlotRecord, ROOT_NONCE_LEN};
+use nas_slots::{Regime, SlotId, SlotRecord, Witness, ROOT_NONCE_LEN};
 use nas_store::{Addressing, BlobStore};
 use nas_transfer::{transport_identity, Channel, Request, Response};
 use std::collections::BTreeMap;
@@ -490,11 +490,45 @@ pub struct SyncOpts<'a> {
     pub peer: &'a str,
     pub peer_pub: &'a str,
     pub passphrase: Option<Vec<u8>>,
+    /// A second node — typically `nas peer serve --witness` — that relays
+    /// observations of slot heads (SPECS §5.3). Consulted before the head is
+    /// trusted, told about it after.
+    pub witness: Option<&'a str>,
+    pub witness_pub: Option<&'a str>,
+}
+
+/// Connect to `addr` and complete the handshake with the key in `pub_path`
+/// pinned: whoever answers must be that key, or the handshake fails before a
+/// byte of ours is sent. The failure is already reported; the `Err` is the
+/// exit code to return.
+fn dial(repo: &Repo, addr: &str, pub_path: &str) -> Result<Channel, i32> {
+    let vk = fs::read(pub_path).map_err(|e| err(format!("{pub_path}: {e}")))?;
+    let tid = repo
+        .identity(Role::Transport)
+        .map_err(|e| e.to_string())
+        .and_then(|i| transport_identity(&i).map_err(|e| e.to_string()))
+        .map_err(|e| err(format!("transport identity: {e}")))?;
+    let sock = TcpStream::connect(addr).map_err(|e| err(format!("connect {addr}: {e}")))?;
+    let ch = Channel::connect(sock, &tid, vk.clone())
+        .map_err(|e| refused(format!("handshake with {addr}: {e}")))?;
+    println!("connected to {addr} (peer key {})", fingerprint(&vk));
+    Ok(ch)
 }
 
 /// Where the last head this client published to a peer is pinned.
 fn pin_path(repo: &Repo) -> PathBuf {
     repo.root.join("state/peer-seq")
+}
+
+/// A device that joined by copying `config` + `wraps/` has no `state/` yet;
+/// the pin must still land, since it is that device's only memory of what it
+/// has seen served.
+fn write_pin(repo: &Repo, seq: u64) -> Result<(), String> {
+    let p = pin_path(repo);
+    if let Some(dir) = p.parent() {
+        fs::create_dir_all(dir).map_err(|e| format!("pin: {e}"))?;
+    }
+    fs::write(p, format!("{seq}\n")).map_err(|e| format!("pin: {e}"))
 }
 
 fn read_pin(repo: &Repo) -> Option<u64> {
@@ -509,38 +543,14 @@ pub fn sync(ns: &str, o: SyncOpts<'_>) -> i32 {
         Ok(r) => r,
         Err(e) => return err(format!("namespace {ns}: {e}")),
     };
-    let peer_vk = match fs::read(o.peer_pub) {
-        Ok(b) => b,
-        Err(e) => return err(format!("{}: {e}", o.peer_pub)),
-    };
-    let tid = match repo
-        .identity(Role::Transport)
-        .map_err(|e| e.to_string())
-        .and_then(|i| transport_identity(&i).map_err(|e| e.to_string()))
-    {
-        Ok(i) => i,
-        Err(e) => return err(format!("transport identity: {e}")),
-    };
     let blobs = match repo.blobs() {
         Ok(b) => b,
         Err(e) => return err(e),
     };
-
-    let sock = match TcpStream::connect(o.peer) {
-        Ok(s) => s,
-        Err(e) => return err(format!("connect {}: {e}", o.peer)),
-    };
-    // The peer key is pinned by `connect`: whoever answers must be the key in
-    // `--peer-pub`, or the handshake fails before a byte of ours is sent.
-    let mut ch = match Channel::connect(sock, &tid, peer_vk.clone()) {
+    let mut ch = match dial(&repo, o.peer, o.peer_pub) {
         Ok(c) => c,
-        Err(e) => return refused(format!("handshake with {}: {e}", o.peer)),
+        Err(code) => return code,
     };
-    println!(
-        "connected to {} (peer key {})",
-        o.peer,
-        fingerprint(&peer_vk)
-    );
 
     // ── Blobs ──
     let addrs = match blobs.addrs() {
@@ -602,13 +612,17 @@ pub fn sync(ns: &str, o: SyncOpts<'_>) -> i32 {
     );
 
     // ── Head ──
-    let Some(head_hex) = repo.head() else {
-        println!("no HEAD yet; nothing to publish");
-        return exit::OK;
-    };
-    let root = match Addr::from_hex(&head_hex) {
-        Ok(a) => a,
-        Err(e) => return err(format!("state/HEAD: {e}")),
+    //
+    // No local HEAD does not mean nothing to do: a second device of this
+    // namespace has no HEAD and no pin, and is exactly the client a rolled-back
+    // or withholding peer fools (SPECS §5.3). It still asks for the served head
+    // and checks it against the witness node before believing anything.
+    let root = match repo.head() {
+        None => None,
+        Some(h) => match Addr::from_hex(&h) {
+            Ok(a) => Some(a),
+            Err(e) => return err(format!("state/HEAD: {e}")),
+        },
     };
     let writer = match repo.identity(Role::Slot) {
         Ok(i) => i,
@@ -635,13 +649,16 @@ pub fn sync(ns: &str, o: SyncOpts<'_>) -> i32 {
     // A peer serving anything older, or nothing at all when there was
     // something, is rolling back (SPECS §5.2) — the defence the socket tests
     // exercise, now on the CLI path.
-    let (seq, prev) = match (&served, pinned) {
+    //
+    // `None` means there is nothing to publish (the peer already serves this
+    // HEAD, or there is no local HEAD); `Some` is the next record to publish.
+    let next = match (&served, pinned) {
         (None, Some(p)) => {
             return refused(format!(
-                "peer serves no head, but seq {p} was published here before (rollback or withholding)"
+                "peer serves no head, but seq {p} was seen here before (rollback or withholding)"
             ));
         }
-        (None, None) => (0, [0u8; 32]),
+        (None, None) => root.map(|r| (0, [0u8; 32], r)),
         (Some(h), pin) => {
             if h.slot_id != slot {
                 return refused("peer served a record for a different slot");
@@ -654,49 +671,176 @@ pub fn sync(ns: &str, o: SyncOpts<'_>) -> i32 {
             if let Some(p) = pin {
                 if h.seq < p {
                     return refused(format!(
-                        "peer serves seq {}, but seq {p} was published here before (rollback)",
+                        "peer serves seq {}, but seq {p} was seen here before (rollback)",
                         h.seq
                     ));
                 }
             }
-            if h.root == root {
-                println!(
-                    "head: seq {} already points at {}; up to date",
-                    h.seq,
-                    root.to_hex()
-                );
-                return exit::OK;
+            match root {
+                Some(r) if h.root == r => {
+                    println!(
+                        "head: seq {} already points at {}; up to date",
+                        h.seq,
+                        r.to_hex()
+                    );
+                    None
+                }
+                Some(r) => Some((h.seq + 1, h.record_hash(), r)),
+                None => {
+                    println!(
+                        "head: peer serves seq {} -> {}; nothing local to publish",
+                        h.seq,
+                        h.root.to_hex()
+                    );
+                    None
+                }
             }
-            (h.seq + 1, h.record_hash())
         }
     };
 
-    let nonce: [u8; ROOT_NONCE_LEN] = match nas_crypto::random::array() {
-        Ok(n) => n,
-        Err(e) => return err(e),
+    // ── Witness node (SPECS §5.3) ──
+    //
+    // The pin above is one device's memory. A second device of the same
+    // namespace has no pin, and a peer that rolled back after the first device
+    // published would look honest to it — unless someone else remembers. That
+    // is the witness node: before trusting the served head, ask it what this
+    // namespace observed before; after settling on a head, tell it.
+    //
+    // The roster is this namespace's own `Role::Witness` key. Every device of
+    // the namespace derives the same one from the seed, so an observation from
+    // one device is believed on another (UC07). Believing *other* observers is
+    // an M2 roster, and is where a witness node run by a stranger becomes
+    // useful rather than merely honest.
+    let witness_node = match (o.witness, o.witness_pub) {
+        (Some(addr), Some(pub_path)) => {
+            let wid = match repo.identity(Role::Witness) {
+                Ok(i) => i,
+                Err(e) => return err(format!("witness identity: {e}")),
+            };
+            let mut wch = match dial(&repo, addr, pub_path) {
+                Ok(c) => c,
+                Err(code) => return code,
+            };
+            let held = match call(&mut wch, &Request::Witnesses(slot)) {
+                Ok(Response::Records(rs)) => rs,
+                Ok(Response::Error(m)) => return refused(format!("witness node: {m}")),
+                Ok(other) => return err(format!("unexpected reply to Witnesses: {other:?}")),
+                Err(e) => return err(e),
+            };
+            let mut ours = 0usize;
+            for bytes in &held {
+                let w = match Witness::decode(bytes) {
+                    Ok(w) => w,
+                    Err(e) => {
+                        return refused(format!("witness node relayed an undecodable witness: {e}"))
+                    }
+                };
+                if w.witness_pk != wid.verifying_key() || w.slot_id != slot || w.verify().is_err() {
+                    continue;
+                }
+                ours += 1;
+                match &served {
+                    None => {
+                        return refused(format!(
+                            "peer serves no head, but seq {} was witnessed (rollback or withholding)",
+                            w.seq
+                        ))
+                    }
+                    Some(h) if w.seq > h.seq => {
+                        return refused(format!(
+                            "peer serves seq {}, but seq {} was witnessed (rollback)",
+                            h.seq, w.seq
+                        ))
+                    }
+                    Some(h) if w.seq == h.seq && w.sig_hash != h.sig_hash() => {
+                        return refused(format!(
+                            "fork: the witness saw a different record at seq {} than the peer serves (SPECS §5.3)",
+                            w.seq
+                        ))
+                    }
+                    _ => {}
+                }
+            }
+            println!(
+                "witnesses: {ours} of {} relayed by {addr} are this namespace's; none contradict the served head",
+                held.len()
+            );
+            Some((wch, wid, addr))
+        }
+        (None, None) => None,
+        _ => return err("--witness and --witness-pub go together"),
     };
-    let rec = match SlotRecord::sign(&writer, slot, seq, root, nonce, prev, Regime::CasMerge) {
-        Ok(r) => r,
-        Err(e) => return err(format!("sign: {e}")),
+
+    let (seq, sig_hash) = match next {
+        None => {
+            let Some(h) = served.as_ref() else {
+                // Nothing served, nothing local, and (if asked) no witness
+                // contradicting that. Genuinely empty.
+                println!("peer serves no head and nothing is published here yet");
+                return exit::OK;
+            };
+            // A served head this device accepted is now its floor too: the
+            // pin is what was *seen* here, not only what was published here,
+            // so a later rollback is caught even by a device that never wrote.
+            if pinned.is_none_or(|p| h.seq > p) {
+                if let Err(e) = write_pin(&repo, h.seq) {
+                    return err(e);
+                }
+            }
+            (h.seq, h.sig_hash())
+        }
+        Some((seq, prev, root)) => {
+            let nonce: [u8; ROOT_NONCE_LEN] = match nas_crypto::random::array() {
+                Ok(n) => n,
+                Err(e) => return err(e),
+            };
+            let rec =
+                match SlotRecord::sign(&writer, slot, seq, root, nonce, prev, Regime::CasMerge) {
+                    Ok(r) => r,
+                    Err(e) => return err(format!("sign: {e}")),
+                };
+            let bytes = match rec.encode() {
+                Ok(b) => b,
+                Err(e) => return err(format!("encode: {e}")),
+            };
+            match call(&mut ch, &Request::PublishSlot(bytes)) {
+                Ok(Response::Ok) => {}
+                Ok(Response::Error(m)) => return refused(format!("publish seq {seq}: {m}")),
+                Ok(other) => return err(format!("unexpected reply to PublishSlot: {other:?}")),
+                Err(e) => return err(e),
+            }
+            if let Err(e) = write_pin(&repo, seq) {
+                return err(e);
+            }
+            println!(
+                "head: published seq {seq} -> {} to slot {}",
+                root.to_hex(),
+                slot.to_hex()
+            );
+            (seq, rec.sig_hash())
+        }
     };
-    let bytes = match rec.encode() {
-        Ok(b) => b,
-        Err(e) => return err(format!("encode: {e}")),
-    };
-    match call(&mut ch, &Request::PublishSlot(bytes)) {
-        Ok(Response::Ok) => {}
-        Ok(Response::Error(m)) => return refused(format!("publish seq {seq}: {m}")),
-        Ok(other) => return err(format!("unexpected reply to PublishSlot: {other:?}")),
-        Err(e) => return err(e),
+
+    if let Some((mut wch, wid, addr)) = witness_node {
+        // `logical_time` is this observer's own counter, not a clock; the slot
+        // sequence is monotone for one namespace's observations of its own slot.
+        let w = match Witness::sign(&wid, slot, seq, sig_hash, seq) {
+            Ok(w) => w,
+            Err(e) => return err(format!("witness sign: {e}")),
+        };
+        let bytes = match w.encode() {
+            Ok(b) => b,
+            Err(e) => return err(format!("witness encode: {e}")),
+        };
+        match call(&mut wch, &Request::PublishWitness(bytes)) {
+            Ok(Response::Ok) => println!("witnessed seq {seq} at {addr}"),
+            Ok(Response::Error(m)) => {
+                return refused(format!("witness node refused the observation: {m}"))
+            }
+            Ok(other) => return err(format!("unexpected reply to PublishWitness: {other:?}")),
+            Err(e) => return err(e),
+        }
     }
-    if let Err(e) = fs::write(pin_path(&repo), format!("{seq}\n")) {
-        return err(format!("pin: {e}"));
-    }
-    println!(
-        "head: published seq {seq} -> {} to slot {}",
-        root.to_hex(),
-        slot.to_hex()
-    );
     exit::OK
 }
 

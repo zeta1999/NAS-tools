@@ -167,8 +167,12 @@ settled and the work that follows from them.
       over a real PQC socket, a second sync is a no-op, and a client with the
       wrong pinned peer key is refused at the handshake before any record
       moves. See MANUAL-TESTING.md §10.
-- [ ] The three-process localhost simulation (two peers + a witness), then
-      containers.
+- [x] The three-process localhost simulation: `tests/usecases/uc10_three_node_drill.sh`
+      (honest peer restarted `--hostile rollback`, a `--witness` node, three
+      devices). Found and fixed two defects the in-process tests could not:
+      `Repo::open` dropping `$NAS_PASSPHRASE`, and the pin silently not
+      written on a copy-joined device with no `state/`. MANUAL-TESTING.md §12.
+- [ ] Then containers.
 - [x] `nas-peer --witness`: no blobs, no caps, relay only — `nas peer serve
       --witness` (see the M1 entry above).
 - [x] Lease deltas, checkpoints, sweep, young-blob grace, per-holder quotas.

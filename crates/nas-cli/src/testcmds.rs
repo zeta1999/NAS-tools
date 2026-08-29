@@ -99,7 +99,7 @@ fn stored_bytes(st: &BlobStore) -> u64 {
 
 /// `nas test roundtrip <ns> <path>` — SPECS §19.3.
 pub fn roundtrip(ns: &str, src: &str) -> i32 {
-    let repo = match Repo::open(ns) {
+    let repo = match Repo::open_with(ns, crate::repo::passphrase_from(None)) {
         Ok(r) => r,
         Err(e) => return err(format!("namespace {ns}: {e}")),
     };
@@ -180,7 +180,7 @@ pub fn roundtrip(ns: &str, src: &str) -> i32 {
 /// Builds two trees sharing `shared`% of their bytes, stores the first, then
 /// measures what storing the second actually costs.
 pub fn dedup_ratio(ns: &str, shared_pct: u32, max_transfer_pct: u32) -> i32 {
-    let repo = match Repo::open(ns) {
+    let repo = match Repo::open_with(ns, crate::repo::passphrase_from(None)) {
         Ok(r) => r,
         Err(e) => return err(format!("namespace {ns}: {e}")),
     };
@@ -242,7 +242,7 @@ pub fn dedup_ratio(ns: &str, shared_pct: u32, max_transfer_pct: u32) -> i32 {
 /// work when disabled is not known to be doing anything (SPECS §12.5).
 /// Without `CS`, the address is unguessable and the attempt is **refused**.
 pub fn confirmation_attack(ns: &str, with_cs: bool) -> i32 {
-    let repo = match Repo::open(ns) {
+    let repo = match Repo::open_with(ns, crate::repo::passphrase_from(None)) {
         Ok(r) => r,
         Err(e) => return err(format!("namespace {ns}: {e}")),
     };

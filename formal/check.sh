@@ -26,23 +26,52 @@ fi
 # Allowed axioms. Anything else -- above all `sorryAx`, which an `axiom`
 # declaration or a `native_decide` would introduce without the token `sorry`
 # ever appearing -- fails the gate.
+#
+# The `#print axioms` commands are GENERATED here, not read from the file.
+#
+# The previous version parsed whatever `#print axioms` lines the source
+# happened to contain, which meant it only ever checked theorems that
+# *volunteered* their axioms. A review planted this in Padding.lean:
+#
+#     axiom paddingIsAlwaysFree : ∀ (L x : List Nat), (padLadder L x).isSome
+#     theorem sneaky (L x : List Nat) : (padLadder L x).isSome :=
+#       paddingIsAlwaysFree L x
+#
+# with no `#print axioms sneaky` -- and the gate reported "axioms clean".
+# The demonstration in MANUAL-TESTING §1d only ever worked because the planted
+# cheat happened to print its own axioms. A gate you can opt out of is not a
+# gate, so the list of names now comes from the declarations themselves.
 ALLOWED='propext|Classical.choice|Quot.sound'
 for f in lean/NasVerify/*.lean; do
-  out=$(lean "$f" 2>&1)
-  if echo "$out" | grep -qE "error|sorry"; then
+  ns=$(grep -m1 '^namespace ' "$f" | awk '{print $2}')
+  names=$(grep -oE '^ *(theorem|lemma) +[A-Za-z_][A-Za-z0-9_'"'"']*' "$f" \
+          | awk '{print $NF}' | sort -u)
+  if [ -z "$names" ]; then
+    say "$f" "FAIL — no theorems found"; fail=1; continue
+  fi
+  probe=$(mktemp "${TMPDIR:-/tmp}/nas-axioms-XXXXXX.lean")
+  cp "$f" "$probe"
+  for n in $names; do
+    if [ -n "$ns" ]; then echo "#print axioms $ns.$n" >> "$probe"
+    else echo "#print axioms $n" >> "$probe"; fi
+  done
+  out=$(lean "$probe" 2>&1)
+  rm -f "$probe"
+
+  if echo "$out" | grep -qE "^.*error|declaration uses 'sorry'"; then
     say "$f" "FAIL"; echo "$out" | head -20; fail=1; continue
   fi
-  # Every `#print axioms` line must list only allowed axioms.
   bad=$(echo "$out" | grep "depends on axioms" \
         | sed -E 's/.*\[(.*)\].*/\1/' | tr ',' '\n' | tr -d ' ' \
         | grep -vE "^($ALLOWED)$" | sort -u)
-  n=$(echo "$out" | grep -c "depends on axioms")
+  declared=$(echo "$names" | wc -w | tr -d ' ')
+  printed=$(echo "$out" | grep -c "depends on axioms\|does not depend on any axioms")
   if [ -n "$bad" ]; then
     say "$f" "FAIL — unexpected axioms: $(echo $bad | tr '\n' ' ')"; fail=1
-  elif [ "$n" -eq 0 ]; then
-    say "$f" "FAIL — no #print axioms assertions"; fail=1
+  elif [ "$printed" -lt "$declared" ]; then
+    say "$f" "FAIL — $printed of $declared theorems reported axioms"; fail=1
   else
-    say "$f" "verified ($n theorems, axioms clean)"
+    say "$f" "verified ($declared theorems, axioms enumerated)"
   fi
 done
 

@@ -619,7 +619,95 @@ input a reviewer's eye slid over.
 
 ---
 
-## 9. Multi-node simulation (planned, M1)
+## 9. Four adversarial reviews, and what they broke
+
+Four reviews ran in parallel against M1 — crypto/vault, peer/transport,
+storage/consistency, and spec-fidelity. Between them they confirmed defects in
+every layer. The two most damaging findings were about **the gates themselves**,
+which is the worst place to have them, since a broken gate silently certifies
+everything downstream of it.
+
+### 9a. The Lean axiom gate could be opted out of
+
+The gate parsed whatever `#print axioms` lines the source happened to contain.
+A theorem that never emitted one was simply not checked. The review planted:
+
+```lean
+axiom paddingIsAlwaysFree : ∀ (L x : List Nat), (padLadder L x).isSome
+theorem sneaky_unverified_claim (L x : List Nat) : (padLadder L x).isSome :=
+  paddingIsAlwaysFree L x
+```
+
+with no `#print axioms` line, and the gate reported **`axioms clean`**.
+
+Worse, §1d of this file *demonstrates the gate biting* — and that demonstration
+only ever worked because the planted cheat happened to print its own axioms. The
+demonstration was real and the conclusion drawn from it was wrong.
+
+`check.sh` now extracts every `theorem`/`lemma` name from the file, appends a
+generated `#print axioms` for each to a temporary copy, and requires that as many
+axiom lines come back as there were declarations. Re-running the exact bypass:
+
+```
+lean/NasVerify/Padding.lean   FAIL — unexpected axioms: NasTools.paddingIsAlwaysFree
+```
+
+The in-file `#print axioms` blocks were deleted, because leaving them would
+suggest the gate still reads them.
+
+### 9b. CI gated 5 assertions while the documentation cited 25
+
+`ci.sh` ran the acceptance suite with no `NAS_MILESTONE`, and `lib.sh` defaults
+to M0. So CI ran **5** assertions. All of passphrase mode, every e2ee peer
+assertion and the transit-only ACL were ungated: a regression in any of them
+could not turn CI red. §6b of this file congratulates itself for making a
+failing assertion turn CI red — true, but only for the five that ran.
+
+`ci.sh` now runs at `CI_MILESTONE` (M1), and raising it is a one-line change as
+milestones land.
+
+### 9c. An 8-line stub scored 25 out of 25
+
+The harness graded nothing but exit codes. The substance of each assertion lives
+inside the `nas test …` subcommands — inside the binary under test. The binary
+graded its own homework, and the harness could not tell it from an oracle. The
+review wrote this and scored a perfect run:
+
+```sh
+#!/bin/sh
+for a in "$@"; do case "$a" in wrong-passphrase|--without-cs|--right) exit 2;; esac; done
+case "$*" in *"cross-tenant-dedup"*) exit 2;; *"acl check"*"--right write"*) exit 2;; esac
+exit 0
+```
+
+`lib.sh` gained three primitives that verify **side effects the harness inspects
+itself** — `check_creates`, `check_absent_under`, `check_present_under` — and
+UC01 and UC03 now use them for the properties that matter most: that a namespace
+really stored blobs, that no fixture text or filename appears in any of them in
+`e2ee`, and that both *do* appear in `transit-only`.
+
+Observed, same stub, after the change:
+
+```
+use-case acceptance (≤M1): 24 passed, 6 failed, 58 pending
+  ✗ FAIL e2ee namespace actually stored blobs
+    └ nothing at .../work/blobs
+  ✗ FAIL harness finds no fixture text in any blob
+    └ .../work/blobs does not exist, so nothing was stored
+```
+
+Note the second message. `check_absent_under` fails when the directory does not
+exist, rather than passing because there was no leak to find — absence of
+evidence from an empty store is not evidence of absence.
+
+**This does not make the suite independent.** Twenty-four assertions still pass
+for the stub, because they still only check an exit code. The honest description
+of the number is: *the count is a progress marker, not third-party
+verification.* STATUS.md says so now.
+
+---
+
+## 10. Multi-node simulation (planned, M1)
 
 Not yet built. The shape, given 16 GB of RAM:
 

@@ -722,6 +722,11 @@ The first end-to-end run of the networked path, release binary, no mocks:
    `nas peer sync <ns> --peer <addr> --peer-pub <transport.pub>` from a
    second process. The subject the peer evaluates comes from the transport key
    that completed the handshake, never from an argument.
+4. `nas peer serve <dir> --listen 127.0.0.1:0 --witness --once` — the
+   listening line reads `(witness-only, honest, 0 clients, 0 writers, ...)`.
+   The refusal of blob and slot requests in that mode is unit-tested at the
+   dispatch (`nas-transfer`); it has **not** yet been driven over the socket
+   from a second process — that is the UC07 M2 assertion.
 
 Observed:
 

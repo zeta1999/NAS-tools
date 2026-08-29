@@ -169,7 +169,8 @@ settled and the work that follows from them.
       moves. See MANUAL-TESTING.md §10.
 - [ ] The three-process localhost simulation (two peers + a witness), then
       containers.
-- [ ] `nas-peer --witness`: no blobs, no caps, relay only.
+- [x] `nas-peer --witness`: no blobs, no caps, relay only — `nas peer serve
+      --witness` (see the M1 entry above).
 - [x] Lease deltas, checkpoints, sweep, young-blob grace, per-holder quotas.
       **Measured:** a LeaseDelta is 5337 B fixed + 32 B per address — 8537 B for
       100 addresses, where signing each address individually would cost
@@ -182,7 +183,9 @@ settled and the work that follows from them.
       window wants its own (longer) setting, or the warning has to reach the
       client by some route other than it happening to reconnect. Decide before
       `nas-peer` starts actually deleting.
-- [ ] Proof-of-possession responder
+- [x] Proof-of-possession responder (`Request::Prove` → `BlobStore::prove`,
+      `nas-transfer/src/server.rs:36`; the client checks with `check_proof`
+      before trusting a dedup claim, SPECS §4.5)
 - [x] `--witness` mode: no blobs, no caps, relay only (`nas peer serve
       --witness`; refused at the dispatch in `nas_transfer::handle`, the one
       place every request passes)
@@ -190,8 +193,13 @@ settled and the work that follows from them.
 
 ## M2 — adversarial hardening
 
-- [ ] Freshness anchors, client pins, chain walking, skip-chain checkpoints
-- [ ] Witness publication and relay
+- [x] Freshness anchors, client pins, chain walking (`nas-slots` `client.rs`:
+      `Anchor`, `Verdict`, pinned-seq refusal; exercised by the rollback and
+      fork drills)
+- [ ] Skip-chain checkpoints (SPECS §5.5) — see the M1 entry
+- [x] Witness publication and relay (`PublishWitness`/`Witnesses` in
+      `nas_transfer::handle`, `nas-slots` `witness.rs`; relay is
+      witness-only-capable via `peer serve --witness`)
 - [x] One named test per attack: tamper, rollback, withhold, dedup-lie,
       CAS-non-enforcement, witness withholding (`nas test attack <kind>`,
       `crates/nas-cli/src/attack.rs`; UC09 scores 6 of 8 at M1)

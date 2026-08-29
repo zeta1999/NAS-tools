@@ -30,8 +30,8 @@ step "device 2 (pin from having seen seq 1) — no witness needed either now"; N
 step "device 3: brand new, no pin, WITHOUT witness (the blind spot)"
 mkdir -p $T/home3/demo; cp -R $T/home/demo/config $T/home/demo/wraps $T/home3/demo/; NAS_HOME=$T/home3 $SYNC | tail -1; echo "exit=${PIPESTATUS[0]}"
 step "device 3: brand new, no pin, WITH witness (expect: refused, rollback)"
-rm -f $T/home3/demo/state/pin; NAS_HOME=$T/home3 $SYNC $WIT | tail -1; echo "exit=${PIPESTATUS[0]}"
+rm -f $T/home3/demo/state/peer-seq; NAS_HOME=$T/home3 $SYNC $WIT | tail -1; echo "exit=${PIPESTATUS[0]}"
 step "device 3 against a WITHHOLDING peer, with witness"; kill $P1; wait $P1 2>/dev/null
 $N peer serve $T/peer --listen 127.0.0.1:$PP --hostile withhold > $T/peer3.log 2>&1 & P1=$!; sleep 1
-rm -f $T/home3/demo/state/pin; NAS_HOME=$T/home3 $SYNC $WIT | tail -1; echo "exit=${PIPESTATUS[0]}"
+rm -f $T/home3/demo/state/peer-seq; NAS_HOME=$T/home3 $SYNC $WIT | tail -1; echo "exit=${PIPESTATUS[0]}"
 kill $P1 $P2 2>/dev/null; wait 2>/dev/null; echo; echo "--- witness node log"; cut -c1-120 $T/wit.log

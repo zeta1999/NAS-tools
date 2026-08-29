@@ -150,16 +150,37 @@ See `MANUAL-TESTING.md` §5 for the commands and raw output.
 - **Symlinks are skipped**, not stored: following them lets a tree escape its
   own root, and storing them needs a format field that does not exist.
 
-## Not built
+## Where the numbers stand
 
-M1 remainder: the two remaining
-confidentiality modes, `nas-transfer`, and `nas-peer` built hostile from day
-one. `ci.sh` is green end to end today: 97 Rust tests, 11 Lean theorems verified
-with a clean axiom gate, TLC green with its three sanity checks still failing as
-required, and 5 acceptance assertions actually passing at M0 (25 at M1). 342 Rust tests total.
+`ci.sh` is green end to end today, at `CI_MILESTONE=M1`:
+
+| | count |
+|---|---|
+| Rust unit tests | 363 |
+| Lean theorems (clean axiom gate) | 14 |
+| `cargo-fuzz` targets | 11 |
+| Acceptance assertions passing (≤M1) | 30 of 88 |
+| Acceptance assertions pending (M2+) | 58 |
+
+**30 of 88 is a progress marker, not a verification result.** The 58 pending
+assertions are not failures and not successes — they are unwritten code that
+`ci.sh` refuses to score. Every one of them is a claim SPECS makes that nothing
+yet demonstrates, and the three use cases with a passing score (UC01–UC03) are
+the three whose milestones have arrived. UC04, UC07 and UC09 — deletion
+resistance, roaming, and the hostile peer — are at zero.
+
+TLC is green with its three sanity checks still failing as required.
 
 > The TLA+ model constrains SPECS §5, which is **M2** code. It is assurance
-> about the design, not about anything shipped in M0.
+> about the design, not about anything shipped. Its correspondence to
+> `nas-slots` is **partial**: same-sequence equivocation only, asserted as such
+> by `a_fork_at_disjoint_sequences_is_not_detected`.
+
+## Not built
+
+M2: fork detection end to end against a live hostile peer, lease-based GC with
+a caller, retention/Object Lock enforcement, quota admission (§6.4), the
+single-writer handoff (§5.1), and the multi-process localhost simulation.
 
 ## Environment constraints
 

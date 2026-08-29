@@ -170,7 +170,7 @@ together.
 
 Observed: `0 passed, 0 failed, 81 pending`.
 
-81 assertions across 9 use cases, each tagged with the milestone that unblocks
+88 assertions across 9 use cases, each tagged with the milestone that unblocks
 it. **PENDING is never counted as success** — the runner says so explicitly and
 exits non-zero on any FAIL.
 

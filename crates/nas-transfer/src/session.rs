@@ -33,6 +33,9 @@ pub enum SessionError {
     },
     /// The peer closed mid-message.
     Truncated,
+    /// The peer stopped sending. Distinct from `Truncated`, because a stall is
+    /// an attack and a clean close is not.
+    TimedOut,
 }
 
 impl std::fmt::Display for SessionError {
@@ -45,6 +48,7 @@ impl std::fmt::Display for SessionError {
                 write!(f, "peer announced a {len} B frame, limit is {MAX_FRAME} B")
             }
             Self::Truncated => write!(f, "peer closed mid-message"),
+            Self::TimedOut => write!(f, "peer stalled for more than {IO_TIMEOUT:?}"),
         }
     }
 }
@@ -60,10 +64,26 @@ impl From<WireError> for SessionError {
     }
 }
 
+/// How long a single framed read may block.
+///
+/// There were no timeouts at all: a client that completed the handshake, sent a
+/// four-byte length prefix and then stopped pinned a server thread forever —
+/// a slow loris costing the attacker one socket. The handshake reads are
+/// covered too, so a peer can be stalled *before* any session exists.
+pub const IO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// A connected, authenticated channel to the other side.
 pub struct Channel {
     stream: TcpStream,
     session: SecureSession,
+    /// The verifying key this channel is authenticated against.
+    ///
+    /// Kept so a server can derive *who is asking* from the handshake rather
+    /// than from a string a caller passes in. It was discarded before, which
+    /// left `serve` taking a free-form `subject` that nothing bound to the
+    /// authenticated identity — an ACL evaluated against an unbound string is
+    /// decorative.
+    peer_vk: Vec<u8>,
 }
 
 impl Channel {
@@ -79,6 +99,8 @@ impl Channel {
         peer_vk: Vec<u8>,
     ) -> Result<Self, SessionError> {
         let mut stream = stream;
+        set_timeouts(&stream)?;
+        let pinned = peer_vk.clone();
         let init = Initiator::new(clone_identity(id)?, peer_vk)
             .map_err(|e| SessionError::Crypto(e.to_string()))?;
         let hello = init
@@ -89,7 +111,11 @@ impl Channel {
         let session = init
             .finish(&reply)
             .map_err(|e| SessionError::Crypto(e.to_string()))?;
-        Ok(Self { stream, session })
+        Ok(Self {
+            stream,
+            session,
+            peer_vk: pinned,
+        })
     }
 
     /// Complete the handshake as the responder.
@@ -99,13 +125,26 @@ impl Channel {
         peer_vk: Vec<u8>,
     ) -> Result<Self, SessionError> {
         let mut stream = stream;
+        set_timeouts(&stream)?;
+        let pinned = peer_vk.clone();
         let resp = Responder::new(clone_identity(id)?, peer_vk);
         let hello = read_frame(&mut stream)?;
         let (reply, session) = resp
             .respond(&hello)
             .map_err(|e| SessionError::Crypto(e.to_string()))?;
         write_frame(&mut stream, &reply)?;
-        Ok(Self { stream, session })
+        Ok(Self {
+            stream,
+            session,
+            peer_vk: pinned,
+        })
+    }
+
+    /// The verifying key this channel authenticated against.
+    ///
+    /// A server derives the ACL subject from this, never from an argument.
+    pub fn peer_identity(&self) -> &[u8] {
+        &self.peer_vk
     }
 
     fn send(&mut self, plain: &[u8]) -> Result<(), SessionError> {
@@ -158,6 +197,13 @@ fn clone_identity(id: &Identity) -> Result<Identity, SessionError> {
     Identity::from_bytes(&sk, &vk).map_err(|e| SessionError::Crypto(e.to_string()))
 }
 
+/// Bound every blocking read and write, including the handshake.
+fn set_timeouts(s: &TcpStream) -> Result<(), SessionError> {
+    s.set_read_timeout(Some(IO_TIMEOUT))?;
+    s.set_write_timeout(Some(IO_TIMEOUT))?;
+    Ok(())
+}
+
 fn write_frame(w: &mut impl Write, bytes: &[u8]) -> Result<(), SessionError> {
     if bytes.len() > MAX_FRAME {
         return Err(SessionError::FrameTooLarge { len: bytes.len() });
@@ -184,8 +230,17 @@ fn read_frame(r: &mut impl Read) -> Result<Vec<u8>, SessionError> {
     match r.read_exact(&mut body) {
         Ok(()) => Ok(body),
         Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => Err(SessionError::Truncated),
+        Err(e) if is_timeout(&e) => Err(SessionError::TimedOut),
         Err(e) => Err(SessionError::Io(e)),
     }
+}
+
+/// A read that expired. The kind differs by platform, so both are checked.
+fn is_timeout(e: &io::Error) -> bool {
+    matches!(
+        e.kind(),
+        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+    )
 }
 
 #[cfg(test)]

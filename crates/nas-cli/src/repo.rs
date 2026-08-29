@@ -449,10 +449,16 @@ impl Repo {
     /// A hash of the convergence secret, for comparing two namespaces without
     /// exposing the secret itself.
     pub fn convergence_secret_fingerprint(&self) -> [u8; 32] {
-        use nas_crypto::{chunk_key, seal};
+        // `seal_chunk`, not `chunk_key` + `seal`: the latter now refuses a
+        // derived key, and the old code swallowed that with `unwrap_or_default`
+        // -- so every namespace fingerprinted as `blake3(&[])` and the one
+        // assertion that compares two fingerprints started passing vacuously.
+        // A comparison whose inputs are constant is not a comparison, so this
+        // panics rather than degrading: an infallible operation that fails is a
+        // bug here, not a condition to tolerate.
         let probe = b"nas-tools/fingerprint-probe/v1";
-        let sealed =
-            seal(&chunk_key(&self.convergence_secret(), probe), probe, b"").unwrap_or_default();
+        let (sealed, _) = nas_crypto::seal_chunk(&self.convergence_secret(), probe, b"")
+            .expect("sealing a fixed probe under a derived key is infallible");
         *blake3::hash(&sealed).as_bytes()
     }
 
@@ -516,5 +522,36 @@ fn secrets_convergence(s: &Secrets) -> ConvergenceSecret {
     match s {
         Secrets::Vault(v) => v.current_generation().convergence_secret(),
         Secrets::Passphrase(ns, _) => ns.convergence_secret(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The fingerprint's whole job is to differ when the secret differs.
+    ///
+    /// It silently stopped doing that -- `seal` began refusing derived keys and
+    /// an `unwrap_or_default` turned the refusal into an empty ciphertext, so
+    /// every namespace hashed to the same value. Nothing failed: the only
+    /// assertion that used it compares two fingerprints for *equality*, which a
+    /// constant satisfies. This test fails on that, which the acceptance suite
+    /// structurally could not.
+    #[test]
+    fn the_fingerprint_distinguishes_two_secrets() {
+        let a = Repo::foreign_secret(b"one");
+        let b = Repo::foreign_secret(b"two");
+        let fp = |cs: &ConvergenceSecret| {
+            let probe = b"nas-tools/fingerprint-probe/v1";
+            let (sealed, _) = nas_crypto::seal_chunk(cs, probe, b"").unwrap();
+            *blake3::hash(&sealed).as_bytes()
+        };
+        assert_ne!(fp(&a), fp(&b), "the fingerprint is not secret-dependent");
+        assert_eq!(fp(&a), fp(&a), "the fingerprint is not deterministic");
+        assert_ne!(
+            fp(&a),
+            *blake3::hash(b"").as_bytes(),
+            "degraded to a constant"
+        );
     }
 }

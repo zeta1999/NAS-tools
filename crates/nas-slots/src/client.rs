@@ -3,11 +3,51 @@
 //! This is the Rust counterpart of `formal/tlaplus/SlotConsistency.tla`, and
 //! the three properties the model checks are the three this module must hold:
 //!
-//! | TLA+ invariant | Here |
-//! |---|---|
-//! | `AnchorFloor` — a pin never falls below the cap's anchor | [`Reject::BelowAnchor`] |
-//! | `MonotonicPins` — pins only move forward | [`Reject::Rollback`] |
-//! | `ForkDetected` — incompatible evidence always raises | [`SlotClient::fork_proof`] |
+//! | TLA+ invariant | Here | Faithful? |
+//! |---|---|---|
+//! | `AnchorFloor` — a pin never falls below the cap's anchor | [`Reject::BelowAnchor`] | yes |
+//! | `MonotonicPins` — pins only move forward | [`Reject::Rollback`] | yes |
+//! | `ForkDetected` — incompatible evidence always raises | [`SlotClient::forked`] | **no — see below** |
+//!
+//! # The `ForkDetected` correspondence is partial, and was overstated
+//!
+//! The model's `Compatible` predicate is a full **ancestry** relation: two
+//! versions conflict when neither is an ancestor of the other, *including when
+//! they sit at different sequence numbers*. Catching that was the model's own
+//! "defect 3", fixed in its second revision.
+//!
+//! [`forked`](Self::forked) is strictly weaker. It raises only when one
+//! sequence accumulates two different `sig_hash` values — **same-sequence
+//! equivocation only**. A [`Witness`] carries `(seq, sig_hash, logical_time)`
+//! and no `prev` link, so the Rust data model cannot express ancestry and
+//! therefore cannot reproduce `Compatible`. In a real fork the two live branches
+//! usually sit at *different* heads, because each device witnesses its own head
+//! — and that case is invisible here.
+//!
+//! This file previously claimed the three invariants were "the three properties
+//! this module must hold". A green TLC run is not evidence about this code's
+//! fork coverage, and saying so was an overclaim. Closing the gap needs
+//! witnesses to carry enough (a `prev` hash, or a checkpoint link) for a client
+//! to test ancestry, plus a model whose witness abstraction matches. Recorded in
+//! TODO.md rather than papered over.
+//!
+//! # Witnesses must be rostered before they are believed
+//!
+//! [`Witness::verify`](crate::Witness::verify) checks a signature against the
+//! key the witness carries itself, so that a proof stays checkable by a third
+//! party. That makes a *bare* proof forgeable: `Role::Witness` identities are
+//! derivable by anyone, so a hostile peer can mint two keypairs and produce a
+//! verifying `ForkProof` against an honest slot — a permanent false alarm, and
+//! a publishable slander.
+//!
+//! So this module keeps a roster of observers it will believe, and
+//! [`observe_witness`] admits nothing outside it. Relaying and re-verifying a
+//! proof needs no roster; **acting** on one does.
+//!
+//! It also bounds what it keeps. Evidence is append-only by design (see below),
+//! which without a bound is a peer's invitation to relay witnesses until the
+//! client runs out of memory. At most [`MAX_HASHES_PER_SEQ`] distinct hashes are
+//! retained per sequence — two already prove a fork, so a third adds nothing.
 //!
 //! # Evidence is re-derived, never latched
 //!
@@ -22,11 +62,20 @@
 //! [`observe`]: SlotClient::observe
 
 use crate::chain::{verify_chain, ChainError};
-use crate::id::SlotId;
+use crate::id::{SlotId, WriterId};
 use crate::record::{Regime, SlotRecord};
 use crate::roster::Roster;
 use crate::witness::{ForkProof, Witness};
 use std::collections::{BTreeMap, BTreeSet};
+
+/// Distinct `sig_hash` values retained per sequence.
+///
+/// Two at one sequence already constitute a fork; a third proves nothing more
+/// and would let a peer grow this map without limit.
+pub const MAX_HASHES_PER_SEQ: usize = 2;
+
+/// Retained witnesses, from which a publishable proof is built.
+pub const MAX_WITNESSES: usize = 64;
 
 /// The freshness anchor a capability carries (SPECS §5.3.1).
 ///
@@ -118,6 +167,9 @@ pub struct SlotClient {
     evidence: BTreeMap<u64, BTreeSet<[u8; 32]>>,
     /// Witnesses kept so a derived alarm can be turned into a publishable proof.
     witnesses: Vec<Witness>,
+    /// Observers this client will believe. Empty means believe none — the safe
+    /// default, since an unrostered witness is one anybody could have minted.
+    witness_roster: Roster,
 }
 
 impl SlotClient {
@@ -132,7 +184,20 @@ impl SlotClient {
             pin: None,
             evidence,
             witnesses: Vec::new(),
+            witness_roster: Roster::new(),
         }
+    }
+
+    /// Add an observer whose witnesses this client will act on.
+    ///
+    /// A client with an empty roster believes no witness at all — the safe
+    /// default, since an unrostered witness is one anybody could have minted.
+    pub fn trust_witness(&mut self, verifying_key: &[u8]) -> Result<(), crate::RosterError> {
+        self.witness_roster.add(verifying_key).map(|_| ())
+    }
+
+    pub fn trusted_witnesses(&self) -> usize {
+        self.witness_roster.len()
     }
 
     pub fn slot_id(&self) -> SlotId {
@@ -147,24 +212,49 @@ impl SlotClient {
         self.pin
     }
 
-    /// Record an observation. Only ever adds.
+    /// Record an observation. Only ever adds, and never past the bound.
+    ///
+    /// The bound is not a compromise of the append-only design: two hashes at
+    /// one sequence already prove a fork, so refusing a third loses nothing and
+    /// removes a peer's ability to grow this map at will.
     pub fn observe(&mut self, seq: u64, sig_hash: [u8; 32]) {
-        self.evidence.entry(seq).or_default().insert(sig_hash);
+        let set = self.evidence.entry(seq).or_default();
+        if set.len() < MAX_HASHES_PER_SEQ || set.contains(&sig_hash) {
+            set.insert(sig_hash);
+        }
     }
 
     /// Take in a witness relayed by the peer.
     ///
-    /// Unverified witnesses are dropped rather than stored: a peer that could
-    /// inject an unsigned "observation" could manufacture a fork alarm against
-    /// an honest slot, which would make the alarm worthless in the other
-    /// direction.
+    /// Three gates, and the roster is the one that was missing. A valid
+    /// signature proves only that *somebody* signed; since anyone can derive a
+    /// `Role::Witness` identity, a peer that could get an unrostered witness
+    /// admitted could manufacture a fork alarm against an honest slot — making
+    /// the alarm worthless in the other direction.
     pub fn observe_witness(&mut self, w: &Witness) -> bool {
-        if w.slot_id != self.slot_id || w.verify().is_err() {
+        if w.slot_id != self.slot_id {
+            return false;
+        }
+        if !self
+            .witness_roster
+            .contains(&WriterId::of_key(&w.witness_pk))
+        {
+            return false;
+        }
+        if w.verify().is_err() {
             return false;
         }
         self.observe(w.seq, w.sig_hash);
-        self.witnesses.push(w.clone());
+        if self.witnesses.len() < MAX_WITNESSES {
+            self.witnesses.push(w.clone());
+        }
         true
+    }
+
+    /// How many distinct hashes are retained at `seq`. For tests and
+    /// diagnostics; bounded by [`MAX_HASHES_PER_SEQ`].
+    pub fn evidence_at(&self, seq: u64) -> usize {
+        self.evidence.get(&seq).map(|s| s.len()).unwrap_or(0)
     }
 
     /// Is there evidence of a fork? Derived, never cached.
@@ -506,8 +596,11 @@ mod tests {
         let c = chain_of(&id, 4, "a");
         let mut cl = fresh(&c);
 
-        let wa = Witness::sign(&witness_ident(10), slot(), 2, [0x01; 32], 0).unwrap();
-        let wb = Witness::sign(&witness_ident(11), slot(), 2, [0x02; 32], 0).unwrap();
+        let (ia, ib) = (witness_ident(10), witness_ident(11));
+        cl.trust_witness(ia.verifying_key()).unwrap();
+        cl.trust_witness(ib.verifying_key()).unwrap();
+        let wa = Witness::sign(&ia, slot(), 2, [0x01; 32], 0).unwrap();
+        let wb = Witness::sign(&ib, slot(), 2, [0x02; 32], 0).unwrap();
         assert!(cl.observe_witness(&wa));
         assert!(cl.observe_witness(&wb));
 
@@ -529,8 +622,11 @@ mod tests {
         let mut cl = fresh(&c);
         assert!(cl.pin().is_none());
 
-        let wa = Witness::sign(&witness_ident(10), slot(), 3, [0x01; 32], 0).unwrap();
-        let wb = Witness::sign(&witness_ident(11), slot(), 3, [0x02; 32], 0).unwrap();
+        let (ia, ib) = (witness_ident(10), witness_ident(11));
+        cl.trust_witness(ia.verifying_key()).unwrap();
+        cl.trust_witness(ib.verifying_key()).unwrap();
+        let wa = Witness::sign(&ia, slot(), 3, [0x01; 32], 0).unwrap();
+        let wb = Witness::sign(&ib, slot(), 3, [0x02; 32], 0).unwrap();
         cl.observe_witness(&wa);
         cl.observe_witness(&wb);
         assert_eq!(
@@ -548,12 +644,58 @@ mod tests {
         let id = ident(1);
         let c = chain_of(&id, 4, "a");
         let mut cl = fresh(&c);
-        let good = Witness::sign(&witness_ident(10), slot(), 2, [0x01; 32], 0).unwrap();
+        let ia = witness_ident(10);
+        cl.trust_witness(ia.verifying_key()).unwrap();
+        let good = Witness::sign(&ia, slot(), 2, [0x01; 32], 0).unwrap();
         let mut forged = good.clone();
         forged.sig_hash = [0x02; 32];
         assert!(cl.observe_witness(&good));
         assert!(!cl.observe_witness(&forged), "unsigned witness accepted");
         assert_eq!(cl.forked(), None);
+    }
+
+    #[test]
+    fn a_peer_cannot_alarm_a_client_with_witness_keys_of_its_own() {
+        // The attack the old suite missed entirely. `Role::Witness` identities
+        // are derivable by anyone, so a valid signature proves only that
+        // SOMEBODY signed. Without a roster this was a permanent false alarm on
+        // any slot -- and a publishable slander against an honest writer.
+        let id = ident(1);
+        let c = chain_of(&id, 4, "a");
+        let mut cl = fresh(&c);
+        let honest = witness_ident(10);
+        cl.trust_witness(honest.verifying_key()).unwrap();
+
+        let evil_a = Identity::derive(&[0xE1; 32], Role::Witness).unwrap();
+        let evil_b = Identity::derive(&[0xE2; 32], Role::Witness).unwrap();
+        let wa = Witness::sign(&evil_a, slot(), 2, [0x01; 32], 0).unwrap();
+        let wb = Witness::sign(&evil_b, slot(), 2, [0x02; 32], 0).unwrap();
+
+        // Both are perfectly valid signatures, and both are refused.
+        assert!(wa.verify().is_ok() && wb.verify().is_ok());
+        assert!(!cl.observe_witness(&wa), "unrostered witness admitted");
+        assert!(!cl.observe_witness(&wb), "unrostered witness admitted");
+        assert_eq!(cl.forked(), None, "a peer manufactured a fork alarm");
+        assert!(cl.fork_proof().is_none());
+    }
+
+    #[test]
+    fn evidence_is_bounded_so_a_peer_cannot_exhaust_memory() {
+        // Append-only evidence with no bound is an invitation to relay
+        // witnesses until the client dies. Two hashes at one seq already prove
+        // a fork, so the third onwards adds nothing.
+        let id = ident(1);
+        let c = chain_of(&id, 4, "a");
+        let mut cl = fresh(&c);
+        for i in 0..1000u32 {
+            cl.observe(7, {
+                let mut h = [0u8; 32];
+                h[..4].copy_from_slice(&i.to_le_bytes());
+                h
+            });
+        }
+        assert_eq!(cl.evidence_at(7), MAX_HASHES_PER_SEQ);
+        assert_eq!(cl.forked(), Some(7), "the fork is still detected");
     }
 
     #[test]
@@ -571,6 +713,34 @@ mod tests {
         .unwrap();
         assert!(!cl.observe_witness(&w));
         assert_eq!(cl.forked(), None);
+    }
+
+    #[test]
+    fn a_fork_at_disjoint_sequences_is_not_detected() {
+        // The documented gap, asserted so it cannot be quietly believed fixed.
+        // In a real fork each device witnesses its own head, so the two live
+        // branches usually sit at different sequence numbers -- and this check
+        // sees nothing. The TLA+ `Compatible` relation catches it; the Rust
+        // cannot, because a Witness carries no ancestry.
+        let id = ident(1);
+        let c = chain_of(&id, 4, "a");
+        let mut cl = fresh(&c);
+        let (ia, ib) = (witness_ident(10), witness_ident(11));
+        cl.trust_witness(ia.verifying_key()).unwrap();
+        cl.trust_witness(ib.verifying_key()).unwrap();
+
+        // Branch a is at seq 5, branch b at seq 9. Genuinely forked.
+        let wa = Witness::sign(&ia, slot(), 5, [0xA1; 32], 0).unwrap();
+        let wb = Witness::sign(&ib, slot(), 9, [0xB1; 32], 0).unwrap();
+        assert!(cl.observe_witness(&wa));
+        assert!(cl.observe_witness(&wb));
+
+        assert_eq!(
+            cl.forked(),
+            None,
+            "if this now passes, update the module docs"
+        );
+        assert!(cl.fork_proof().is_none());
     }
 
     #[test]

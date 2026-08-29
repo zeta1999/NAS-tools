@@ -5,10 +5,30 @@
 //! and cafés. So a client publishes a **signed observation** and the untrusted
 //! peer relays it.
 //!
-//! The peer can withhold or delay a witness. It **cannot forge one**, and that
-//! asymmetry is the whole mechanism: two witnesses citing incompatible
-//! `(seq, sig_hash)` for one slot are a self-contained, publishable *proof* of
-//! a fork rather than a heuristic.
+//! The peer can withhold or delay a witness. It cannot forge one **from a key
+//! it does not hold** — and that qualifier is load-bearing.
+//!
+//! # What a bare `ForkProof` does and does not establish
+//!
+//! [`Witness::verify`] checks the signature against the key the witness carries
+//! *itself*, with no roster. That is deliberate: a proof has to be checkable by
+//! a third party who holds neither side's roster, or it is not publishable.
+//!
+//! The cost is that a bare proof establishes only **"two signatures over
+//! conflicting heads exist"** — not "two legitimate observers equivocated".
+//! `Role::Witness` identities are derivable by anyone, so a hostile peer can
+//! mint two keypairs and manufacture a proof against a perfectly honest slot.
+//!
+//! An earlier version of this documentation said flatly that the peer "cannot
+//! forge one", and a test named `a_forged_witness_cannot_manufacture_a_proof`
+//! appeared to confirm it. That test only defeated the *naive* attack — editing
+//! a real witness without re-signing. It never tried generating fresh keys,
+//! which succeeds. The claim was a false generalisation from a test that did
+//! not cover the attack.
+//!
+//! So: relay and verify proofs freely, but **act** on one only after checking
+//! both witnesses against a roster of known observers. That is
+//! [`SlotClient`](crate::SlotClient)'s job, and it now requires it.
 //!
 //! # Why a witness carries the whole verifying key
 //!
@@ -325,10 +345,9 @@ mod tests {
     }
 
     #[test]
-    fn a_forged_witness_cannot_manufacture_a_proof() {
-        // The peer relays witnesses and could try to invent a conflict. It
-        // holds no witness key, so the signature check stops it -- and
-        // try_new performs that check itself rather than trusting the caller.
+    fn editing_a_real_witness_without_re_signing_is_caught() {
+        // The naive attack -- and the ONLY one this test used to cover, while
+        // being named as though it covered forgery in general.
         let a = ident(1);
         let wa = Witness::sign(&a, slot(), 5, [0x01; 32], 0).unwrap();
         let mut forged = wa.clone();
@@ -337,6 +356,26 @@ mod tests {
             ForkProof::try_new(&wa, &forged).is_none(),
             "unsigned conflict accepted"
         );
+    }
+
+    #[test]
+    fn a_peer_can_manufacture_a_bare_proof_with_keys_of_its_own() {
+        // The attack the old test missed. `Role::Witness` identities are
+        // derivable by anyone, so a hostile peer mints two keypairs and gets a
+        // verifying ForkProof against a perfectly honest slot.
+        //
+        // Asserted POSITIVELY so the limitation is a fact of the suite rather
+        // than a claim in a comment: a bare proof establishes "two signatures
+        // over conflicting heads exist", not "two legitimate observers
+        // equivocated". SlotClient is what refuses to act on one, by roster.
+        let evil_a = Identity::derive(&[0xE1; 32], Role::Witness).unwrap();
+        let evil_b = Identity::derive(&[0xE2; 32], Role::Witness).unwrap();
+        let wa = Witness::sign(&evil_a, slot(), 5, [0x01; 32], 0).unwrap();
+        let wb = Witness::sign(&evil_b, slot(), 5, [0x02; 32], 0).unwrap();
+
+        let proof = ForkProof::try_new(&wa, &wb)
+            .expect("a bare proof shows only that two signatures exist");
+        assert!(proof.verify());
     }
 
     #[test]

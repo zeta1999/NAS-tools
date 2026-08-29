@@ -79,5 +79,64 @@ check_refuses() {
   esac
 }
 
+# ── Harness-side verification ────────────────────────────────────────
+#
+# Everything above grades an EXIT CODE, and that is a weaker signal than it
+# reads as: a review wrote an 8-line shell script that matched four substrings
+# and scored 25 of 25. The substance of each assertion lives inside the
+# `nas test ...` subcommands -- which is to say, inside the binary under test.
+# The binary grades its own homework, and the harness cannot tell it from an
+# oracle.
+#
+# These primitives are the harness doing its own verification: they look at the
+# filesystem directly, so passing them requires actually storing something. They
+# do not make the suite independent -- only rewriting the assertions as
+# side-effect checks would -- but they close the "any binary that exits 0" hole
+# for the assertions that matter most.
+
+# Assert a path exists and is non-empty.
+check_creates() { # $1=milestone? $2=desc $3=path
+  local ms; ms=$(_take_ms "$1"); [[ "${1:-}" =~ ^M[0-6]$ ]] && shift
+  local desc="$1" path="$2"
+  if ! _gate "$ms"; then _skip "$desc" "$ms" "$(_reason "$ms")"; return 0; fi
+  if [ -s "$path" ] || [ -n "$(ls -A "$path" 2>/dev/null)" ]; then
+    printf '  \033[32m✓\033[0m %s\n' "$desc"; PASS=$((PASS+1))
+  else
+    printf '  \033[31m✗ FAIL\033[0m %s\n    └ nothing at %s\n' "$desc" "$path"
+    FAIL=$((FAIL+1))
+  fi
+}
+
+# Assert a byte string does NOT appear anywhere under a directory. The harness
+# greps for itself rather than asking the binary whether it leaked.
+check_absent_under() { # $1=milestone? $2=desc $3=dir $4=needle
+  local ms; ms=$(_take_ms "$1"); [[ "${1:-}" =~ ^M[0-6]$ ]] && shift
+  local desc="$1" dir="$2" needle="$3"
+  if ! _gate "$ms"; then _skip "$desc" "$ms" "$(_reason "$ms")"; return 0; fi
+  if [ ! -d "$dir" ]; then
+    printf '  \033[31m✗ FAIL\033[0m %s\n    └ %s does not exist, so nothing was stored\n' \
+      "$desc" "$dir"; FAIL=$((FAIL+1)); return 0
+  fi
+  if grep -rqa -- "$needle" "$dir" 2>/dev/null; then
+    printf '  \033[31m✗ FAIL\033[0m %s\n    └ found %q under %s\n' "$desc" "$needle" "$dir"
+    FAIL=$((FAIL+1))
+  else
+    printf '  \033[32m✓\033[0m %s\n' "$desc"; PASS=$((PASS+1))
+  fi
+}
+
+# Assert a byte string DOES appear (transit-only: visible names are correct).
+check_present_under() { # $1=milestone? $2=desc $3=dir $4=needle
+  local ms; ms=$(_take_ms "$1"); [[ "${1:-}" =~ ^M[0-6]$ ]] && shift
+  local desc="$1" dir="$2" needle="$3"
+  if ! _gate "$ms"; then _skip "$desc" "$ms" "$(_reason "$ms")"; return 0; fi
+  if grep -rqa -- "$needle" "$dir" 2>/dev/null; then
+    printf '  \033[32m✓\033[0m %s\n' "$desc"; PASS=$((PASS+1))
+  else
+    printf '  \033[31m✗ FAIL\033[0m %s\n    └ %q not found under %s\n' "$desc" "$needle" "$dir"
+    FAIL=$((FAIL+1))
+  fi
+}
+
 uc_summary() { printf '\n  %d passed, %d failed, %d pending\n' "$PASS" "$FAIL" "$PEND"
   [ "$FAIL" -eq 0 ]; }

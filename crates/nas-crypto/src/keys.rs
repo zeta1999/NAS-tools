@@ -32,6 +32,12 @@ pub enum CryptoError {
     Seal,
     /// A sealed blob was shorter than its own framing.
     Truncated,
+    /// A content-derived key was passed to [`seal`].
+    ///
+    /// Its nonce is a function of the key, so sealing anything other than the
+    /// key's own derivation input reuses a keystream. Use [`seal_chunk`], which
+    /// derives and seals from the same bytes and cannot desynchronise them.
+    DerivedKeyNeedsSealChunk,
 }
 
 impl std::fmt::Display for CryptoError {
@@ -40,6 +46,11 @@ impl std::fmt::Display for CryptoError {
             Self::Open => write!(f, "decryption failed"),
             Self::Seal => write!(f, "encryption failed"),
             Self::Truncated => write!(f, "sealed data truncated"),
+            Self::DerivedKeyNeedsSealChunk => write!(
+                f,
+                "a content-derived key cannot be used with seal(); use seal_chunk(), \
+                 which derives and seals from the same bytes"
+            ),
         }
     }
 }
@@ -167,16 +178,51 @@ fn derived_nonce(key: &[u8; KEY_LEN]) -> [u8; NONCE_LEN] {
     n
 }
 
+/// Derive a chunk key from `plaintext` **and seal that same plaintext**.
+///
+/// # Why this exists, and why [`seal`] now refuses derived keys
+///
+/// The module claimed a deterministic nonce was unreachable for anything but a
+/// content-derived key, and that "the type system does" what prose could not.
+/// It enforced half of that. `chunk_key(cs, A)` derives from `A`, but
+/// `seal(&key, B)` encrypted whatever `B` the caller passed — the derivation
+/// input and the sealed plaintext were never bound together. Two calls with the
+/// same `A` and different `B` reuse a `(key, nonce)` pair, and a review's probe
+/// confirmed the consequence directly:
+///
+/// ```text
+/// XOR(ciphertext_bodies) == XOR(plaintexts)
+/// ```
+///
+/// which is the keystream disclosure `seal_with_nonce`'s own documentation
+/// warns about. No caller in the tree ever misused it — every one passed the
+/// same bytes to both — but that is caller discipline, which is precisely what
+/// the module was written not to rely on.
+///
+/// Fusing the two operations makes the sealed bytes *always* the derivation
+/// input. [`seal`] now returns [`CryptoError::DerivedKeyNeedsSealChunk`] for a
+/// derived key, so the desynchronised call is no longer expressible.
+pub fn seal_chunk(
+    cs: &ConvergenceSecret,
+    plaintext: &[u8],
+    aad: &[u8],
+) -> Result<(Vec<u8>, [u8; KEY_LEN]), CryptoError> {
+    let key = chunk_key(cs, plaintext);
+    let n = derived_nonce(&key.bytes);
+    let sealed = seal_with_nonce(&key.bytes, &n, plaintext, aad).map_err(|_| CryptoError::Seal)?;
+    Ok((sealed, key.bytes))
+}
+
 /// Encrypt. The nonce follows from the key's policy; callers cannot supply one.
 ///
 /// Output is `ciphertext || tag` for a derived-nonce key (the nonce is
 /// recomputable) and `nonce || ciphertext || tag` for a random-nonce key.
 pub fn seal(key: &Key, plaintext: &[u8], aad: &[u8]) -> Result<Vec<u8>, CryptoError> {
     match key.policy {
-        NoncePolicy::Derived => {
-            let n = derived_nonce(&key.bytes);
-            seal_with_nonce(&key.bytes, &n, plaintext, aad).map_err(|_| CryptoError::Seal)
-        }
+        // Refused, not handled. A derived key's nonce is a function of the key
+        // alone, so sealing a plaintext that is not the key's own derivation
+        // input reuses a keystream. `seal_chunk` cannot desynchronise the two.
+        NoncePolicy::Derived => Err(CryptoError::DerivedKeyNeedsSealChunk),
         NoncePolicy::Random => {
             encrypt_aad(&key.bytes, plaintext, aad).map_err(|_| CryptoError::Seal)
         }
@@ -268,10 +314,7 @@ mod tests {
         // it. This is that round trip.
         let s = cs(1);
         let pt = b"a chunk that will be read back later";
-        let k = chunk_key(&s, pt);
-        let sealed = seal(&k, pt, b"aad").unwrap();
-
-        let stored: [u8; KEY_LEN] = *k.expose_derived().expect("chunk keys are derived");
+        let (sealed, stored) = seal_chunk(&s, pt, b"aad").unwrap();
         let rk = chunk_key_from_stored(stored);
         assert_eq!(open_chunk(&rk, &sealed, b"aad").unwrap(), pt);
     }
@@ -280,10 +323,42 @@ mod tests {
     fn a_stored_ck_still_authenticates_the_aad() {
         let s = cs(1);
         let pt = b"chunk";
-        let k = chunk_key(&s, pt);
-        let sealed = seal(&k, pt, b"right").unwrap();
-        let rk = chunk_key_from_stored(*k.expose_derived().unwrap());
+        let (sealed, stored) = seal_chunk(&s, pt, b"right").unwrap();
+        let rk = chunk_key_from_stored(stored);
         assert_eq!(open_chunk(&rk, &sealed, b"wrong"), Err(CryptoError::Open));
+    }
+
+    #[test]
+    fn seal_refuses_a_derived_key_so_the_desync_is_unreachable() {
+        // The bug this closes: chunk_key(cs, A) then seal(key, B) reused a
+        // (key, nonce) pair over two different plaintexts, leaking
+        // XOR(plaintexts). No caller did it, but the module claimed the type
+        // system made it impossible and it did not.
+        let s = cs(1);
+        let k = chunk_key(&s, b"derived from A");
+        assert_eq!(
+            seal(&k, b"but sealing B", b""),
+            Err(CryptoError::DerivedKeyNeedsSealChunk)
+        );
+        // Even sealing the SAME bytes goes through seal_chunk now, so there is
+        // no path where the two can drift apart.
+        assert!(seal(&k, b"derived from A", b"").is_err());
+        assert!(seal_chunk(&s, b"derived from A", b"").is_ok());
+    }
+
+    #[test]
+    fn seal_chunk_is_deterministic_and_returns_the_key_it_used() {
+        let s = cs(2);
+        let pt = b"a chunk";
+        let (a, ka) = seal_chunk(&s, pt, b"aad").unwrap();
+        let (b, kb) = seal_chunk(&s, pt, b"aad").unwrap();
+        assert_eq!(a, b, "convergence requires determinism");
+        assert_eq!(ka, kb);
+        // The returned key is the one that must go into the manifest.
+        assert_eq!(
+            open_chunk(&chunk_key_from_stored(ka), &a, b"aad").unwrap(),
+            pt
+        );
     }
 
     #[test]
@@ -299,7 +374,7 @@ mod tests {
     fn open_chunk_rejects_a_key_that_did_not_seal_it() {
         let s = cs(1);
         let pt = b"chunk";
-        let sealed = seal(&chunk_key(&s, pt), pt, b"").unwrap();
+        let sealed = seal_chunk(&s, pt, b"").unwrap().0;
         let wrong = chunk_key_from_stored([0u8; KEY_LEN]);
         assert_eq!(open_chunk(&wrong, &sealed, b""), Err(CryptoError::Open));
     }
@@ -310,8 +385,8 @@ mod tests {
         // silently degrades to zero rather than breaking loudly.
         let s = cs(1);
         let pt = b"the same chunk of a file";
-        let a = seal(&chunk_key(&s, pt), pt, b"").unwrap();
-        let b = seal(&chunk_key(&s, pt), pt, b"").unwrap();
+        let a = seal_chunk(&s, pt, b"").unwrap().0;
+        let b = seal_chunk(&s, pt, b"").unwrap().0;
         assert_eq!(a, b);
     }
 
@@ -320,8 +395,8 @@ mod tests {
         // Two tenants storing the same file must produce different ciphertext,
         // or a co-tenant learns what you hold (SPECS §3.2).
         let pt = b"payslip.pdf contents";
-        let mine = seal(&chunk_key(&cs(1), pt), pt, b"").unwrap();
-        let theirs = seal(&chunk_key(&cs(2), pt), pt, b"").unwrap();
+        let (mine, _) = seal_chunk(&cs(1), pt, b"").unwrap();
+        let (theirs, _) = seal_chunk(&cs(2), pt, b"").unwrap();
         assert_ne!(mine, theirs);
     }
 
@@ -342,10 +417,8 @@ mod tests {
         let s = cs(3);
         let pt = b"payload";
         let ck = chunk_key(&s, pt);
-        assert_eq!(
-            open(&ck, &seal(&ck, pt, b"aad").unwrap(), b"aad").unwrap(),
-            pt
-        );
+        let (sealed, _) = seal_chunk(&s, pt, b"aad").unwrap();
+        assert_eq!(open(&ck, &sealed, b"aad").unwrap(), pt);
 
         let mk = manifest_key(&DirSecret::root(&[4u8; KEY_LEN]));
         assert_eq!(
@@ -358,8 +431,8 @@ mod tests {
     fn wrong_aad_or_key_fails_to_open() {
         let s = cs(5);
         let pt = b"payload";
+        let (sealed, _) = seal_chunk(&s, pt, b"header").unwrap();
         let k = chunk_key(&s, pt);
-        let sealed = seal(&k, pt, b"header").unwrap();
         assert_eq!(open(&k, &sealed, b"other").unwrap_err(), CryptoError::Open);
         let other = chunk_key(&cs(6), pt);
         assert_eq!(
@@ -391,7 +464,8 @@ mod tests {
         fn convergent_roundtrip(pt in prop::collection::vec(any::<u8>(), 0..512)) {
             let s = cs(11);
             let k = chunk_key(&s, &pt);
-            prop_assert_eq!(open(&k, &seal(&k, &pt, b"").unwrap(), b"").unwrap(), pt);
+            let (sealed, _) = seal_chunk(&s, &pt, b"").unwrap();
+            prop_assert_eq!(open(&k, &sealed, b"").unwrap(), pt);
         }
 
         /// Identical plaintext always converges; different plaintext never does.
@@ -401,8 +475,8 @@ mod tests {
             b in prop::collection::vec(any::<u8>(), 0..128),
         ) {
             let s = cs(13);
-            let sa = seal(&chunk_key(&s, &a), &a, b"").unwrap();
-            let sb = seal(&chunk_key(&s, &b), &b, b"").unwrap();
+            let (sa, _) = seal_chunk(&s, &a, b"").unwrap();
+            let (sb, _) = seal_chunk(&s, &b, b"").unwrap();
             prop_assert_eq!(a == b, sa == sb);
         }
 

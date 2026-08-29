@@ -462,32 +462,22 @@ mod tests {
         let still = v.generation(0).unwrap().convergence_secret();
         let (a, b) = (g0, still);
         let pt = b"a chunk written before the rotation";
-        use nas_crypto::{chunk_key, seal as cseal};
+        use nas_crypto::seal_chunk;
         assert_eq!(
-            cseal(&chunk_key(&a, pt), pt, b"").unwrap(),
-            cseal(&chunk_key(&b, pt), pt, b"").unwrap()
+            seal_chunk(&a, pt, b"").unwrap(),
+            seal_chunk(&b, pt, b"").unwrap()
         );
     }
 
     #[test]
     fn rotation_changes_what_new_writes_look_like() {
         // Otherwise it is not a rotation.
-        use nas_crypto::{chunk_key, seal as cseal};
+        use nas_crypto::seal_chunk;
         let mut v = Vault::create().unwrap();
         let pt = b"a chunk";
-        let before = cseal(
-            &chunk_key(&v.current_generation().convergence_secret(), pt),
-            pt,
-            b"",
-        )
-        .unwrap();
+        let before = seal_chunk(&v.current_generation().convergence_secret(), pt, b"").unwrap();
         v.rotate_convergence().unwrap();
-        let after = cseal(
-            &chunk_key(&v.current_generation().convergence_secret(), pt),
-            pt,
-            b"",
-        )
-        .unwrap();
+        let after = seal_chunk(&v.current_generation().convergence_secret(), pt, b"").unwrap();
         assert_ne!(before, after);
     }
 

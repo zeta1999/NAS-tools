@@ -831,3 +831,42 @@ skipped it would be scoring an unwritten control as passed.
 UC09 in the harness: **6 passed, 0 failed, 2 pending at `NAS_MILESTONE=M1`**;
 the two pending are the lease-griefing drill and `all --cold-start`, tagged M2
 individually.
+
+## 12. Three real processes on localhost — the drill UC09 cannot run
+
+UC09 drives the hostile peer in-process. `tests/usecases/uc10_three_node_drill.sh`
+runs the shipped binary as three separate processes — a `nas peer serve` that
+is restarted `--hostile rollback` half way through, a `--witness` node, and
+three client "devices" of the same namespace — so that what the witness node
+buys is observed over real sockets rather than asserted about a mock. The
+drill is manual (fixed ports, `target/release/nas`), not part of `run.sh`.
+
+Observed, in order:
+
+- device 1 publishes seq 1 to the honest peer; device 2 joins by copying
+  `config` + `wraps/` and opens by passphrase; against the honest peer, with
+  the witness, it accepts seq 1 (`2 of 2 relayed by the witness are this
+  namespace's; none contradict the served head`), pins it, and witnesses it.
+- the peer restarts as `--hostile rollback` serving seq 0. Device 1 (pin from
+  publishing) and device 2 (pin from having seen seq 1) are both refused
+  **without the witness**: `peer serves seq 0, but seq 1 was seen here before
+  (rollback)`, exit 2.
+- device 3, brand new, no pin, no witness: accepts seq 0, exit 0. That is the
+  blind spot SPECS §5.4 describes, and the drill prints it on purpose.
+- device 3 with the witness: `peer serves seq 0, but seq 1 was witnessed
+  (rollback)`, exit 2. Against a withholding peer with the witness: served
+  head is verified, witnessed, exit 0.
+
+Two defects only a multi-process drill could have found, both fixed:
+
+- **`Repo::open(ns)` dropped `$NAS_PASSPHRASE`.** The three `nas test`
+  commands used it and failed on every passphrase-mode namespace, which the
+  in-process tests never noticed because they all create `--mode e2ee`. The
+  constructor is gone; every caller goes through `open_with` and
+  `passphrase_from`.
+- **The pin was silently not written on a device that joined by copy.** A
+  copied namespace has `config` and `wraps/` but no `state/`; `fs::write` of
+  `state/peer-seq` failed with ENOENT and the sync reported success. Device 2
+  therefore had no memory of seq 1 and would have accepted the rollback the
+  moment the witness node was unreachable. `write_pin` now creates the
+  directory. The drill's `device 2 pin:` line exists to make this visible.

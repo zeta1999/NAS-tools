@@ -32,6 +32,7 @@ nas — NAS-tools command line
   nas peer serve <dir> --listen <host:port> [--hostile <spec>] [--mode <m>]
                        [--salt <tenant.salt>] [--once] [--witness]
   nas peer sync <ns> --peer <host:port> --peer-pub <transport.pub>
+                     [--witness <host:port> --witness-pub <transport.pub>]
   nas test roundtrip <ns> <path>
   nas test dedup-ratio <ns> --shared <pct> --max-transfer <pct>
   nas test confirmation-attack <ns> --with-cs|--without-cs
@@ -143,7 +144,8 @@ fn peer(args: &[String]) -> i32 {
             "usage: nas peer init|show <dir>\n       nas peer allow <dir> <subject> <transport.pub>\n       \
              nas peer writer <dir> <slot.pub>\n       nas peer grant <dir> <subject> <right>\n       \
              nas peer serve <dir> --listen <host:port> [--hostile <spec>] [--once] [--witness]\n       \
-             nas peer sync <ns> --peer <host:port> --peer-pub <transport.pub>"
+             nas peer sync <ns> --peer <host:port> --peer-pub <transport.pub>\n       \
+             [--witness <host:port> --witness-pub <transport.pub>]"
         );
         exit::ERROR
     };
@@ -194,6 +196,8 @@ fn peer(args: &[String]) -> i32 {
                     peer,
                     peer_pub,
                     passphrase: repo::passphrase_from(opt(args, "--passphrase")),
+                    witness: opt(args, "--witness"),
+                    witness_pub: opt(args, "--witness-pub"),
                 },
             )
         }

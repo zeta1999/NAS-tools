@@ -332,10 +332,9 @@ impl Repo {
         WrapRecord::decode(&bytes).map_err(|e| io::Error::other(e.to_string()))
     }
 
-    pub fn open(ns: &str) -> io::Result<Self> {
-        Self::open_with(ns, None)
-    }
-
+    // There is deliberately no `open(ns)` without a passphrase argument: the
+    // three `nas test` commands that used one silently dropped
+    // `$NAS_PASSPHRASE` and failed on every passphrase-mode namespace.
     pub fn open_with(ns: &str, passphrase: Option<Vec<u8>>) -> io::Result<Self> {
         let root = path_of(ns);
         let cfg = fs::read_to_string(root.join("config"))?;

@@ -7,6 +7,7 @@
 
 mod aclcmd;
 mod exit;
+mod peercmd;
 mod repo;
 mod testcmds;
 
@@ -19,8 +20,17 @@ nas — NAS-tools command line
   nas ns create <name> [--mode e2ee|passphrase|transit-only]
                        [--padding none|classes|fixed]
   nas ns list
+  nas ns export-pub <ns> <out-dir>       keys a peer operator needs to admit <ns>
   nas acl grant|revoke|check <ns> --subject <s> --right <r>
   nas acl list <ns>
+  nas peer init <dir>
+  nas peer allow <dir> <subject> <transport.pub>
+  nas peer writer <dir> <slot.pub>
+  nas peer grant <dir> <subject> <right>
+  nas peer show <dir>
+  nas peer serve <dir> --listen <host:port> [--hostile <spec>] [--mode <m>]
+                       [--salt <tenant.salt>] [--once]
+  nas peer sync <ns> --peer <host:port> --peer-pub <transport.pub>
   nas test roundtrip <ns> <path>
   nas test dedup-ratio <ns> --shared <pct> --max-transfer <pct>
   nas test confirmation-attack <ns> --with-cs|--without-cs
@@ -64,6 +74,11 @@ fn positional(args: &[String]) -> Vec<&str> {
                     | "key"
                     | "approvers"
                     | "scope"
+                    | "listen"
+                    | "hostile"
+                    | "salt"
+                    | "peer"
+                    | "peer-pub"
             ) {
                 i += 2;
                 continue;
@@ -107,7 +122,7 @@ fn run(argv: &[String]) -> i32 {
         "test" => test(rest),
         // Recognised in SPECS, not built. Never REFUSED — see exit.rs.
         "acl" => acl(rest),
-        "peer" => testcmds::unimplemented("peer", "M1 (§10)"),
+        "peer" => peer(rest),
         "gateway" => testcmds::unimplemented("gateway", "M3 (§2.1)"),
         "mirror" => testcmds::unimplemented("mirror", "M5 (§7.6)"),
         "put" | "rm" | "delete-request" => testcmds::unimplemented(cmd, "M2 (§16)"),
@@ -116,6 +131,70 @@ fn run(argv: &[String]) -> i32 {
             eprint!("{USAGE}");
             exit::ERROR
         }
+    }
+}
+
+fn peer(args: &[String]) -> i32 {
+    let pos = positional(args);
+    let usage = || {
+        eprintln!(
+            "usage: nas peer init|show <dir>\n       nas peer allow <dir> <subject> <transport.pub>\n       \
+             nas peer writer <dir> <slot.pub>\n       nas peer grant <dir> <subject> <right>\n       \
+             nas peer serve <dir> --listen <host:port> [--hostile <spec>] [--once]\n       \
+             nas peer sync <ns> --peer <host:port> --peer-pub <transport.pub>"
+        );
+        exit::ERROR
+    };
+    let (Some(verb), Some(target)) = (pos.first().copied(), pos.get(1).copied()) else {
+        return usage();
+    };
+    match verb {
+        "init" => peercmd::init(target),
+        "show" => peercmd::show(target),
+        "allow" => match (pos.get(2), pos.get(3)) {
+            (Some(subject), Some(file)) => peercmd::allow(target, subject, file),
+            _ => usage(),
+        },
+        "writer" => match pos.get(2) {
+            Some(file) => peercmd::writer(target, file),
+            None => usage(),
+        },
+        "grant" => match (pos.get(2), pos.get(3)) {
+            (Some(subject), Some(right)) => peercmd::grant(target, subject, right),
+            _ => usage(),
+        },
+        "serve" => {
+            let Some(listen) = opt(args, "--listen") else {
+                eprintln!("serve needs --listen <host:port>");
+                return exit::ERROR;
+            };
+            peercmd::serve(
+                target,
+                peercmd::ServeOpts {
+                    listen,
+                    hostile: opt(args, "--hostile"),
+                    mode: opt(args, "--mode"),
+                    salt_file: opt(args, "--salt"),
+                    once: flag(args, "--once"),
+                },
+            )
+        }
+        "sync" => {
+            let (Some(peer), Some(peer_pub)) = (opt(args, "--peer"), opt(args, "--peer-pub"))
+            else {
+                eprintln!("sync needs --peer <host:port> and --peer-pub <transport.pub>");
+                return exit::ERROR;
+            };
+            peercmd::sync(
+                target,
+                peercmd::SyncOpts {
+                    peer,
+                    peer_pub,
+                    passphrase: repo::passphrase_from(opt(args, "--passphrase")),
+                },
+            )
+        }
+        _ => usage(),
     }
 }
 
@@ -282,8 +361,17 @@ fn ns(args: &[String]) -> i32 {
                 }
             }
         }
+        Some("export-pub") => match (pos.get(1), pos.get(2)) {
+            (Some(name), Some(out)) => {
+                peercmd::export_pub(name, out, repo::passphrase_from(opt(args, "--passphrase")))
+            }
+            _ => {
+                eprintln!("usage: nas ns export-pub <name> <out-dir> [--passphrase <pw>]");
+                exit::ERROR
+            }
+        },
         _ => {
-            eprintln!("usage: nas ns create|list");
+            eprintln!("usage: nas ns create|list|open|export-pub");
             exit::ERROR
         }
     }

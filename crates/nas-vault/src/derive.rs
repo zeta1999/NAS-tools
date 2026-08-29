@@ -68,6 +68,14 @@ impl NamespaceSecrets {
     pub fn lease_identity(&self) -> Result<Identity, SignError> {
         Identity::derive(&self.slot_seed, Role::Lease)
     }
+
+    /// The identity this namespace authenticates to a peer with (§3.1
+    /// `Transport`). Distinct from the slot key by role separation: a peer
+    /// learns this key from every handshake, and must not thereby learn
+    /// anything about the key that signs the history it stores.
+    pub fn transport_identity(&self) -> Result<Identity, SignError> {
+        Identity::derive(&self.slot_seed, Role::Transport)
+    }
 }
 
 #[cfg(test)]

@@ -707,9 +707,40 @@ verification.* STATUS.md says so now.
 
 ---
 
-## 10. Multi-node simulation (planned, M1)
+## 10. Multi-node simulation (M1)
 
-Not yet built. The shape, given 16 GB of RAM:
+### 10a. Two processes on localhost — done
+
+The first end-to-end run of the networked path, release binary, no mocks:
+
+1. `nas peer init <dir>`, then `nas peer allow` / `nas peer writer` /
+   `nas peer grant` with the keys the client exported via `nas ns export-pub`.
+   The peer directory holds one private file — its own transport seed — and
+   otherwise only public keys and names (SPECS §10).
+2. `nas peer serve <dir> --listen 127.0.0.1:<port>` in one process.
+3. In a fresh `NAS_HOME`: `nas ns create`, populate it, then
+   `nas peer sync <ns> --peer <addr> --peer-pub <transport.pub>` from a
+   second process. The subject the peer evaluates comes from the transport key
+   that completed the handshake, never from an argument.
+
+Observed:
+
+- The sync pushed the root record and the blobs behind it over the PQC
+  handshake; the peer's blob directory afterwards contains only ciphertext
+  addressed by BLAKE3 of the ciphertext, and no plaintext marker.
+- A second `nas peer sync` was a **no-op**: the peer reported every blob
+  already held and the CAS on the slot refused nothing because nothing changed.
+- A sync with a **wrong `--peer-pub`** was refused at the handshake — the
+  client never reached the point of sending a record, which is the property
+  the pin exists for. A `--peer-pub` that is not exactly 32 bytes is rejected
+  before any connection is opened.
+- A transport key the operator has not `allow`ed is turned away before the
+  KEM runs: the peer reads the hello, checks the claimed key against
+  `clients/`, and a stranger costs it one JSON parse.
+
+### 10b. Three nodes in containers — planned
+
+The shape, given 16 GB of RAM:
 
 - **colima with an explicit budget** — `colima start --cpu 4 --memory 6 --disk 40`
   so the VM cannot grow into the working set.

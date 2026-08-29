@@ -571,6 +571,7 @@ dependencies = [
  "nas-peer",
  "nas-slots",
  "nas-store",
+ "nas-transfer",
  "nas-vault",
 ]
 
@@ -647,6 +648,7 @@ dependencies = [
  "nas-slots",
  "nas-store",
  "proptest",
+ "serde_json",
  "simple_network",
 ]
 

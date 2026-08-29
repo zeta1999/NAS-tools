@@ -428,6 +428,7 @@ impl Repo {
             // derive from it -- still distinct keypairs, by role separation.
             Secrets::Passphrase(ns, _) => match role {
                 Role::Lease => ns.lease_identity(),
+                Role::Transport => ns.transport_identity(),
                 _ => ns.slot_identity(),
             }
             .map_err(|e| io::Error::other(e.to_string())),
@@ -502,6 +503,13 @@ impl Repo {
 
     pub fn blobs_root(&self) -> PathBuf {
         self.root.clone()
+    }
+
+    /// The `transit-only` tenant salt; empty for the other modes. Not secret
+    /// (see the field), and a peer serving this tenant needs it to address
+    /// blobs the same way the client does.
+    pub fn tenant_salt(&self) -> &[u8] {
+        &self.tenant_salt
     }
 
     pub fn head(&self) -> Option<String> {

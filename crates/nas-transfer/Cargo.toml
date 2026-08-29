@@ -12,6 +12,9 @@ nas-peer = { path = "../nas-peer" }
 nas-slots = { path = "../nas-slots" }
 nas-store = { path = "../nas-store" }
 simple_network = { path = "../../../simple-network", default-features = false, features = ["pqc"] }
+# Already in the tree via simple_network's `pqc` feature; used only to peek at
+# the client's verifying key inside its hello (see `Channel::accept_from`).
+serde_json = "1"
 
 [dev-dependencies]
 proptest = "1"

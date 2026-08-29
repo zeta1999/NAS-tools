@@ -118,7 +118,7 @@ impl Channel {
         })
     }
 
-    /// Complete the handshake as the responder.
+    /// Complete the handshake as the responder, for one expected client.
     pub fn accept(
         stream: TcpStream,
         id: &Identity,
@@ -126,11 +126,49 @@ impl Channel {
     ) -> Result<Self, SessionError> {
         let mut stream = stream;
         set_timeouts(&stream)?;
+        let hello = read_frame(&mut stream)?;
+        Self::respond(stream, id, peer_vk, &hello)
+    }
+
+    /// Complete the handshake as the responder, for any client `allowed`
+    /// admits.
+    ///
+    /// `simple-network`'s responder pins one client key up front, which is the
+    /// right shape for a test and the wrong one for a peer with a roster: the
+    /// key that is connecting is not known until its hello arrives. So the
+    /// hello is read first, the verifying key it *claims* is shown to
+    /// `allowed`, and only an admitted key proceeds — to a responder pinned to
+    /// exactly that key, so the claim is then proven by the handshake signature
+    /// rather than taken on trust. A key `allowed` rejects never reaches the
+    /// KEM at all, which also keeps the cost of a stranger's connection to one
+    /// JSON parse.
+    pub fn accept_from(
+        stream: TcpStream,
+        id: &Identity,
+        allowed: impl FnOnce(&[u8]) -> bool,
+    ) -> Result<Self, SessionError> {
+        let mut stream = stream;
+        set_timeouts(&stream)?;
+        let hello = read_frame(&mut stream)?;
+        let claimed = claimed_client_vk(&hello)?;
+        if !allowed(&claimed) {
+            return Err(SessionError::Crypto(
+                "client key is not on this peer's list".into(),
+            ));
+        }
+        Self::respond(stream, id, claimed, &hello)
+    }
+
+    fn respond(
+        mut stream: TcpStream,
+        id: &Identity,
+        peer_vk: Vec<u8>,
+        hello: &[u8],
+    ) -> Result<Self, SessionError> {
         let pinned = peer_vk.clone();
         let resp = Responder::new(clone_identity(id)?, peer_vk);
-        let hello = read_frame(&mut stream)?;
         let (reply, session) = resp
-            .respond(&hello)
+            .respond(hello)
             .map_err(|e| SessionError::Crypto(e.to_string()))?;
         write_frame(&mut stream, &reply)?;
         Ok(Self {
@@ -183,6 +221,42 @@ impl Channel {
         self.send_request(r)?;
         self.recv_response()
     }
+}
+
+/// The verifying key a client hello says it is from.
+///
+/// Read as plain JSON rather than through `simple-network`'s private
+/// `ClientHello`, because that type is not exported. The field is a
+/// `Vec<u8>`, which serde writes as an array of numbers. Nothing here is
+/// trusted: the value is only used to pick which pinned key the real
+/// handshake then verifies against.
+fn claimed_client_vk(hello: &[u8]) -> Result<Vec<u8>, SessionError> {
+    let v: serde_json::Value = serde_json::from_slice(hello)
+        .map_err(|e| SessionError::Crypto(format!("client hello is not JSON: {e}")))?;
+    let arr = v
+        .get("client_vk")
+        .and_then(|k| k.as_array())
+        .ok_or_else(|| SessionError::Crypto("client hello carries no client_vk".into()))?;
+    arr.iter()
+        .map(|n| {
+            n.as_u64()
+                .and_then(|x| u8::try_from(x).ok())
+                .ok_or_else(|| SessionError::Crypto("client_vk is not a byte array".into()))
+        })
+        .collect()
+}
+
+/// A NAS-tools transport identity (§3.1 `Role::Transport`) as the type
+/// `simple-network`'s handshake takes.
+///
+/// This is the only place a NAS-tools key crosses into `simple-network`, and
+/// `export_transport` refuses every role but `Transport`, so a slot or lease
+/// key cannot be handed to the wire by mistake.
+pub fn transport_identity(id: &nas_crypto::Identity) -> Result<Identity, SessionError> {
+    let (sk, vk) = id
+        .export_transport()
+        .map_err(|e| SessionError::Crypto(e.to_string()))?;
+    Identity::from_bytes(&sk, &vk).map_err(|e| SessionError::Crypto(e.to_string()))
 }
 
 /// `Identity` is not `Clone` upstream, so round-trip it through its own export.

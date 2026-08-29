@@ -160,8 +160,15 @@ settled and the work that follows from them.
       synchronous handshake so no async runtime enters NAS-tools. Eight
       integration tests cross a real socket, including the tamper, dedup-lie
       and rollback defences and the peer-key pin.
-- [ ] The three-process localhost simulation, then containers.
-- [ ] Wire `nas-transfer` into the CLI: `nas peer serve` / `nas peer sync`.
+- [x] Wire `nas-transfer` into the CLI: `nas peer serve` / `nas peer sync`,
+      plus `nas peer init|allow|writer|grant|show` so an operator admits a
+      client's transport key, its slot key and its rights by hand. Exercised
+      end-to-end on localhost against the release binary: a namespace pushed
+      over a real PQC socket, a second sync is a no-op, and a client with the
+      wrong pinned peer key is refused at the handshake before any record
+      moves. See MANUAL-TESTING.md §10.
+- [ ] The three-process localhost simulation (two peers + a witness), then
+      containers.
 - [ ] `nas-peer --witness`: no blobs, no caps, relay only.
 - [x] Lease deltas, checkpoints, sweep, young-blob grace, per-holder quotas.
       **Measured:** a LeaseDelta is 5337 B fixed + 32 B per address — 8537 B for

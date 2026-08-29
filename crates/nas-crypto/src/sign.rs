@@ -70,6 +70,10 @@ pub enum SignError {
     /// A signature of the wrong length. Rejected before the backend sees it,
     /// so a malformed record cannot reach the verifier at all.
     BadSignatureLength { got: usize },
+    /// The secret half was asked for on a role that never leaves this crate.
+    /// Only [`Role::Transport`] is handed to `simple-network`; a slot or lease
+    /// key has no business being exported anywhere.
+    NotExportable { role: Role },
 }
 
 impl std::fmt::Display for SignError {
@@ -87,6 +91,9 @@ impl std::fmt::Display for SignError {
                     f,
                     "signature is {got} B, ML-DSA-65 signatures are {SIG_SIZE} B"
                 )
+            }
+            Self::NotExportable { role } => {
+                write!(f, "{role:?} keys are never exported; only Transport is")
             }
         }
     }
@@ -134,6 +141,27 @@ impl Identity {
 
     pub fn role(&self) -> Role {
         self.role
+    }
+
+    /// The raw `(signing_key, verifying_key)` of the **transport** identity,
+    /// for handing to `simple-network`'s handshake — which is the one consumer
+    /// [`Role::Transport`] exists for (§3.1).
+    ///
+    /// Refused for every other role. The slot key signs history and the lease
+    /// key signs retention; neither has a reason to leave locked memory, and a
+    /// general "give me the secret" accessor would be the first thing a bug
+    /// elsewhere reached for.
+    pub fn export_transport(&self) -> Result<(Vec<u8>, Vec<u8>), SignError> {
+        if self.role != Role::Transport {
+            return Err(SignError::NotExportable { role: self.role });
+        }
+        let sk = self
+            .kp
+            .signing_key()
+            .as_slice()
+            .map_err(|_| SignError::Backend)?
+            .to_vec();
+        Ok((sk, self.verifying_key().to_vec()))
     }
 
     /// The public half. Safe to publish; this is what a roster holds.

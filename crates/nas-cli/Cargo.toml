@@ -15,4 +15,5 @@ nas-crypto = { path = "../nas-crypto" }
 nas-peer = { path = "../nas-peer" }
 nas-slots = { path = "../nas-slots" }
 nas-store = { path = "../nas-store" }
+nas-transfer = { path = "../nas-transfer" }
 nas-vault = { path = "../nas-vault" }

@@ -4,7 +4,11 @@
 steps built, the 5 M0-tagged acceptance assertions pass against the real binary,
 and the padding measurement that M0 gated on is complete — it **contradicted the
 spec by 2-3×**. The review found **four reproduced defects**, all fixed; see
-MANUAL-TESTING.md §7. Next: M1.
+MANUAL-TESTING.md §7. **M1 is in progress:** the peer, the slot system and the
+transfer protocol are built and networked, and the CLI now drives them
+(`nas peer serve` / `nas peer sync`) — a namespace has been pushed over a real
+PQC socket between two `nas` processes on localhost. Remaining M1: the
+two-peers-plus-witness simulation, skip-chain checkpoints, ownership handoff.
 
 `SPECS.md` is at **revision 5** (~1476 lines, 21 sections). It has survived one
 adversarial review (rev 1→2, 15 findings, all accepted), a round closing its own
@@ -90,12 +94,17 @@ listing; lease-based GC with deltas; **three confidentiality modes** (`e2ee`,
 - **`crates/nas-cli`** — the `nas` binary. Exit codes are a *contract*: 0 ok,
   1 error, 2 refused by policy, **3 unimplemented**. A specified-but-unbuilt
   subcommand must never exit 2, or the harness would score unwritten code as a
-  passing security control.
-- **`tests/usecases/`** — 83 acceptance assertions, milestone-gated; 53 are
-  M0–M2. **5 passing, 0 failing, 78 pending** at `NAS_MILESTONE=M0` (what CI
-  gates on), and **16 passing, 9 failing, 58 pending** at `NAS_MILESTONE=M1` —
-  and **25 passing, 0 failing, 58 pending** at `NAS_MILESTONE=M1` — UC01
-  (transit-only), UC02 (passphrase) and UC03 (e2ee) are all green end to end. Verified to
+  passing security control. `nas peer serve` runs a `nas-peer` behind a
+  `nas-transfer` listener; `nas peer sync` pushes a local namespace to it with
+  the peer's key pinned on the command line, so a peer presenting any other key
+  is refused before a single record is sent.
+- **`tests/usecases/`** — 88 acceptance assertions, milestone-gated; 58 are
+  M0–M2. Measured on the current binary: **5 passing, 0 failing, 83 pending**
+  at `NAS_MILESTONE=M0`; **30 passing, 0 failing, 58 pending** at
+  `NAS_MILESTONE=M1` (what `ci.sh` gates on); **30 passing, 28 failing, 30
+  pending** at `NAS_MILESTONE=M2` — the 28 are the hostile-peer and lifecycle
+  assertions that M2 builds. UC01 (transit-only), UC02 (passphrase) and UC03
+  (e2ee) are all green end to end. Verified to
   bite: a stub that always exits 0 fails the refusal assertion, and one that
   always exits 1 is reported BROKEN rather than refused (MANUAL-TESTING.md §6a).
 

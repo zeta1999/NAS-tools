@@ -19,6 +19,17 @@ pub enum AddrError {
     NotHex,
 }
 
+impl fmt::Display for AddrError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            AddrError::BadLength(n) => write!(f, "address must be {ADDR_LEN} bytes, got {n}"),
+            AddrError::NotHex => f.write_str("address is not valid hex"),
+        }
+    }
+}
+
+impl std::error::Error for AddrError {}
+
 impl Addr {
     /// Compute the address of a sealed blob.
     ///

@@ -1,0 +1,32 @@
+# Three nas nodes, one image (nas-node, built by docker/build.sh), no shell in any of them.
+# Repos are bind-mounted from $DRILL on the host (initialised there by the host CLI: same
+# on-disk format); the devices are the host CLI talking to the published ports. Driven by
+# tests/usecases/uc11_containers.sh — not meant to be `up`ed by hand.
+#
+#   peer          honest peer            127.0.0.1:47341
+#   peer-hostile  same repo, --hostile rollback, same port (profile: hostile; start after
+#                 `stop peer`) — the uc10 "restart the peer as hostile" step
+#   withhold      --hostile withhold     127.0.0.1:47343
+#   witness       --witness              127.0.0.1:47342
+services:
+  peer:
+    image: nas-node
+    command: ["peer", "serve", "/repo", "--listen", "0.0.0.0:47341"]
+    volumes: ["${DRILL:?set DRILL to the drill dir}/peer:/repo"]
+    ports: ["127.0.0.1:47341:47341"]
+  peer-hostile:
+    image: nas-node
+    profiles: ["hostile"]
+    command: ["peer", "serve", "/repo", "--listen", "0.0.0.0:47341", "--hostile", "rollback"]
+    volumes: ["${DRILL:?set DRILL to the drill dir}/peer:/repo"]
+    ports: ["127.0.0.1:47341:47341"]
+  withhold:
+    image: nas-node
+    command: ["peer", "serve", "/repo", "--listen", "0.0.0.0:47343", "--hostile", "withhold"]
+    volumes: ["${DRILL:?set DRILL to the drill dir}/peer2:/repo"]
+    ports: ["127.0.0.1:47343:47343"]
+  witness:
+    image: nas-node
+    command: ["peer", "serve", "/repo", "--listen", "0.0.0.0:47342", "--witness"]
+    volumes: ["${DRILL:?set DRILL to the drill dir}/wit:/repo"]
+    ports: ["127.0.0.1:47342:47342"]

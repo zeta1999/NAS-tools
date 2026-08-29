@@ -172,7 +172,12 @@ settled and the work that follows from them.
       devices). Found and fixed two defects the in-process tests could not:
       `Repo::open` dropping `$NAS_PASSPHRASE`, and the pin silently not
       written on a copy-joined device with no `state/`. MANUAL-TESTING.md §12.
-- [ ] Then containers.
+- [x] Then containers: `tests/usecases/uc11_containers.sh` + `docker/`
+      (Dockerfile, compose.yaml). Host-built binary, slim runtime images,
+      three nodes on one compose network; same drill as UC10, passes under
+      colima. Docker Desktop's daemon was unreachable on this machine; colima
+      + `DOCKER_HOST=unix://$HOME/.colima/default/docker.sock` works.
+      MANUAL-TESTING.md §13.
 - [x] `nas-peer --witness`: no blobs, no caps, relay only — `nas peer serve
       --witness` (see the M1 entry above).
 - [x] Lease deltas, checkpoints, sweep, young-blob grace, per-holder quotas.

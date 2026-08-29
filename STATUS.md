@@ -201,8 +201,12 @@ TLC is green with its three sanity checks still failing as required.
 M2: fork detection over the wire against a live hostile peer (the in-process
 drills exist; the socket is not in their loop), lease-based GC with a caller
 and the lease-griefing quota, retention/Object Lock enforcement, quota
-admission (§6.4), the single-writer handoff (§5.1), and the three-node
-container simulation.
+admission (§6.4), and the single-writer handoff (§5.1). The three-node
+container simulation now exists (`tests/usecases/uc11_containers.sh`,
+MANUAL-TESTING.md §13): host-built `nas` binary, three slim runtime
+containers on one compose network, honest peer restarted `--hostile
+rollback`, a `--witness` node, three devices — same assertions as the
+localhost drill, all passing under colima.
 
 ## Environment constraints
 

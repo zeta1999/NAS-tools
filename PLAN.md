@@ -7,7 +7,7 @@
 Scope: **M0 through M2** — up to where *"resists a hostile peer"* is demonstrated
 rather than intended. Padding defaults to `none`.
 
-**Definition of done: the 53 M0–M2 acceptance assertions in `tests/usecases/`
+**Definition of done: the 58 M0–M2 acceptance assertions in `tests/usecases/`
 pass.** The other 30 stay PENDING (M3–M5) and 1 is deferred (M6). Revision 1 said
 "all 81", which was unachievable inside this scope — and since `ci.sh` runs the
 harness, that would have made CI permanently red from the first binary, until
@@ -119,7 +119,10 @@ project; naming the sizing is how it stays visible.
     (`cargo-zigbuild`) or use a multi-stage Docker builder.** "No cargo in the
     image" is about the *runtime* image.
 
-**Exit:** the 20 M1-tagged assertions pass; fuzz targets running.
+**Exit:** the 25 M1-tagged assertions pass; fuzz targets running.
+*(Revision 2 said 20. Five more were added during M1 — the harness-side
+filesystem checks that stopped an 8-line stub from scoring 25/25. Counting
+them here rather than quietly is the point of naming the number at all.)*
 
 ## 5. M2 — adversarial detection and the deletion loop *(~2× M0)*
 
@@ -186,7 +189,7 @@ is the default — it only bites opt-in users).
 
 | Change | Driver |
 |---|---|
-| Done = 53 M0–M2 assertions, not 81 | 25 belonged to M3–M5; with `ci.sh` running the harness, CI would have been red from the first binary until someone disabled the gate |
+| Done = 58 M0–M2 assertions, not 88 | 30 belong to M3–M5; with `ci.sh` running the harness, CI would have been red from the first binary until someone disabled the gate |
 | Harness gains milestone gating, an exit-2 refusal contract, and a fixed exit check | `check_refuses` passed on *any* non-zero exit, so a stub CLI erroring on everything passed all 14 security assertions; `run.sh` checked `echo`'s status |
 | Assertions reconciled with §5.4, §2.2, §19.1 | Three claimed more than the spec guarantees — including one that the must-fail `ForkAlwaysDetected` check deliberately disproves |
 | Step 0 restated | It locks caps and the test contract, not the disk format; both directions of the comparison table were wrong |

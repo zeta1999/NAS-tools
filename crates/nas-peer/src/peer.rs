@@ -118,6 +118,13 @@ pub struct Peer {
     view: u8,
     pub roster: Roster,
     pub acl: Acl,
+    /// Verifying key → ACL subject.
+    ///
+    /// The subject used to be a string the caller passed to `serve`, bound to
+    /// nothing — so whoever the server wired was the subject for every client,
+    /// whichever key had actually completed the handshake. An ACL evaluated
+    /// against an unbound string is decorative.
+    subjects: BTreeMap<Vec<u8>, String>,
     /// Addresses that may not be swept (SPECS §16). Extend-only in the honest
     /// peer: shrinking it is what `ignore_retention` models.
     retention: std::collections::BTreeSet<[u8; 32]>,
@@ -133,7 +140,7 @@ impl Peer {
     ) -> Result<Self, PeerError> {
         let root = root.into();
         fs::create_dir_all(root.join("slots"))?;
-        Ok(Self {
+        let mut peer = Self {
             blobs: BlobStore::open_with(&root, addressing)?,
             root,
             mode,
@@ -142,9 +149,84 @@ impl Peer {
             view: 0,
             roster: Roster::new(),
             acl: Acl::new(),
+            subjects: BTreeMap::new(),
             retention: std::collections::BTreeSet::new(),
             hostility,
-        })
+        };
+        peer.load()?;
+        Ok(peer)
+    }
+
+    /// Read slot histories and the retention set back from disk.
+    ///
+    /// Both were in-memory only for the whole of M1. `open` created `slots/`
+    /// and wrote nothing into it, and `retention` was a fresh `BTreeSet` on
+    /// every start — so a review reproduced this: retain a blob, confirm
+    /// `delete_blob` refuses, restart the peer, and the blob deletes cleanly.
+    /// **Object Lock that dies on `kill -9` is not Object Lock** (SPECS §16).
+    fn load(&mut self) -> Result<(), PeerError> {
+        let slots_dir = self.root.join("slots");
+        if let Ok(rd) = fs::read_dir(&slots_dir) {
+            for e in rd.flatten() {
+                if !e.path().is_dir() {
+                    continue;
+                }
+                let Ok(records) = fs::read_dir(e.path()) else {
+                    continue;
+                };
+                for f in records.flatten() {
+                    let Ok(bytes) = fs::read(f.path()) else {
+                        continue;
+                    };
+                    // A record that will not decode is skipped rather than
+                    // fatal: the peer must still come up and serve what it can.
+                    // It is unverifiable here anyway -- the roster is client
+                    // state, and every record is re-verified on the read path.
+                    if let Ok(rec) = SlotRecord::decode(&bytes) {
+                        self.slots
+                            .entry(rec.slot_id)
+                            .or_default()
+                            .insert(rec.seq, rec);
+                    }
+                }
+            }
+        }
+        if let Ok(bytes) = fs::read(self.root.join("retention")) {
+            for chunk in bytes.chunks_exact(32) {
+                let mut a = [0u8; 32];
+                a.copy_from_slice(chunk);
+                self.retention.insert(a);
+            }
+        }
+        Ok(())
+    }
+
+    fn slot_dir(&self, slot: &SlotId) -> PathBuf {
+        self.root.join("slots").join(slot.to_hex())
+    }
+
+    /// Persist one record. Written before it is acknowledged, so a crash
+    /// between accepting and storing cannot lose a write the client believes
+    /// succeeded.
+    fn persist_slot(&self, rec: &SlotRecord) -> Result<(), PeerError> {
+        let dir = self.slot_dir(&rec.slot_id);
+        fs::create_dir_all(&dir)?;
+        let bytes = rec.encode().map_err(PeerError::Slot)?;
+        let tmp = dir.join(format!("{}.tmp", rec.seq));
+        fs::write(&tmp, &bytes)?;
+        fs::rename(&tmp, dir.join(rec.seq.to_string()))?;
+        Ok(())
+    }
+
+    fn persist_retention(&self) -> Result<(), PeerError> {
+        let mut out = Vec::with_capacity(self.retention.len() * 32);
+        for a in &self.retention {
+            out.extend_from_slice(a);
+        }
+        let tmp = self.root.join("retention.tmp");
+        fs::write(&tmp, &out)?;
+        fs::rename(&tmp, self.root.join("retention"))?;
+        Ok(())
     }
 
     pub fn root(&self) -> &Path {
@@ -153,6 +235,18 @@ impl Peer {
 
     pub fn blobs(&self) -> &BlobStore {
         &self.blobs
+    }
+
+    /// Bind a transport verifying key to an ACL subject.
+    pub fn bind_subject(&mut self, verifying_key: &[u8], subject: &str) {
+        self.subjects
+            .insert(verifying_key.to_vec(), subject.to_string());
+    }
+
+    /// The subject a connection authenticates as, or `None` for a key this
+    /// peer has never been told about. `None` must deny, never default.
+    pub fn subject_for(&self, verifying_key: &[u8]) -> Option<&str> {
+        self.subjects.get(verifying_key).map(|s| s.as_str())
     }
 
     /// Choose which branch this connection is served (SPECS §5.3).
@@ -228,9 +322,29 @@ impl Peer {
     pub fn publish_slot(&mut self, subject: &str, rec: SlotRecord) -> Result<(), PeerError> {
         // Write policy is enforceable in every mode: the peer checks
         // authenticity, which needs no readability (SPECS §15.4).
-        let d = self.acl.check(subject, Right::Write, self.mode);
-        if !d.permits() {
-            return Err(PeerError::Refused { decision: d });
+        //
+        // `append` also permits publishing. It previously did not, so a subject
+        // holding only `Append` could store nothing at all -- which made the
+        // §16 ransomware posture ("append, and withhold every delete-*")
+        // expressible in the ACL table and nowhere in behaviour.
+        let write = self.acl.check(subject, Right::Write, self.mode);
+        let append = self.acl.check(subject, Right::Append, self.mode);
+        if !write.permits() && !append.permits() {
+            return Err(PeerError::Refused { decision: write });
+        }
+
+        // What `append` cannot buy, stated where it matters rather than in a
+        // manual. SPECS §2.2: in an encrypted mode a slot update is an opaque
+        // root address, so "added a key" and "deleted every key" are
+        // indistinguishable to the peer -- `Mode::peer_can_enforce_append_only`
+        // is true only for `transit-only`. An append-only device therefore gets
+        // its protection from the retention set (§16), which the peer CAN check
+        // because retention is addresses rather than semantics, not from this
+        // right. Granting append and believing the peer polices additivity
+        // would be believing in a control that does not exist.
+        if !write.permits() && !self.mode.peer_can_enforce_append_only() {
+            // Permitted, and deliberately not silent about what it is not.
+            debug_assert!(append.permits());
         }
         let Some(vk) = self.roster.get(&rec.writer_id) else {
             return Err(PeerError::NotRostered);
@@ -292,6 +406,9 @@ impl Peer {
                 }
             }
         }
+        // Persisted BEFORE acknowledgement: a crash in between would otherwise
+        // lose a write the client was told had succeeded.
+        self.persist_slot(&rec)?;
         self.slots
             .entry(rec.slot_id)
             .or_default()
@@ -329,10 +446,11 @@ impl Peer {
     /// Add to the retention set. **Extend-only** in the honest peer: a client
     /// verifies the new set is a superset of the old, so a peer that quietly
     /// dropped an entry would be caught by comparison rather than by trust.
-    pub fn extend_retention(&mut self, addrs: &[Addr]) {
+    pub fn extend_retention(&mut self, addrs: &[Addr]) -> Result<(), PeerError> {
         for a in addrs {
             self.retention.insert(*a.as_bytes());
         }
+        self.persist_retention()
     }
 
     pub fn retains(&self, addr: &Addr) -> bool {
@@ -611,7 +729,7 @@ mod tests {
         // and nothing here stops it -- the defence is the client noticing.
         let (_s, mut p, _) = peer("retention", Hostility::HONEST);
         let a = p.put_blob(b"legal record").unwrap();
-        p.extend_retention(&[a]);
+        p.extend_retention(&[a]).unwrap();
         assert!(matches!(
             p.delete_blob(&a),
             Err(PeerError::RetentionHold { .. })
@@ -626,7 +744,7 @@ mod tests {
             },
         );
         let b = q.put_blob(b"legal record").unwrap();
-        q.extend_retention(&[b]);
+        q.extend_retention(&[b]).unwrap();
         q.delete_blob(&b).unwrap();
         assert!(
             !q.blobs().has(&b),
@@ -639,9 +757,9 @@ mod tests {
         let (_s, mut p, _) = peer("extend", Hostility::HONEST);
         let a = p.put_blob(b"one").unwrap();
         let b = p.put_blob(b"two").unwrap();
-        p.extend_retention(&[a]);
+        p.extend_retention(&[a]).unwrap();
         assert_eq!(p.retention_len(), 1);
-        p.extend_retention(&[b]);
+        p.extend_retention(&[b]).unwrap();
         assert_eq!(
             p.retention_len(),
             2,
@@ -829,5 +947,231 @@ mod fork_tests {
             .expect("two clients on a forking peer must be able to prove it");
         assert!(proof.verify());
         assert_eq!(proof.seq, 1);
+    }
+}
+
+#[cfg(test)]
+mod persistence_tests {
+    use super::*;
+    use nas_crypto::{Identity, Role};
+    use nas_slots::ROOT_NONCE_LEN;
+
+    fn ident(seed: u8) -> Identity {
+        Identity::derive(&[seed; 32], Role::Slot).unwrap()
+    }
+    fn slot() -> SlotId {
+        SlotId::new(b"ns", b"durable")
+    }
+
+    /// A scratch dir that is NOT removed between opens, so a restart is a
+    /// restart rather than a fresh peer.
+    struct Scratch(PathBuf);
+    impl Scratch {
+        fn new(t: &str) -> Self {
+            let p = std::env::temp_dir().join(format!("nas-persist-{}-{t}", std::process::id()));
+            let _ = fs::remove_dir_all(&p);
+            Self(p)
+        }
+    }
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn open(root: &PathBuf) -> Peer {
+        Peer::open(root, Mode::E2ee, Addressing::Content, Hostility::HONEST).unwrap()
+    }
+
+    #[test]
+    fn retention_survives_a_restart() {
+        // The review's reproduction, now a regression test. Object Lock that
+        // dies on kill -9 is not Object Lock (SPECS §16).
+        let s = Scratch::new("retention");
+        let addr;
+        {
+            let mut p = open(&s.0);
+            addr = p.put_blob(b"a legal record under retention").unwrap();
+            p.extend_retention(&[addr]).unwrap();
+            assert!(matches!(
+                p.delete_blob(&addr),
+                Err(PeerError::RetentionHold { .. })
+            ));
+        }
+        // Restart.
+        let p = open(&s.0);
+        assert!(p.retains(&addr), "retention was lost across a restart");
+        assert!(matches!(
+            p.delete_blob(&addr),
+            Err(PeerError::RetentionHold { .. })
+        ));
+        assert!(p.blobs().has(&addr));
+    }
+
+    #[test]
+    fn slot_history_survives_a_restart() {
+        // Without this a client's chain walk silently loses its history every
+        // time the peer is restarted, and §5.5's retain-N guarantee is void.
+        let s = Scratch::new("slots");
+        let id = ident(1);
+        {
+            let mut p = open(&s.0);
+            p.roster.add(id.verifying_key()).unwrap();
+            p.acl.grant("laptop", &[Right::Write]);
+            let mut prev = [0u8; 32];
+            for seq in 0..5 {
+                let r = SlotRecord::sign(
+                    &id,
+                    slot(),
+                    seq,
+                    Addr::of_ciphertext(format!("root-{seq}").as_bytes()),
+                    [1u8; ROOT_NONCE_LEN],
+                    prev,
+                    Regime::CasMerge,
+                )
+                .unwrap();
+                prev = r.record_hash();
+                p.publish_slot("laptop", r).unwrap();
+            }
+            assert_eq!(p.slot_len(&slot()), 5);
+        }
+        let p = open(&s.0);
+        assert_eq!(
+            p.slot_len(&slot()),
+            5,
+            "slot history was lost across a restart"
+        );
+        assert_eq!(p.slot_head(&slot()).unwrap().seq, 4);
+
+        // And the reloaded history still verifies end to end.
+        let mut roster = Roster::new();
+        roster.add(id.verifying_key()).unwrap();
+        let walk = p.slot_history(&slot(), 0);
+        nas_slots::verify_chain(&walk, slot(), &roster, None).unwrap();
+    }
+
+    #[test]
+    fn a_restarted_peer_still_enforces_cas() {
+        // The head must be recovered, not reset -- otherwise a restart lets a
+        // client re-publish seq 0 and silently truncate the history.
+        let s = Scratch::new("cas");
+        let id = ident(1);
+        let genesis = SlotRecord::sign(
+            &id,
+            slot(),
+            0,
+            Addr::of_ciphertext(b"root-0"),
+            [1u8; ROOT_NONCE_LEN],
+            [0u8; 32],
+            Regime::CasMerge,
+        )
+        .unwrap();
+        {
+            let mut p = open(&s.0);
+            p.roster.add(id.verifying_key()).unwrap();
+            p.acl.grant("laptop", &[Right::Write]);
+            p.publish_slot("laptop", genesis.clone()).unwrap();
+        }
+        let mut p = open(&s.0);
+        p.roster.add(id.verifying_key()).unwrap();
+        p.acl.grant("laptop", &[Right::Write]);
+        assert!(matches!(
+            p.publish_slot("laptop", genesis),
+            Err(PeerError::CasConflict {
+                head: 0,
+                offered: 0
+            })
+        ));
+    }
+
+    #[test]
+    fn junk_in_the_slots_directory_does_not_stop_the_peer_starting() {
+        // A peer must come up and serve what it can. Records are re-verified
+        // on the read path anyway, so a corrupt file is skipped, not fatal.
+        let s = Scratch::new("junk");
+        {
+            let _ = open(&s.0);
+        }
+        let d = s.0.join("slots").join("not-a-slot-id");
+        fs::create_dir_all(&d).unwrap();
+        fs::write(d.join("0"), b"not a slot record").unwrap();
+        let p = open(&s.0);
+        assert_eq!(p.slot_len(&SlotId::from_bytes([0u8; 32])), 0);
+    }
+}
+
+#[cfg(test)]
+mod append_tests {
+    use super::*;
+    use nas_crypto::{Identity, Role};
+    use nas_slots::ROOT_NONCE_LEN;
+
+    struct Scratch(PathBuf);
+    impl Scratch {
+        fn new(t: &str) -> Self {
+            let p = std::env::temp_dir().join(format!("nas-append-{}-{t}", std::process::id()));
+            let _ = fs::remove_dir_all(&p);
+            Self(p)
+        }
+    }
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn genesis(id: &Identity, slot: SlotId) -> SlotRecord {
+        SlotRecord::sign(
+            id,
+            slot,
+            0,
+            Addr::of_ciphertext(b"root"),
+            [1u8; ROOT_NONCE_LEN],
+            [0u8; 32],
+            Regime::CasMerge,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn an_append_only_subject_can_publish() {
+        // Before this, `Append` granted nothing and the §16 safe configuration
+        // -- a backup agent that may add but never destroy -- could not store
+        // anything at all.
+        for mode in [Mode::E2ee, Mode::Passphrase, Mode::TransitOnly] {
+            let s = Scratch::new(&format!("append-{mode:?}"));
+            let mut p = Peer::open(&s.0, mode, Addressing::Content, Hostility::HONEST).unwrap();
+            let id = Identity::derive(&[1u8; 32], Role::Slot).unwrap();
+            p.roster.add(id.verifying_key()).unwrap();
+            p.acl.grant("backup-agent", &[Right::Append]);
+            let slot = SlotId::new(b"ns", b"s");
+            p.publish_slot("backup-agent", genesis(&id, slot))
+                .unwrap_or_else(|e| panic!("{mode:?}: append-only subject refused: {e}"));
+        }
+    }
+
+    #[test]
+    fn a_subject_with_neither_write_nor_append_is_still_refused() {
+        let s = Scratch::new("neither");
+        let mut p = Peer::open(&s.0, Mode::E2ee, Addressing::Content, Hostility::HONEST).unwrap();
+        let id = Identity::derive(&[1u8; 32], Role::Slot).unwrap();
+        p.roster.add(id.verifying_key()).unwrap();
+        p.acl.grant("guest", &[Right::Read]);
+        let slot = SlotId::new(b"ns", b"s");
+        assert!(matches!(
+            p.publish_slot("guest", genesis(&id, slot)),
+            Err(PeerError::Refused { .. })
+        ));
+    }
+
+    #[test]
+    fn append_does_not_imply_the_peer_polices_additivity() {
+        // SPECS §2.2, asserted rather than left in a manual: in an encrypted
+        // mode a slot update is an opaque root address, so the peer cannot tell
+        // "added a key" from "deleted every key". An append-only device's real
+        // protection is the retention set, not this right.
+        assert!(!Mode::E2ee.peer_can_enforce_append_only());
+        assert!(!Mode::Passphrase.peer_can_enforce_append_only());
+        assert!(Mode::TransitOnly.peer_can_enforce_append_only());
     }
 }

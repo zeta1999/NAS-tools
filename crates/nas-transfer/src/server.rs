@@ -65,7 +65,20 @@ pub fn handle(peer: &mut Peer, subject: &str, req: Request) -> Response {
 }
 
 /// Serve requests until the client disconnects.
-pub fn serve(peer: &mut Peer, ch: &mut Channel, subject: &str) -> Result<usize, SessionError> {
+///
+/// The ACL subject is derived from the authenticated identity; see the body.
+pub fn serve(peer: &mut Peer, ch: &mut Channel) -> Result<usize, SessionError> {
+    // The subject comes from the HANDSHAKE, not from an argument. There is no
+    // parameter to pass an unbound string through any more, which is the point:
+    // an ACL evaluated against a caller-supplied name enforces nothing.
+    //
+    // An unknown key gets `"?"`, which is in no ACL, so every rights check
+    // returns `UnknownSubject` and every write is refused. Denying by default
+    // matters more here than a tidy error.
+    let subject = peer
+        .subject_for(ch.peer_identity())
+        .unwrap_or("?")
+        .to_string();
     let mut served = 0usize;
     loop {
         let req = match ch.recv_request() {
@@ -74,7 +87,7 @@ pub fn serve(peer: &mut Peer, ch: &mut Channel, subject: &str) -> Result<usize, 
             Err(SessionError::Truncated) => return Ok(served),
             Err(e) => return Err(e),
         };
-        let rsp = handle(peer, subject, req);
+        let rsp = handle(peer, &subject, req);
         ch.send_response(&rsp)?;
         served += 1;
     }

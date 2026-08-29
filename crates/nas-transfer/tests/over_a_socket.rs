@@ -65,6 +65,9 @@ fn connected(tag: &str, hostility: Hostility, seed: impl FnOnce(&mut Peer)) -> (
     let client_id = Identity::generate().unwrap();
     let server_vk = server_id.verifying_key();
     let client_vk = client_id.verifying_key();
+    // The subject is bound to the client's transport key, not passed as a
+    // string -- so the ACL is evaluated against whoever actually handshook.
+    peer.bind_subject(&client_vk, "laptop");
 
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
@@ -74,7 +77,7 @@ fn connected(tag: &str, hostility: Hostility, seed: impl FnOnce(&mut Peer)) -> (
         ready.send(()).unwrap();
         let (sock, _) = listener.accept().unwrap();
         let mut ch = Channel::accept(sock, &server_id, client_vk).unwrap();
-        let _ = nas_transfer::serve(&mut peer, &mut ch, "laptop");
+        let _ = nas_transfer::serve(&mut peer, &mut ch);
     });
     wait.recv().unwrap();
 
@@ -292,4 +295,102 @@ fn the_handshake_pins_the_peer_key() {
         Channel::connect(sock, &client_id, impostor.verifying_key()).is_err(),
         "the client accepted a peer it had not pinned"
     );
+}
+
+#[test]
+fn an_unbound_identity_is_denied_rather_than_defaulted() {
+    // The subject used to be a string the caller passed to `serve`, bound to
+    // nothing -- so whoever the server happened to wire was the subject for
+    // every client. Now it comes from the handshake, and a key the peer has
+    // never been told about maps to no subject at all.
+    let s = Scratch::new("unbound");
+    let mut peer = Peer::open(&s.0, Mode::E2ee, Addressing::Content, Hostility::HONEST).unwrap();
+    peer.roster.add(writer().verifying_key()).unwrap();
+    peer.acl.grant("laptop", &[Right::Write]);
+    // Deliberately NOT calling bind_subject for this client.
+
+    let server_id = Identity::generate().unwrap();
+    let client_id = Identity::generate().unwrap();
+    let server_vk = server_id.verifying_key();
+    let client_vk = client_id.verifying_key();
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (ready, wait) = mpsc::channel();
+    thread::spawn(move || {
+        ready.send(()).unwrap();
+        let (sock, _) = listener.accept().unwrap();
+        let mut ch = Channel::accept(sock, &server_id, client_vk).unwrap();
+        let _ = nas_transfer::serve(&mut peer, &mut ch);
+    });
+    wait.recv().unwrap();
+
+    let sock = TcpStream::connect(addr).unwrap();
+    let mut ch = Channel::connect(sock, &client_id, server_vk).unwrap();
+
+    let bytes = record(&writer(), 0, [0u8; 32], "root-0").encode().unwrap();
+    match ch.call(&Request::PublishSlot(bytes)).unwrap() {
+        Response::Error(m) => assert!(
+            m.contains("unknown subject") || m.contains("refused"),
+            "an unbound identity was not denied: {m}"
+        ),
+        other => panic!("an unbound identity was allowed to publish: {other:?}"),
+    }
+}
+
+#[test]
+fn the_subject_follows_the_key_that_handshook() {
+    // Two clients, two keys, two subjects -- and the ACL distinguishes them.
+    // Impossible to express before, because `serve` took one string.
+    let s = Scratch::new("two-subjects");
+    let mut peer = Peer::open(&s.0, Mode::E2ee, Addressing::Content, Hostility::HONEST).unwrap();
+    peer.roster.add(writer().verifying_key()).unwrap();
+    peer.acl.grant("writer-device", &[Right::Write]);
+    peer.acl.grant("reader-device", &[Right::Read]);
+
+    let server_id = Identity::generate().unwrap();
+    let allowed = Identity::generate().unwrap();
+    let refused = Identity::generate().unwrap();
+    peer.bind_subject(&allowed.verifying_key(), "writer-device");
+    peer.bind_subject(&refused.verifying_key(), "reader-device");
+    let server_vk = server_id.verifying_key();
+
+    for (id, should_publish) in [(allowed, true), (refused, false)] {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client_vk = id.verifying_key();
+        // The peer is moved into the thread and back out via the channel, so
+        // both connections talk to the same peer state.
+        let (tx, rx) = mpsc::channel();
+        let (ready, wait) = mpsc::channel();
+        let mut p = peer;
+        let sid = server_id_clone(&server_id);
+        thread::spawn(move || {
+            ready.send(()).unwrap();
+            let (sock, _) = listener.accept().unwrap();
+            let mut ch = Channel::accept(sock, &sid, client_vk).unwrap();
+            let _ = nas_transfer::serve(&mut p, &mut ch);
+            tx.send(p).unwrap();
+        });
+        wait.recv().unwrap();
+
+        let sock = TcpStream::connect(addr).unwrap();
+        let mut ch = Channel::connect(sock, &id, server_vk.clone()).unwrap();
+        let bytes = record(&writer(), 0, [0u8; 32], "root-0").encode().unwrap();
+        let got = ch.call(&Request::PublishSlot(bytes)).unwrap();
+        drop(ch);
+        peer = rx.recv().unwrap();
+
+        match (&got, should_publish) {
+            (Response::Ok, true) => {}
+            (Response::Error(_), false) => {}
+            _ => panic!("should_publish={should_publish} but got {got:?}"),
+        }
+    }
+}
+
+/// `Identity` is not `Clone`; round-trip it the same way the session layer does.
+fn server_id_clone(id: &Identity) -> Identity {
+    let (sk, vk) = id.export().unwrap();
+    Identity::from_bytes(&sk, &vk).unwrap()
 }

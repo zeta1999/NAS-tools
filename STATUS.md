@@ -100,11 +100,13 @@ listing; lease-based GC with deltas; **three confidentiality modes** (`e2ee`,
   is refused before a single record is sent.
 - **`tests/usecases/`** — 88 acceptance assertions, milestone-gated; 58 are
   M0–M2. Measured on the current binary: **5 passing, 0 failing, 83 pending**
-  at `NAS_MILESTONE=M0`; **30 passing, 0 failing, 58 pending** at
-  `NAS_MILESTONE=M1` (what `ci.sh` gates on); **30 passing, 28 failing, 30
-  pending** at `NAS_MILESTONE=M2` — the 28 are the hostile-peer and lifecycle
-  assertions that M2 builds. UC01 (transit-only), UC02 (passphrase) and UC03
-  (e2ee) are all green end to end. Verified to
+  at `NAS_MILESTONE=M0`; **36 passing, 0 failing, 52 pending** at
+  `NAS_MILESTONE=M1` (what `ci.sh` gates on); **37 passing, 21 failing, 30
+  pending** at `NAS_MILESTONE=M2` — the 21 are the deletion-resistance and
+  lifecycle assertions that M2 builds. UC01 (transit-only), UC02 (passphrase)
+  and UC03 (e2ee) are all green end to end; UC09 (hostile peer) is 6 of 8, the
+  two remaining being lease griefing and the `all` drill that contains it,
+  both waiting on §16 leases. Verified to
   bite: a stub that always exits 0 fails the refusal assertion, and one that
   always exits 1 is reported BROKEN rather than refused (MANUAL-TESTING.md §6a).
 
@@ -165,18 +167,27 @@ See `MANUAL-TESTING.md` §5 for the commands and raw output.
 
 | | count |
 |---|---|
-| Rust unit tests | 363 |
+| Rust unit tests | 367 |
 | Lean theorems (clean axiom gate) | 14 |
 | `cargo-fuzz` targets | 11 |
-| Acceptance assertions passing (≤M1) | 30 of 88 |
-| Acceptance assertions pending (M2+) | 58 |
+| Acceptance assertions passing (≤M1) | 36 of 88 |
+| Acceptance assertions pending (M2+) | 52 |
 
-**30 of 88 is a progress marker, not a verification result.** The 58 pending
+**36 of 88 is a progress marker, not a verification result.** The 52 pending
 assertions are not failures and not successes — they are unwritten code that
 `ci.sh` refuses to score. Every one of them is a claim SPECS makes that nothing
-yet demonstrates, and the three use cases with a passing score (UC01–UC03) are
-the three whose milestones have arrived. UC04, UC07 and UC09 — deletion
-resistance, roaming, and the hostile peer — are at zero.
+yet demonstrates, and the four use cases with a passing score (UC01–UC03,
+UC09) are the ones whose milestones have arrived. UC04 and UC07 — deletion
+resistance and roaming — are at zero.
+
+The UC09 drills (`nas test attack <kind>`) run the server's own dispatch
+against a peer opened with one hostility flag, after first proving the same
+flow succeeds against an honest peer; the transport is not in the loop, so
+"6 of 8" is a statement about the client-side controls, not about the wire.
+Two of the drills are explicit about their limits: `withhold` is caught against
+the client's upload receipt and cannot distinguish withholding from loss, and
+`witness-withholding` exits 2 from a single relay — SPECS §5.4 says it is
+undetectable there — passing only when a second, witness-only relay exists.
 
 TLC is green with its three sanity checks still failing as required.
 
@@ -187,9 +198,11 @@ TLC is green with its three sanity checks still failing as required.
 
 ## Not built
 
-M2: fork detection end to end against a live hostile peer, lease-based GC with
-a caller, retention/Object Lock enforcement, quota admission (§6.4), the
-single-writer handoff (§5.1), and the multi-process localhost simulation.
+M2: fork detection over the wire against a live hostile peer (the in-process
+drills exist; the socket is not in their loop), lease-based GC with a caller
+and the lease-griefing quota, retention/Object Lock enforcement, quota
+admission (§6.4), the single-writer handoff (§5.1), and the three-node
+container simulation.
 
 ## Environment constraints
 

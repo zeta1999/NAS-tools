@@ -326,6 +326,9 @@ pub struct ServeOpts<'a> {
     /// Serve one connection and exit. For tests and scripts; a real peer
     /// runs until killed.
     pub once: bool,
+    /// Relay witnesses and refuse everything else (SPECS §5.3): "a
+    /// witness-only node holds no blobs and no caps".
+    pub witness: bool,
 }
 
 /// `nas peer serve <dir> --listen <addr> [--hostile <spec>] [--once]`
@@ -387,6 +390,9 @@ pub fn serve(dir: &str, o: ServeOpts<'_>) -> i32 {
         }
     }
     peer.acl = acl;
+    // Enforced at the dispatch (`nas_transfer::handle`), where every request
+    // passes, not per store method.
+    peer.witness_only = o.witness;
     for (subject, vk) in &clients {
         peer.bind_subject(vk, subject);
     }
@@ -401,7 +407,8 @@ pub fn serve(dir: &str, o: ServeOpts<'_>) -> i32 {
         .unwrap_or_else(|_| o.listen.to_string());
     // Printed before the first accept so a script can wait on this line.
     println!(
-        "peer {dir} listening on {local} ({}, {} clients, {} writers, {:?})",
+        "peer {dir} listening on {local} ({}{}, {} clients, {} writers, {:?})",
+        if o.witness { "witness-only, " } else { "" },
         hostility.describe(),
         clients.len(),
         writers.len(),

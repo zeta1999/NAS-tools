@@ -752,3 +752,77 @@ The shape, given 16 GB of RAM:
   is the minimum that makes §5.3's fork detection meaningful.
 
 Record observed output here as it lands.
+
+## 11. Hostile peer drills — UC09 (M1)
+
+`nas test attack <kind>` (`crates/nas-cli/src/attack.rs`) runs each UC09
+attack against a `nas-peer` opened with one hostility flag, through the **same
+dispatch** the network server uses (`nas_transfer::handle`). The PQC transport
+is deliberately not in the loop — it is UC07's subject, and a socket between two
+halves of one process would test the socket, not the control.
+
+Two properties of the harness are worth knowing before reading the results:
+
+- **Every drill first runs against an honest peer** and requires the flow to
+  succeed (put → get verifies; three records publish; `has` answers false for
+  bytes it never saw; a conflicting CAS write is refused; a witness is relayed
+  back). Without that, a control that rejects everything — or a harness that is
+  merely broken — would score as "attack detected".
+- **The exit code says which of three things happened.** 0: the control fired.
+  2 (`refused`): the attack went through unnoticed, a missing control scored
+  as the security failure it is. 3: the control is specified and unbuilt.
+
+Observed on the current binary (`target/release/nas`):
+
+```
+$ nas test attack tamper
+attack tamper: detected — 4096 B served for 3ac1d81e… do not hash to it — address verification refused the blob (SPECS §3.4)
+$ nas test attack rollback
+attack rollback: detected — peer served seq 1 as head; pinned client refused: offered seq 1 is behind the pinned seq 2 (SPECS §5.3)
+$ nas test attack withhold
+attack withhold: detected — peer acknowledged storing fa11c5d7… and now answers `no blob fa11c5d7…` — noticed against the client's receipt; indistinguishable from loss, so the remedy is leases and replication (SPECS §16), not a check
+$ nas test attack dedup-lie
+attack dedup-lie: detected — claimed possession of 1e3b523b…, failed the proof-of-possession challenge (`no blob 1e3b523b…`) — client uploads anyway (SPECS §4.5)
+$ nas test attack cas-non-enforcement
+attack cas-non-enforcement: detected — peer kept a CAS loser and served it as seq 1; pinned client: refused — record 0 does not chain to its predecessor; fork evidence at seq Some(1) (SPECS §5.2, §5.3)
+$ nas test attack lease-griefing
+attack lease-griefing: pending (M2 (§16))
+unimplemented: `test attack lease-griefing` is specified and lands in M2 (§16)      # exit 3
+$ nas test attack witness-withholding
+attack witness-withholding: NOT detected — from a single relay, withheld witnesses look exactly like none having been published (SPECS §5.4, the `ForkAlwaysDetected` must-fail) — rerun with --with-witness-node
+refused: undetected attack(s): witness-withholding                                   # exit 2
+$ nas test attack witness-withholding --with-witness-node
+attack witness-withholding: detected — hostile relay returned 0 witnesses (fork invisible: None); witness node returned 1, 1 admitted; fork evidence at seq 1 (SPECS §5.3, §5.4)
+```
+
+Three of those lines deserve a note:
+
+- **`withhold` is not a cryptographic catch, and says so.** The peer's denial
+  is caught against the client's own receipt for the upload; the harness cannot
+  and does not claim to distinguish withholding from loss. SPECS §16's answer
+  is leases and replication, and the drill's message names that rather than
+  implying a check exists.
+- **`witness-withholding` without the node exits 2, on purpose.** SPECS §5.4
+  and the TLA+ must-fail `ForkAlwaysDetected` establish that a single relay
+  withholding everything is indistinguishable from an idle one. The drill
+  reports that as an undetected attack, because from that topology it is one.
+  UC09 asserts the topology in which detection is possible, and the drill
+  prints what the hostile relay returned (0) beside what the witness node
+  returned (1) so the difference the node makes is visible in the output.
+- **`cas-non-enforcement` detects at two layers.** A pinned client refuses the
+  second branch because record 0 does not chain to its pin; independently, the
+  evidence set holds two signature hashes at seq 1 (`forked() = Some(1)`),
+  which is what a witness would carry to another device.
+
+With `--cold-start` the client is a capability and nothing else — no pin, no
+history — and the same six detect, by a different control each time:
+rollback is caught by the anchor floor (`offered seq 1 is below the cap anchor
+at 2`) instead of the pin, and CAS non-enforcement by `AnchorMismatch` (`seq 1
+does not match the record the cap was anchored to`) instead of the chain walk.
+`nas test attack all --cold-start` therefore prints six `detected` lines and
+one `pending`, and exits 3: lease griefing needs §16 leases, and an `all` that
+skipped it would be scoring an unwritten control as passed.
+
+UC09 in the harness: **6 passed, 0 failed, 2 pending at `NAS_MILESTONE=M1`**;
+the two pending are the lease-griefing drill and `all --cold-start`, tagged M2
+individually.

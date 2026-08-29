@@ -183,16 +183,22 @@ settled and the work that follows from them.
       client by some route other than it happening to reconnect. Decide before
       `nas-peer` starts actually deleting.
 - [ ] Proof-of-possession responder
-- [ ] `--witness` mode: no blobs, no caps, relay only
+- [x] `--witness` mode: no blobs, no caps, relay only (`nas peer serve
+      --witness`; refused at the dispatch in `nas_transfer::handle`, the one
+      place every request passes)
 - [x] Push/pull over `simple-network` `pqc` (honest-peer path)
 
 ## M2 — adversarial hardening
 
 - [ ] Freshness anchors, client pins, chain walking, skip-chain checkpoints
 - [ ] Witness publication and relay
-- [ ] One named test per attack: tamper, rollback, withhold, dedup-lie,
-      CAS-non-enforcement, lease griefing, witness withholding
-- [ ] Cold-start test: a fresh client holding only a cap resists all of the above
+- [x] One named test per attack: tamper, rollback, withhold, dedup-lie,
+      CAS-non-enforcement, witness withholding (`nas test attack <kind>`,
+      `crates/nas-cli/src/attack.rs`; UC09 scores 6 of 8 at M1)
+- [ ] Lease griefing bounded by per-holder quota — needs §16 leases; the drill
+      exits 3 (unimplemented) until then
+- [x] Cold-start test: `nas test attack all --cold-start` — six drills detected
+      against a cap-only client; exits 3 only because lease griefing is pending
 
 ## M3 — S3 face
 

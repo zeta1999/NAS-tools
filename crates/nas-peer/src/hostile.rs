@@ -53,6 +53,12 @@ pub struct Hostility {
     /// Sweep blobs the retention set protects (§16). Caught by a client that
     /// re-checks the retention superset, and by the blob simply being gone.
     pub ignore_retention: bool,
+    /// Accept witnesses and relay none of them (§5.3, §5.4). A forking peer
+    /// that also withholds witnesses is undetectable *from that peer alone*:
+    /// SPECS §5.4 and the must-fail `ForkAlwaysDetected` check say so. It is
+    /// caught only when a second relay (a witness-only node) exists that the
+    /// clients also talk to.
+    pub withhold_witnesses: bool,
 }
 
 impl Hostility {
@@ -63,6 +69,7 @@ impl Hostility {
         dedup_lie: false,
         fork: false,
         ignore_retention: false,
+        withhold_witnesses: false,
     };
 
     pub fn is_honest(&self) -> bool {
@@ -85,6 +92,7 @@ impl Hostility {
                 "dedup-lie" => h.dedup_lie = true,
                 "fork" => h.fork = true,
                 "ignore-retention" => h.ignore_retention = true,
+                "withhold-witnesses" => h.withhold_witnesses = true,
                 "all" => {
                     h = Self {
                         tamper: true,
@@ -93,12 +101,14 @@ impl Hostility {
                         dedup_lie: true,
                         fork: true,
                         ignore_retention: true,
+                        withhold_witnesses: true,
                     }
                 }
                 other => {
                     return Err(format!(
                         "unknown hostility {other:?}; expected one of \
-                         tamper, rollback, withhold, dedup-lie, fork, ignore-retention, all"
+                         tamper, rollback, withhold, dedup-lie, fork, ignore-retention, \
+                         withhold-witnesses, all"
                     ))
                 }
             }
@@ -119,6 +129,7 @@ impl Hostility {
             (self.dedup_lie, "dedup-lie"),
             (self.fork, "fork"),
             (self.ignore_retention, "ignore-retention"),
+            (self.withhold_witnesses, "withhold-witnesses"),
         ] {
             if on {
                 v.push(name);
@@ -155,7 +166,13 @@ mod tests {
     fn all_enables_everything() {
         let h = Hostility::parse("all").unwrap();
         assert!(
-            h.tamper && h.rollback && h.withhold && h.dedup_lie && h.fork && h.ignore_retention
+            h.tamper
+                && h.rollback
+                && h.withhold
+                && h.dedup_lie
+                && h.fork
+                && h.ignore_retention
+                && h.withhold_witnesses
         );
     }
 
@@ -169,7 +186,13 @@ mod tests {
 
     #[test]
     fn describe_round_trips_through_parse() {
-        for spec in ["tamper", "fork", "tamper,fork,withhold", "all"] {
+        for spec in [
+            "tamper",
+            "fork",
+            "tamper,fork,withhold",
+            "fork,withhold-witnesses",
+            "all",
+        ] {
             let h = Hostility::parse(spec).unwrap();
             assert_eq!(Hostility::parse(&h.describe()).unwrap(), h);
         }

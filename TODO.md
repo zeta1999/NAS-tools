@@ -64,6 +64,16 @@ settled and the work that follows from them.
 - [x] CI gate that fails on `sorry` in any Lean file — and a stronger one: every
       theorem carries `#print axioms`, and the gate fails on anything outside
       `propext` / `Classical.choice` / `Quot.sound`. Both verified to bite.
+- [ ] **Close the `ForkDetected` gap.** `SlotClient::forked` detects only
+      same-sequence equivocation; the TLA+ `Compatible` relation is a full
+      ancestry check that also catches branches at *different* sequence numbers
+      — which is what a real fork usually looks like, since each device
+      witnesses its own head. Needs witnesses to carry a `prev`/checkpoint link,
+      and a model whose witness abstraction matches. Asserted as a known gap by
+      `a_fork_at_disjoint_sequences_is_NOT_detected`.
+- [ ] **Vary `ForkAt` in the TLC configs.** Both `MC_small.cfg` and
+      `MC_full.cfg` fix it at 2, so the model never explores forks originating
+      at different points.
 - [ ] `LeaseGC.tla` — the write/sweep race against the young-blob grace period
 - [ ] `DeleteQuorum.tla` — quorum, approval replay, cooling-off bypass
 - [x] `cargo-fuzz` targets for every parser consuming peer bytes — **six**

@@ -37,6 +37,18 @@ pub struct Hostility {
     pub dedup_lie: bool,
     /// Serve two different, internally consistent histories to two clients.
     /// Each walk verifies; only a witness from the other side reveals it (§5.3).
+    ///
+    /// A peer holds no writer key, so it cannot invent a divergent history. It
+    /// forks by *keeping* a write an honest peer would have refused by
+    /// compare-and-swap, and serving that branch to a different client. Every
+    /// record on both branches is one a legitimate writer signed, which is
+    /// exactly why neither client can tell from its own view.
+    ///
+    /// This flag was declared and read nowhere for the whole of M1 — parsed,
+    /// described, included in `all`, unit-tested, and wired to nothing — while
+    /// the module documentation claimed every mode was a live branch. A review
+    /// found it. The fork-detection machinery it is supposed to attack had no
+    /// adversary for its entire existence.
     pub fork: bool,
     /// Sweep blobs the retention set protects (§16). Caught by a client that
     /// re-checks the retention superset, and by the blob simply being gone.

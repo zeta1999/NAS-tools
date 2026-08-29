@@ -104,6 +104,18 @@ pub struct Peer {
     /// head-only: revision 1 stored only the head, which made its own chain
     /// check impossible to perform (SPECS §5.3).
     slots: BTreeMap<SlotId, BTreeMap<u64, SlotRecord>>,
+    /// The second branch a forking peer keeps (SPECS §5.3).
+    ///
+    /// A peer holds no writer key, so it **cannot fabricate** a divergent
+    /// history out of nothing — every record it serves must be one a
+    /// legitimate writer signed. What it can do is accept two conflicting
+    /// writes that an honest peer would have rejected by compare-and-swap, keep
+    /// both, and show each client a different one. That is what equivocation
+    /// actually looks like, and it is what this branch stores.
+    forks: BTreeMap<SlotId, BTreeMap<u64, SlotRecord>>,
+    /// Which branch this connection sees. A forking peer answers differently
+    /// per client; an honest one ignores it entirely.
+    view: u8,
     pub roster: Roster,
     pub acl: Acl,
     /// Addresses that may not be swept (SPECS §16). Extend-only in the honest
@@ -126,6 +138,8 @@ impl Peer {
             root,
             mode,
             slots: BTreeMap::new(),
+            forks: BTreeMap::new(),
+            view: 0,
             roster: Roster::new(),
             acl: Acl::new(),
             retention: std::collections::BTreeSet::new(),
@@ -139,6 +153,25 @@ impl Peer {
 
     pub fn blobs(&self) -> &BlobStore {
         &self.blobs
+    }
+
+    /// Choose which branch this connection is served (SPECS §5.3).
+    ///
+    /// Set per connection by the server loop, so two clients talking to one
+    /// forking peer see different histories — which is the only way a fork
+    /// becomes observable at all.
+    pub fn set_view(&mut self, view: u8) {
+        self.view = view;
+    }
+
+    /// The branch this connection sees, honouring `fork`.
+    fn branch(&self, slot: &SlotId) -> Option<&BTreeMap<u64, SlotRecord>> {
+        if self.hostility.fork && self.view != 0 {
+            if let Some(alt) = self.forks.get(slot) {
+                return Some(alt);
+            }
+        }
+        self.slots.get(slot)
     }
 
     // ── Blobs ───────────────────────────────────────────────────────────
@@ -204,8 +237,14 @@ impl Peer {
         };
         rec.verify(vk).map_err(PeerError::Slot)?;
 
-        let history = self.slots.entry(rec.slot_id).or_default();
-        match history.keys().next_back().copied() {
+        // Read the head first rather than holding a mutable borrow across the
+        // decision: the forking branch below needs to touch a second map.
+        let head = self
+            .slots
+            .get(&rec.slot_id)
+            .and_then(|h| h.keys().next_back().copied());
+
+        match head {
             None => {
                 if rec.seq != 0 {
                     return Err(PeerError::CasConflict {
@@ -216,12 +255,35 @@ impl Peer {
             }
             Some(head) => {
                 if rec.seq != head + 1 {
+                    // An honest peer refuses here and the client retries
+                    // (SPECS §5.2). A forking one KEEPS the loser as a second
+                    // branch and later serves it to a different client. Note it
+                    // forges nothing: the losing record is genuinely signed by a
+                    // rostered writer, which is precisely why neither client can
+                    // tell from its own view.
+                    if self.hostility.fork {
+                        let prefix: Vec<(u64, SlotRecord)> = self
+                            .slots
+                            .get(&rec.slot_id)
+                            .map(|h| h.range(..rec.seq).map(|(k, v)| (*k, v.clone())).collect())
+                            .unwrap_or_default();
+                        let alt = self.forks.entry(rec.slot_id).or_default();
+                        if !alt.contains_key(&rec.seq) {
+                            // Seed the branch with the shared prefix so the
+                            // history it serves verifies end to end.
+                            if alt.is_empty() {
+                                alt.extend(prefix);
+                            }
+                            alt.insert(rec.seq, rec);
+                            return Ok(());
+                        }
+                    }
                     return Err(PeerError::CasConflict {
                         head,
                         offered: rec.seq,
                     });
                 }
-                let prior = &history[&head];
+                let prior = &self.slots[&rec.slot_id][&head];
                 if rec.prev != prior.record_hash() {
                     return Err(PeerError::BrokenChain { seq: rec.seq });
                 }
@@ -230,13 +292,16 @@ impl Peer {
                 }
             }
         }
-        history.insert(rec.seq, rec);
+        self.slots
+            .entry(rec.slot_id)
+            .or_default()
+            .insert(rec.seq, rec);
         Ok(())
     }
 
     /// The current head, or what a rolling-back peer claims is the head.
     pub fn slot_head(&self, slot: &SlotId) -> Option<&SlotRecord> {
-        let history = self.slots.get(slot)?;
+        let history = self.branch(slot)?;
         if self.hostility.rollback && history.len() > 1 {
             // Serve the record before the head. Signed, chained, and a lie by
             // omission -- caught by the client's pin, not by any signature.
@@ -248,7 +313,7 @@ impl Peer {
 
     /// The retained history for a chain walk (SPECS §5.3).
     pub fn slot_history(&self, slot: &SlotId, from: u64) -> Vec<SlotRecord> {
-        let Some(h) = self.slots.get(slot) else {
+        let Some(h) = self.branch(slot) else {
             return Vec::new();
         };
         let upper = self.slot_head(slot).map(|r| r.seq).unwrap_or(u64::MAX);
@@ -617,5 +682,152 @@ mod tests {
             nas_slots::verify_chain(&walk, slot(), &roster, None).is_ok(),
             "the short history must be internally valid -- that is what makes it dangerous"
         );
+    }
+}
+
+#[cfg(test)]
+mod fork_tests {
+    use super::*;
+    use nas_crypto::{Identity, Role};
+    use nas_slots::ROOT_NONCE_LEN;
+
+    fn ident(seed: u8) -> Identity {
+        Identity::derive(&[seed; 32], Role::Slot).unwrap()
+    }
+    fn slot() -> SlotId {
+        SlotId::new(b"ns", b"forked")
+    }
+    fn rec(id: &Identity, seq: u64, prev: [u8; 32], tag: &str) -> SlotRecord {
+        SlotRecord::sign(
+            id,
+            slot(),
+            seq,
+            Addr::of_ciphertext(tag.as_bytes()),
+            [1u8; ROOT_NONCE_LEN],
+            prev,
+            Regime::CasMerge,
+        )
+        .unwrap()
+    }
+
+    struct Scratch(PathBuf);
+    impl Scratch {
+        fn new(t: &str) -> Self {
+            let p = std::env::temp_dir().join(format!("nas-fork-{}-{t}", std::process::id()));
+            let _ = fs::remove_dir_all(&p);
+            Self(p)
+        }
+    }
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// Two writers race; the peer keeps both and shows each client its own.
+    fn forked_peer(tag: &str) -> (Scratch, Peer, Identity, Identity) {
+        let s = Scratch::new(tag);
+        let mut p = Peer::open(
+            &s.0,
+            Mode::E2ee,
+            Addressing::Content,
+            Hostility {
+                fork: true,
+                ..Hostility::HONEST
+            },
+        )
+        .unwrap();
+        let (a, b) = (ident(1), ident(2));
+        p.roster.add(a.verifying_key()).unwrap();
+        p.roster.add(b.verifying_key()).unwrap();
+        p.acl.grant("laptop", &[Right::Write]);
+
+        let g = rec(&a, 0, [0u8; 32], "genesis");
+        let h = g.record_hash();
+        p.publish_slot("laptop", g).unwrap();
+        // Both writers publish seq 1 against the same predecessor. An honest
+        // peer refuses the second; this one keeps it.
+        p.publish_slot("laptop", rec(&a, 1, h, "branch-a")).unwrap();
+        p.publish_slot("laptop", rec(&b, 1, h, "branch-b")).unwrap();
+        (s, p, a, b)
+    }
+
+    #[test]
+    fn a_forking_peer_serves_two_clients_two_histories() {
+        let (_s, mut p, _, _) = forked_peer("two-views");
+        p.set_view(0);
+        let a = p.slot_head(&slot()).unwrap().clone();
+        p.set_view(1);
+        let b = p.slot_head(&slot()).unwrap().clone();
+
+        assert_eq!(a.seq, b.seq, "a fork is two records at ONE sequence");
+        assert_ne!(
+            a.record_hash(),
+            b.record_hash(),
+            "the peer served one history twice"
+        );
+    }
+
+    #[test]
+    fn each_branch_verifies_on_its_own_which_is_what_makes_it_dangerous() {
+        // Neither client can tell from its own view. Every record is genuinely
+        // signed -- the peer forged nothing, it merely kept a loser.
+        let (_s, mut p, a, b) = forked_peer("both-verify");
+        let mut roster = Roster::new();
+        roster.add(a.verifying_key()).unwrap();
+        roster.add(b.verifying_key()).unwrap();
+
+        for view in [0u8, 1] {
+            p.set_view(view);
+            let walk = p.slot_history(&slot(), 0);
+            assert_eq!(walk.len(), 2, "view {view}");
+            nas_slots::verify_chain(&walk, slot(), &roster, None)
+                .unwrap_or_else(|e| panic!("view {view} did not verify: {e}"));
+        }
+    }
+
+    #[test]
+    fn an_honest_peer_refuses_the_second_write_instead_of_forking() {
+        let s = Scratch::new("honest-cas");
+        let mut p = Peer::open(&s.0, Mode::E2ee, Addressing::Content, Hostility::HONEST).unwrap();
+        let (a, b) = (ident(1), ident(2));
+        p.roster.add(a.verifying_key()).unwrap();
+        p.roster.add(b.verifying_key()).unwrap();
+        p.acl.grant("laptop", &[Right::Write]);
+        let g = rec(&a, 0, [0u8; 32], "genesis");
+        let h = g.record_hash();
+        p.publish_slot("laptop", g).unwrap();
+        p.publish_slot("laptop", rec(&a, 1, h, "branch-a")).unwrap();
+        assert!(matches!(
+            p.publish_slot("laptop", rec(&b, 1, h, "branch-b")),
+            Err(PeerError::CasConflict { .. })
+        ));
+        // And the view makes no difference to an honest peer.
+        p.set_view(1);
+        assert_eq!(p.slot_head(&slot()).unwrap().seq, 1);
+        assert_eq!(p.slot_history(&slot(), 0).len(), 2);
+    }
+
+    #[test]
+    fn the_two_branches_yield_a_real_fork_proof() {
+        // The end-to-end point: two clients observing one forking peer produce
+        // witnesses that combine into a publishable proof. Before this flag was
+        // wired, ForkProof was only ever fed hand-built witnesses.
+        use nas_slots::Witness;
+        let (_s, mut p, _, _) = forked_peer("proof");
+        let wa_id = Identity::derive(&[10u8; 32], Role::Witness).unwrap();
+        let wb_id = Identity::derive(&[11u8; 32], Role::Witness).unwrap();
+
+        p.set_view(0);
+        let head_a = p.slot_head(&slot()).unwrap().clone();
+        p.set_view(1);
+        let head_b = p.slot_head(&slot()).unwrap().clone();
+
+        let wa = Witness::sign(&wa_id, slot(), head_a.seq, head_a.sig_hash(), 0).unwrap();
+        let wb = Witness::sign(&wb_id, slot(), head_b.seq, head_b.sig_hash(), 0).unwrap();
+        let proof = nas_slots::ForkProof::try_new(&wa, &wb)
+            .expect("two clients on a forking peer must be able to prove it");
+        assert!(proof.verify());
+        assert_eq!(proof.seq, 1);
     }
 }

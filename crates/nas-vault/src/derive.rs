@@ -123,24 +123,14 @@ mod tests {
         // two passphrase namespaces is stored twice. Asserted so the trade-off
         // is a fact of the test suite and not only of the documentation.
         use nas_core::Addr;
-        use nas_crypto::{chunk_key, seal};
+        use nas_crypto::seal_chunk;
 
         let a = NamespaceSecrets::from_dek(&DEK);
         let b = NamespaceSecrets::from_dek(&[0x22; 32]);
         let plaintext = b"the same family photo in two namespaces";
 
-        let ca = seal(
-            &chunk_key(&a.convergence_secret(), plaintext),
-            plaintext,
-            b"",
-        )
-        .unwrap();
-        let cb = seal(
-            &chunk_key(&b.convergence_secret(), plaintext),
-            plaintext,
-            b"",
-        )
-        .unwrap();
+        let (ca, _) = seal_chunk(&a.convergence_secret(), plaintext, b"").unwrap();
+        let (cb, _) = seal_chunk(&b.convergence_secret(), plaintext, b"").unwrap();
         assert_ne!(Addr::of_ciphertext(&ca), Addr::of_ciphertext(&cb));
     }
 

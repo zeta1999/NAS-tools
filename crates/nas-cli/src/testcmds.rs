@@ -9,7 +9,7 @@
 use crate::exit;
 use crate::repo::Repo;
 use nas_core::{Addr, PaddingProfile};
-use nas_crypto::{chunk_key, seal, ConvergenceSecret};
+use nas_crypto::{seal_chunk, ConvergenceSecret};
 use nas_store::{
     padding, BlobStore, Chunker, ChunkerConfig, Kind, ObjectWriter, TreeStore, CHUNK_AAD,
 };
@@ -314,8 +314,9 @@ fn attacker_addrs(
     let mut out = Vec::new();
     for chunk in ch.split(data) {
         let padded = padding::pad(profile, chunk).map_err(|e| e.to_string())?;
-        let key = chunk_key(cs, &padded);
-        let sealed = seal(&key, &padded, CHUNK_AAD).map_err(|e| e.to_string())?;
+        // Same one-shot derive-and-seal the writer uses — an attacker with the
+        // secret has exactly the writer's capability, not a weaker one.
+        let (sealed, _) = seal_chunk(cs, &padded, CHUNK_AAD).map_err(|e| e.to_string())?;
         out.push(Addr::of_ciphertext(&sealed));
     }
     Ok(out)

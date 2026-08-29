@@ -46,7 +46,7 @@ use crate::manifest::{ChunkRef, Kind, Manifest, ManifestError};
 use crate::padding::{self, PadError};
 use nas_core::{Addr, KeyScheme, PaddingProfile};
 use nas_crypto::{
-    chunk_key, chunk_key_from_stored, open_chunk, seal, ConvergenceSecret, CryptoError, KEY_LEN,
+    chunk_key_from_stored, open_chunk, seal_chunk, ConvergenceSecret, CryptoError, KEY_LEN,
 };
 use std::io::{self, Read, Write};
 
@@ -243,11 +243,14 @@ impl<'a> ObjectWriter<'a> {
                     // §4.2.1: keyed over the PADDED bytes. §3.1's table says
                     // "plaintext chunk", which is the same thing when the
                     // profile is `none` and is the looser of the two.
-                    let key = chunk_key(cs, &padded);
-                    let sealed = seal(&key, &padded, CHUNK_AAD)?;
-                    let ck: [u8; KEY_LEN] = *key
-                        .expose_derived()
-                        .expect("chunk_key always yields a content-derived key");
+                    //
+                    // `seal_chunk` derives and seals in one step on purpose:
+                    // the derived nonce is a function of the key, so sealing
+                    // any *other* plaintext under that key would reuse the
+                    // nonce. Deriving here and sealing there made that a
+                    // convention two call sites had to keep; it is now one
+                    // operation that cannot desynchronise.
+                    let (sealed, ck) = seal_chunk(cs, &padded, CHUNK_AAD)?;
                     (self.store.put(&sealed)?, ck)
                 }
                 Sealer::Plaintext { tenant_salt } => {

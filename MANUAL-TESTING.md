@@ -756,7 +756,61 @@ The shape, given 16 GB of RAM:
 - **Three nodes:** two `nas-peer` instances plus one `nas-peer --witness`, which
   is the minimum that makes §5.3's fork detection meaningful.
 
-Record observed output here as it lands.
+Built as planned: `docker/build.sh` compiles the static arm64 musl binary in a
+throwaway `rust:alpine` container, and `docker/Dockerfile` is `FROM scratch` +
+that one file. `tests/usecases/uc11_containers.sh` drives `docker/compose.yaml`
+(honest peer, hostile peer, witness — same image, only the command differs).
+
+**Environment note — colima can wedge after an interrupted start.** Observed
+once on colima 0.10.1: after an abrupt exit, `colima start` sat for more than
+seven minutes with the hostagent looping on *"user session is ready for ssh"*,
+and a plain `colima stop` then refused. What recovered it, without deleting the
+instance: `colima stop -f`, remove the stale lock/pid files under
+`~/.colima/_lima/colima/` and any leftover `~/.colima/_lima/_networks/user-v2/*.sock`,
+then `colima start` — which completed in 14 s and answered `docker info` from the
+host (server 29.2.1, 4 CPU, 6 GB). If a start exceeds a minute or two, it is
+wedged; waiting longer does not help.
+
+**Environment note — colima copies the host's proxy into dockerd.** If
+`colima start` runs in a shell that has `HTTP_PROXY`/`HTTPS_PROXY` set, colima
+writes them into the VM's `/etc/docker/daemon.json` as a `proxies` block (host
+gateway `192.168.5.2`). Every registry fetch then goes through that proxy and,
+when the proxy intercepts TLS, fails with `x509: certificate signed by unknown
+authority` — while `curl` inside the VM with the proxy env unset works, which
+makes it look like a daemon bug. Observed with a sandboxed shell's local proxy
+on colima 0.10.1 / docker 29.3.0. Fix without restarting the VM: remove the
+`proxies` key from `daemon.json`, `sudo systemctl restart docker`; or start
+colima from a shell without proxy variables.
+
+**Observed (colima 0.10.1, docker 29.3.0, compose v2.39.4, image `nas-node`
+arm64/linux, 2.0 MB static binary from `scratch`).** `docker/build.sh` built
+the image in one pass once the daemon could reach the registry. The drill
+`tests/usecases/uc11_containers.sh` brought up `peer` (:47341, honest),
+`witness` (:47342, witness-only) and `withhold` (:47343) and reproduced UC10
+exactly, this time across real container network boundaries (clients on the
+host reach the nodes through published ports, the nodes see the host gateway
+`172.18.0.1`):
+
+- device 1 published seq 0 and seq 1, both witnessed at :47342 — exit 0.
+- device 2 (fresh, opened by passphrase) accepted seq 1 from the honest peer,
+  pinned and witnessed it — exit 0; the witness then relayed 2 of 2.
+- the `peer` container was restarted as `--hostile rollback` on the same repo
+  and port.
+- device 1 and device 2 refused on their own pins, no witness consulted —
+  `refused: peer serves seq 0, but seq 1 was seen here before (rollback)`,
+  exit 2 each.
+- device 3 (brand new, no pin) *without* witness accepted the rolled-back
+  seq 0 — exit 0. The blind spot, as documented.
+- device 3 *with* witness refused: `seq 0, but seq 1 was witnessed
+  (rollback)`, exit 2.
+- device 3 against the withholding node with witness refused: `serves no
+  head, but seq 0 was witnessed (rollback or withholding)`, exit 2.
+
+Drill exit 0. The `handshake refused: peer closed mid-message` lines in the
+node logs are the drill's own readiness probes (bare TCP connects from the
+gateway), not client traffic. Nothing in the peer or client behaved
+differently in containers than in the localhost simulation (§12), which is the
+result this section was meant to establish.
 
 ## 11. Hostile peer drills — UC09 (M1)
 

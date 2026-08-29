@@ -12,8 +12,15 @@
 use crate::acl::{Acl, Decision, Right};
 use crate::hostile::Hostility;
 use nas_core::{Addr, Mode};
-use nas_slots::{Regime, Roster, SlotId, SlotRecord};
+use nas_slots::{Regime, Roster, SlotId, SlotRecord, Witness, WitnessError};
 use nas_store::{Addressing, BlobStore, StoreError};
+
+/// Witnesses retained per slot. A relay is append-only by design (SPECS
+/// §5.3), and an append-only store with no bound is an invitation to fill the
+/// peer's disk one signed observation at a time. Well above what a device
+/// population produces; a full slot refuses, it does not evict — evicting is
+/// how a relay would quietly become a withholding one.
+pub const MAX_WITNESSES_PER_SLOT: usize = 1024;
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -54,6 +61,18 @@ pub enum PeerError {
     Missing {
         addr: Addr,
     },
+    /// A witness that does not verify against the key it carries. Refused at
+    /// the relay so a client never has to wonder whether what it fetched was
+    /// checked: it re-verifies anyway (`ForkProof::try_new` insists), but a
+    /// relay that stores garbage is a relay that can be filled with garbage.
+    Witness(WitnessError),
+    /// The slot holds [`MAX_WITNESSES_PER_SLOT`] already.
+    WitnessesFull {
+        slot: SlotId,
+    },
+    /// A witness-only node (SPECS §5.3): it relays witnesses and does nothing
+    /// else, so it can hold no blobs and no capabilities to lose.
+    WitnessOnly,
 }
 
 impl std::fmt::Display for PeerError {
@@ -80,6 +99,16 @@ impl std::fmt::Display for PeerError {
                 write!(f, "{} is protected by retention", addr.to_hex())
             }
             Self::Missing { addr } => write!(f, "no blob {}", addr.to_hex()),
+            Self::Witness(e) => write!(f, "witness rejected: {e}"),
+            Self::WitnessesFull { slot } => write!(
+                f,
+                "slot {} already holds {MAX_WITNESSES_PER_SLOT} witnesses",
+                slot.to_hex()
+            ),
+            Self::WitnessOnly => write!(
+                f,
+                "witness-only node: relays witnesses and holds no blobs, slots or caps (SPECS §5.3)"
+            ),
         }
     }
 }
@@ -128,6 +157,15 @@ pub struct Peer {
     /// Addresses that may not be swept (SPECS §16). Extend-only in the honest
     /// peer: shrinking it is what `ignore_retention` models.
     retention: std::collections::BTreeSet<[u8; 32]>,
+    /// Relayed witness observations, `slot -> (witness id, seq) -> witness`
+    /// (SPECS §5.3). One per observer per sequence: a witness re-observing
+    /// the same head replaces its earlier note rather than accumulating.
+    witnesses: BTreeMap<SlotId, BTreeMap<([u8; 32], u64), Witness>>,
+    /// Serve the witness relay and refuse everything else (SPECS §5.3, "a
+    /// witness-only node holds no blobs and no caps"). Enforced at the
+    /// dispatch, where every request passes; a flag the store consulted
+    /// per method would be one forgotten method away from holding a blob.
+    pub witness_only: bool,
     pub hostility: Hostility,
 }
 
@@ -151,6 +189,8 @@ impl Peer {
             acl: Acl::new(),
             subjects: BTreeMap::new(),
             retention: std::collections::BTreeSet::new(),
+            witnesses: BTreeMap::new(),
+            witness_only: false,
             hostility,
         };
         peer.load()?;
@@ -198,11 +238,90 @@ impl Peer {
                 self.retention.insert(a);
             }
         }
+        // Witnesses come back the same way slots do, and are re-verified on
+        // the way in: a file someone edited on disk is dropped, not relayed.
+        if let Ok(rd) = fs::read_dir(self.root.join("witnesses")) {
+            for e in rd.flatten() {
+                let Ok(files) = fs::read_dir(e.path()) else {
+                    continue;
+                };
+                for f in files.flatten() {
+                    let Ok(bytes) = fs::read(f.path()) else {
+                        continue;
+                    };
+                    if let Ok(w) = Witness::decode(&bytes) {
+                        if w.verify().is_ok() {
+                            self.witnesses
+                                .entry(w.slot_id)
+                                .or_default()
+                                .insert((w.witness_id(), w.seq), w);
+                        }
+                    }
+                }
+            }
+        }
         Ok(())
     }
 
     fn slot_dir(&self, slot: &SlotId) -> PathBuf {
         self.root.join("slots").join(slot.to_hex())
+    }
+
+    fn persist_witness(&self, w: &Witness) -> Result<(), PeerError> {
+        let dir = self.root.join("witnesses").join(w.slot_id.to_hex());
+        fs::create_dir_all(&dir)?;
+        let bytes = w.encode().map_err(PeerError::Witness)?;
+        let name = format!(
+            "{}-{}",
+            w.witness_id()
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>(),
+            w.seq
+        );
+        let tmp = dir.join(format!("{name}.tmp"));
+        fs::write(&tmp, &bytes)?;
+        fs::rename(&tmp, dir.join(name))?;
+        Ok(())
+    }
+
+    // ── Witness relay (SPECS §5.3) ──────────────────────────────────────
+
+    /// Accept a signed observation for relay.
+    ///
+    /// No ACL right gates this: a witness carries its own key and proves its
+    /// own authenticity, and the roster that decides whether it is *believed*
+    /// lives in the client (`nas_slots::client`), not here. What the relay
+    /// enforces is that it holds only things that verify, and only so many.
+    pub fn publish_witness(&mut self, w: Witness) -> Result<(), PeerError> {
+        w.verify().map_err(PeerError::Witness)?;
+        let key = (w.witness_id(), w.seq);
+        let held = self.witnesses.get(&w.slot_id);
+        if held.map(|m| !m.contains_key(&key) && m.len() >= MAX_WITNESSES_PER_SLOT) == Some(true) {
+            return Err(PeerError::WitnessesFull { slot: w.slot_id });
+        }
+        // Persisted before it is acknowledged, like a slot record: a client
+        // told its observation was relayed must find it there after a restart.
+        self.persist_witness(&w)?;
+        self.witnesses.entry(w.slot_id).or_default().insert(key, w);
+        Ok(())
+    }
+
+    /// Everything observed for a slot, or nothing at all from a peer that
+    /// withholds witnesses.
+    ///
+    /// Withholding here is the attack SPECS §5.4 proves undetectable from a
+    /// single peer: the client sees an empty relay, which is what an honest
+    /// peer nobody has talked to also looks like. Only a second relay reveals
+    /// the difference, which is why the witness-only node exists.
+    pub fn witnesses(&self, slot: &SlotId) -> Vec<Witness> {
+        if self.hostility.withhold_witnesses {
+            return Vec::new();
+        }
+        self.witnesses
+            .get(slot)
+            .map(|m| m.values().cloned().collect())
+            .unwrap_or_default()
     }
 
     /// Persist one record. Written before it is acknowledged, so a crash
@@ -1173,5 +1292,101 @@ mod append_tests {
         assert!(!Mode::E2ee.peer_can_enforce_append_only());
         assert!(!Mode::Passphrase.peer_can_enforce_append_only());
         assert!(Mode::TransitOnly.peer_can_enforce_append_only());
+    }
+
+    // ---- witness relay (SPECS §5.3) ------------------------------------
+
+    fn slot() -> SlotId {
+        SlotId::new(b"ns", b"witnessed")
+    }
+
+    fn witness(observer: &Identity, seq: u64, sig_hash: [u8; 32]) -> Witness {
+        Witness::sign(observer, slot(), seq, sig_hash, seq).unwrap()
+    }
+
+    #[test]
+    fn a_witness_is_relayed_and_survives_restart() {
+        let s = Scratch::new("witness-relay");
+        let observer = Identity::derive(&[7; 32], Role::Witness).unwrap();
+        let w = witness(&observer, 3, [9; 32]);
+        {
+            let mut p =
+                Peer::open(&s.0, Mode::E2ee, Addressing::Content, Hostility::HONEST).unwrap();
+            // No roster, no ACL: the relay holds anything that verifies.
+            p.publish_witness(w.clone()).unwrap();
+            assert_eq!(p.witnesses(&slot()), vec![w.clone()]);
+            // Idempotent: the same observation twice is one entry.
+            p.publish_witness(w.clone()).unwrap();
+            assert_eq!(p.witnesses(&slot()).len(), 1);
+        }
+        let p = Peer::open(&s.0, Mode::E2ee, Addressing::Content, Hostility::HONEST).unwrap();
+        assert_eq!(
+            p.witnesses(&slot()),
+            vec![w],
+            "acknowledged witness must be there after a restart"
+        );
+        assert!(p.witnesses(&SlotId::new(b"ns", b"other")).is_empty());
+    }
+
+    #[test]
+    fn a_tampered_witness_is_refused_before_it_is_stored() {
+        let s = Scratch::new("witness-tamper");
+        let observer = Identity::derive(&[7; 32], Role::Witness).unwrap();
+        let mut w = witness(&observer, 3, [9; 32]);
+        w.seq = 4;
+        let mut p = Peer::open(&s.0, Mode::E2ee, Addressing::Content, Hostility::HONEST).unwrap();
+        assert!(matches!(p.publish_witness(w), Err(PeerError::Witness(_))));
+        assert!(p.witnesses(&slot()).is_empty());
+        assert!(
+            !s.0.join("witnesses").exists()
+                || fs::read_dir(s.0.join("witnesses"))
+                    .unwrap()
+                    .next()
+                    .is_none(),
+            "nothing may reach disk for a witness that does not verify"
+        );
+    }
+
+    #[test]
+    fn the_per_slot_witness_cap_is_a_refusal_not_an_eviction() {
+        let s = Scratch::new("witness-cap");
+        let observer = Identity::derive(&[7; 32], Role::Witness).unwrap();
+        let mut p = Peer::open(&s.0, Mode::E2ee, Addressing::Content, Hostility::HONEST).unwrap();
+        for seq in 0..MAX_WITNESSES_PER_SLOT as u64 {
+            p.publish_witness(witness(&observer, seq, [1; 32])).unwrap();
+        }
+        let first = witness(&observer, 0, [1; 32]);
+        let extra = witness(&observer, MAX_WITNESSES_PER_SLOT as u64, [1; 32]);
+        assert!(matches!(
+            p.publish_witness(extra),
+            Err(PeerError::WitnessesFull { .. })
+        ));
+        // A re-publish of something already held is not "one more".
+        p.publish_witness(first.clone()).unwrap();
+        let held = p.witnesses(&slot());
+        assert_eq!(held.len(), MAX_WITNESSES_PER_SLOT);
+        assert!(
+            held.contains(&first),
+            "a full slot keeps what it has; it does not evict"
+        );
+    }
+
+    #[test]
+    fn a_withholding_peer_serves_an_empty_relay() {
+        let s = Scratch::new("witness-withhold");
+        let observer = Identity::derive(&[7; 32], Role::Witness).unwrap();
+        let h = Hostility {
+            withhold_witnesses: true,
+            ..Hostility::HONEST
+        };
+        let mut p = Peer::open(&s.0, Mode::E2ee, Addressing::Content, h).unwrap();
+        p.publish_witness(witness(&observer, 1, [2; 32])).unwrap();
+        // Indistinguishable from a peer nobody has talked to (SPECS §5.4).
+        assert!(p.witnesses(&slot()).is_empty());
+        // ...but the bytes are on disk: an honest restart of the same store
+        // would serve them, which is exactly what makes this withholding
+        // rather than loss.
+        let p = Peer::open(&s.0, Mode::E2ee, Addressing::Content, Hostility::HONEST).unwrap();
+        assert_eq!(p.witnesses(&slot()).len(), 1);
     }
 }

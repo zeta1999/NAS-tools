@@ -69,6 +69,14 @@ impl NamespaceSecrets {
         Identity::derive(&self.slot_seed, Role::Lease)
     }
 
+    /// The identity that signs this namespace's witness observations (SPECS
+    /// §5.3). Distinct from the slot key: a witness attests to what it *saw*,
+    /// and a key that can also write the history it attests to is not an
+    /// observer of it.
+    pub fn witness_identity(&self) -> Result<Identity, SignError> {
+        Identity::derive(&self.slot_seed, Role::Witness)
+    }
+
     /// The identity this namespace authenticates to a peer with (§3.1
     /// `Transport`). Distinct from the slot key by role separation: a peer
     /// learns this key from every handshake, and must not thereby learn

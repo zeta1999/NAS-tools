@@ -429,6 +429,10 @@ impl Repo {
             Secrets::Passphrase(ns, _) => match role {
                 Role::Lease => ns.lease_identity(),
                 Role::Transport => ns.transport_identity(),
+                // Previously folded into the slot key, so a passphrase
+                // namespace's witness was its own writer. An observer that can
+                // write what it observes is not an observer.
+                Role::Witness => ns.witness_identity(),
                 _ => ns.slot_identity(),
             }
             .map_err(|e| io::Error::other(e.to_string())),

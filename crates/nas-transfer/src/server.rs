@@ -8,7 +8,7 @@
 use crate::session::{Channel, SessionError};
 use crate::wire::{Request, Response, MAX_RECORDS};
 use nas_peer::{Peer, PeerError};
-use nas_slots::SlotRecord;
+use nas_slots::{SlotRecord, Witness};
 
 /// Handle one request against `peer`.
 ///
@@ -16,6 +16,13 @@ use nas_slots::SlotRecord;
 /// client must be able to tell "you may not do that" from "the peer went away",
 /// and dropping the socket makes every refusal look like a network fault.
 pub fn handle(peer: &mut Peer, subject: &str, req: Request) -> Response {
+    // A witness-only node (SPECS §5.3) answers the two relay requests and
+    // refuses the rest HERE, before any store is touched. "Holds no blobs and
+    // no caps" is a property of what it will accept, and this is the one
+    // place everything it accepts passes through.
+    if peer.witness_only && !matches!(req, Request::PublishWitness(_) | Request::Witnesses(_)) {
+        return Response::Error(PeerError::WitnessOnly.to_string());
+    }
     match req {
         Request::GetBlob(addr) => match peer.get_blob(&addr) {
             Ok(b) => Response::Blob(b),
@@ -55,11 +62,27 @@ pub fn handle(peer: &mut Peer, subject: &str, req: Request) -> Response {
             },
             Err(e) => Response::Error(format!("{e}")),
         },
-        // Witness relay is what a witness-only node exists for (SPECS §5.3).
-        // Not built yet, and saying so beats a silent success that would make a
-        // client believe its observation had been published.
-        Request::PublishWitness(_) | Request::Witnesses(_) => {
-            Response::Error("witness relay is not implemented".into())
+        // The witness relay (SPECS §5.3). Every peer relays; a witness-only
+        // node relays and does nothing else (see the top of this function).
+        Request::PublishWitness(bytes) => match Witness::decode(&bytes) {
+            Ok(w) => match peer.publish_witness(w) {
+                Ok(()) => Response::Ok,
+                Err(e) => Response::Error(e.to_string()),
+            },
+            Err(e) => Response::Error(format!("{e}")),
+        },
+        Request::Witnesses(slot) => {
+            let mut out = Vec::new();
+            for w in peer.witnesses(&slot) {
+                if out.len() == MAX_RECORDS {
+                    break;
+                }
+                match w.encode() {
+                    Ok(b) => out.push(b),
+                    Err(e) => return Response::Error(e.to_string()),
+                }
+            }
+            Response::Records(out)
         }
     }
 }

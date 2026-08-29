@@ -6,6 +6,7 @@
 //! that has no opinions of its own.
 
 mod aclcmd;
+mod attack;
 mod exit;
 mod peercmd;
 mod repo;
@@ -29,11 +30,12 @@ nas — NAS-tools command line
   nas peer grant <dir> <subject> <right>
   nas peer show <dir>
   nas peer serve <dir> --listen <host:port> [--hostile <spec>] [--mode <m>]
-                       [--salt <tenant.salt>] [--once]
+                       [--salt <tenant.salt>] [--once] [--witness]
   nas peer sync <ns> --peer <host:port> --peer-pub <transport.pub>
   nas test roundtrip <ns> <path>
   nas test dedup-ratio <ns> --shared <pct> --max-transfer <pct>
   nas test confirmation-attack <ns> --with-cs|--without-cs
+  nas test attack <kind>|all [--with-witness-node] [--cold-start]
 
 Exit codes: 0 ok, 1 error, 2 refused by policy, 3 unimplemented.
 ";
@@ -140,7 +142,7 @@ fn peer(args: &[String]) -> i32 {
         eprintln!(
             "usage: nas peer init|show <dir>\n       nas peer allow <dir> <subject> <transport.pub>\n       \
              nas peer writer <dir> <slot.pub>\n       nas peer grant <dir> <subject> <right>\n       \
-             nas peer serve <dir> --listen <host:port> [--hostile <spec>] [--once]\n       \
+             nas peer serve <dir> --listen <host:port> [--hostile <spec>] [--once] [--witness]\n       \
              nas peer sync <ns> --peer <host:port> --peer-pub <transport.pub>"
         );
         exit::ERROR
@@ -176,6 +178,7 @@ fn peer(args: &[String]) -> i32 {
                     mode: opt(args, "--mode"),
                     salt_file: opt(args, "--salt"),
                     once: flag(args, "--once"),
+                    witness: flag(args, "--witness"),
                 },
             )
         }
@@ -495,6 +498,19 @@ fn test(args: &[String]) -> i32 {
         Some("listing-is-local") => one_ns(&pos, testcmds::listing_is_local),
         Some("slot-signed") => one_ns(&pos, testcmds::slot_signed),
         Some("recover-without-vault") => one_ns(&pos, testcmds::recover_without_vault),
+        Some("attack") => match pos.get(1) {
+            Some(kind) => attack::attack(
+                kind,
+                attack::AttackOpts {
+                    with_witness_node: flag(args, "--with-witness-node"),
+                    cold_start: flag(args, "--cold-start"),
+                },
+            ),
+            None => {
+                eprintln!("usage: nas test attack <kind>|all [--with-witness-node] [--cold-start]");
+                exit::ERROR
+            }
+        },
         Some("cross-tenant-dedup") => match (pos.get(1), pos.get(2)) {
             (Some(ns), Some(other)) => testcmds::cross_tenant_dedup(ns, other),
             _ => {

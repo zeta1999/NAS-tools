@@ -42,8 +42,8 @@ use nas_core::{Addr, Mode};
 use nas_crypto::{Identity, Role};
 use nas_peer::{Acl, Hostility, Peer, Right};
 use nas_slots::{
-    verify_chain_with_handoffs, Regime, Roster, SlotHandoff, SlotId, SlotRecord, Witness,
-    ROOT_NONCE_LEN,
+    is_checkpoint_seq, verify_chain_with_handoffs, verify_skip_chain, Checkpoint, Regime, Roster,
+    SlotHandoff, SlotId, SlotRecord, Witness, ROOT_NONCE_LEN,
 };
 use nas_store::{Addressing, BlobStore};
 use nas_transfer::{transport_identity, Channel, Request, Response};
@@ -556,6 +556,39 @@ fn write_pin(repo: &Repo, seq: u64, record_hash: [u8; 32]) -> Result<(), String>
     fs::write(p, format!("{seq} {}\n", hex(&record_hash))).map_err(|e| format!("pin: {e}"))
 }
 
+/// The top rung of the ladder this device has seen (SPECS §5.5).
+///
+/// Kept separately from the record pin because it answers a different
+/// question: the record pin says which *record* was at a sequence, this says
+/// which *ladder* the peer was serving. A peer can roll one back without the
+/// other.
+fn cp_pin_path(repo: &Repo) -> PathBuf {
+    repo.root.join("state/peer-checkpoint")
+}
+
+fn write_cp_pin(repo: &Repo, seq: u64, hash: [u8; 32]) -> Result<(), String> {
+    let p = cp_pin_path(repo);
+    if let Some(dir) = p.parent() {
+        fs::create_dir_all(dir).map_err(|e| format!("checkpoint pin: {e}"))?;
+    }
+    fs::write(p, format!("{seq} {}\n", hex(&hash))).map_err(|e| format!("checkpoint pin: {e}"))
+}
+
+fn read_cp_pin(repo: &Repo) -> Option<(u64, [u8; 32])> {
+    let s = fs::read_to_string(cp_pin_path(repo)).ok()?;
+    let mut it = s.split_whitespace();
+    let seq: u64 = it.next()?.parse().ok()?;
+    let h = it.next()?;
+    if h.len() != 64 {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for (i, o) in out.iter_mut().enumerate() {
+        *o = u8::from_str_radix(&h[2 * i..2 * i + 2], 16).ok()?;
+    }
+    Some((seq, out))
+}
+
 fn read_pin(repo: &Repo) -> Option<Pin> {
     let s = fs::read_to_string(pin_path(repo)).ok()?;
     let mut it = s.split_whitespace();
@@ -849,6 +882,87 @@ pub fn sync(ns: &str, o: SyncOpts<'_>) -> i32 {
         );
     }
 
+    // ── Skip-chain ladder (SPECS §5.5) ──
+    //
+    // The rungs are asked for and verified before the head is believed,
+    // because the ladder answers a question the record walk cannot: this
+    // device pins the top rung it has seen, so a peer serving a *different*
+    // ladder — one that does not contain that rung — is caught the way a
+    // different record at a pinned sequence is.
+    //
+    // Anchored at the pin when there is one, which also means the peer may
+    // prune rungs below it; anchored at genesis otherwise, because a ladder
+    // that starts wherever the peer likes is not evidence of anything.
+    let cp_pin = read_cp_pin(&repo);
+    let (cp_from, cp_anchor) = match cp_pin {
+        Some((seq, hash)) => (seq, Some(hash)),
+        None => (0, None),
+    };
+    let rung_bytes = match call(
+        &mut ch,
+        &Request::Checkpoints {
+            slot,
+            from: cp_from,
+        },
+    ) {
+        Ok(Response::Records(rs)) => rs,
+        Ok(Response::Error(m)) => return refused(format!("checkpoints: {m}")),
+        Ok(other) => return err(format!("unexpected reply to Checkpoints: {other:?}")),
+        Err(e) => return err(e),
+    };
+    let mut rungs = Vec::with_capacity(rung_bytes.len());
+    for b in &rung_bytes {
+        match Checkpoint::decode(b) {
+            Ok(c) => rungs.push(c),
+            Err(e) => return refused(format!("peer served an undecodable checkpoint: {e}")),
+        }
+    }
+    let top: Option<Checkpoint> = if rungs.is_empty() {
+        if let Some((seq, _)) = cp_pin {
+            return refused(format!(
+                "peer serves no checkpoint at or above seq {seq}, which was pinned here (SPECS §5.5)"
+            ));
+        }
+        None
+    } else {
+        // An empty tail verifies the ladder on its own: links, signatures,
+        // roster and the anchor. The records it stands for are the chain walk
+        // below, and keeping the two separate is what lets each be reported
+        // for what it is.
+        match verify_skip_chain(&rungs, &[], slot, &roster, cp_anchor, &authorisations) {
+            Ok(w) => {
+                println!(
+                    "ladder: {} rung{} verified, seq {}..{}, {}",
+                    w.checkpoints,
+                    if w.checkpoints == 1 { "" } else { "s" },
+                    w.from_seq,
+                    w.head_seq,
+                    if cp_anchor.is_some() {
+                        "continuing the rung pinned here"
+                    } else {
+                        "from genesis"
+                    }
+                );
+                let top = rungs.last().cloned();
+                // A ladder this device verified is now its floor too, exactly
+                // as an accepted head becomes the record pin: what was *seen*
+                // here bounds a rollback, not only what was published here. A
+                // device that verified a ladder to seq 512 and did not pin it
+                // would accept the same peer dropping back to genesis
+                // tomorrow.
+                if let Some(c) = &top {
+                    if cp_pin.is_none_or(|(seq, _)| c.seq > seq) {
+                        if let Err(e) = write_cp_pin(&repo, c.seq, c.checkpoint_hash()) {
+                            return err(e);
+                        }
+                    }
+                }
+                top
+            }
+            Err(e) => return refused(format!("peer's checkpoint ladder does not verify: {e}")),
+        }
+    };
+
     // ── Chain walk (SPECS §5.3, mechanism 2) ──
     //
     // Everything at or below the served head that this namespace has a
@@ -1016,6 +1130,51 @@ pub fn sync(ns: &str, o: SyncOpts<'_>) -> i32 {
                 root.to_hex(),
                 slot.to_hex()
             );
+
+            // A rung every `CHECKPOINT_INTERVAL` records (SPECS §5.5), chained
+            // to the top of the ladder just verified. Chaining to the verified
+            // ladder rather than to whatever the peer last offered is the
+            // point: a rung is this device's own statement about its history,
+            // and it must not be built on something it did not check.
+            //
+            // A device that has never seen the ladder and is not at genesis
+            // does not start a second one. Two rungs at one sequence signed by
+            // the same key is equivocation — the exact evidence the peer keeps
+            // both of — and producing it by accident would be worse than
+            // skipping a rung.
+            if is_checkpoint_seq(seq) {
+                match (&top, seq) {
+                    (None, s) if s > 0 => println!(
+                        "  checkpoint at seq {s} skipped: no ladder is known here to extend"
+                    ),
+                    (prev, _) => {
+                        let c = match Checkpoint::of_record(&writer, &rec, prev.as_ref()) {
+                            Ok(c) => c,
+                            Err(e) => return err(format!("checkpoint sign: {e}")),
+                        };
+                        let bytes = match c.encode() {
+                            Ok(b) => b,
+                            Err(e) => return err(format!("checkpoint encode: {e}")),
+                        };
+                        match call(&mut ch, &Request::PublishCheckpoint(bytes)) {
+                            Ok(Response::Ok) => {}
+                            Ok(Response::Error(m)) => {
+                                return refused(format!("publish checkpoint {seq}: {m}"))
+                            }
+                            Ok(other) => {
+                                return err(format!(
+                                    "unexpected reply to PublishCheckpoint: {other:?}"
+                                ))
+                            }
+                            Err(e) => return err(e),
+                        }
+                        if let Err(e) = write_cp_pin(&repo, seq, c.checkpoint_hash()) {
+                            return err(e);
+                        }
+                        println!("  checkpointed seq {seq} (SPECS §5.5)");
+                    }
+                }
+            }
             (seq, rec.sig_hash())
         }
     };

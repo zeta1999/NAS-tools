@@ -8,7 +8,7 @@
 use crate::session::{Channel, SessionError};
 use crate::wire::{Request, Response, MAX_RECORDS};
 use nas_peer::{Peer, PeerError};
-use nas_slots::{SlotHandoff, SlotRecord, Witness};
+use nas_slots::{Checkpoint, SlotHandoff, SlotRecord, Witness};
 
 /// Handle one request against `peer`.
 ///
@@ -104,6 +104,33 @@ pub fn handle(peer: &mut Peer, subject: &str, req: Request) -> Response {
                     break;
                 }
                 match h.encode() {
+                    Ok(b) => out.push(b),
+                    Err(e) => return Response::Error(e.to_string()),
+                }
+            }
+            Response::Records(out)
+        }
+        // The skip chain (SPECS §5.5). The peer stores rungs and serves them
+        // in order; it does not link them, prune them or decide which of two
+        // conflicting rungs is real. That is the client's walk, against the
+        // anchor only the client holds.
+        Request::PublishCheckpoint(bytes) => match Checkpoint::decode(&bytes) {
+            Ok(c) => match peer.publish_checkpoint(c) {
+                Ok(()) => Response::Ok,
+                Err(e) => Response::Error(e.to_string()),
+            },
+            Err(e) => Response::Error(format!("{e}")),
+        },
+        Request::Checkpoints { slot, from } => {
+            let mut out = Vec::new();
+            for c in peer.checkpoints(&slot, from) {
+                // Bounded here as well as in the encoder, like the history
+                // walk: a client that hits the cap climbs from a higher
+                // `from`, which is the whole point of a ladder.
+                if out.len() == MAX_RECORDS {
+                    break;
+                }
+                match c.encode() {
                     Ok(b) => out.push(b),
                     Err(e) => return Response::Error(e.to_string()),
                 }

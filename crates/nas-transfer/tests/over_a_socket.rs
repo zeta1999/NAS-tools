@@ -9,7 +9,10 @@
 use nas_core::{Addr, Mode};
 use nas_crypto::{Identity as NasIdentity, Role};
 use nas_peer::{Hostility, Peer, Right};
-use nas_slots::{Regime, SlotHandoff, SlotId, SlotRecord, WriterId, ROOT_NONCE_LEN};
+use nas_slots::{
+    verify_skip_chain, Checkpoint, Regime, Roster, SlotHandoff, SlotId, SlotRecord, WriterId,
+    ROOT_NONCE_LEN,
+};
 use nas_store::{Addressing, BlobStore};
 use nas_transfer::{Channel, Request, Response};
 use simple_network::security::pqc::Identity;
@@ -547,6 +550,181 @@ fn a_witness_only_node_relays_witnesses_and_still_holds_no_handoffs() {
     for req in [
         Request::PublishHandoff(handoff_at(1).encode().unwrap()),
         Request::Handoffs(slot()),
+    ] {
+        match ch.call(&req).unwrap() {
+            Response::Error(m) => assert!(m.contains("witness-only"), "{req:?}: {m}"),
+            other => panic!("{req:?} was accepted: {other:?}"),
+        }
+    }
+}
+
+// ── Skip-chain checkpoints over the wire (SPECS §5.5) ──────────────────────
+
+/// A ladder every `every` records over `records`.
+fn ladder(id: &NasIdentity, records: &[SlotRecord], every: u64) -> Vec<Checkpoint> {
+    let mut out: Vec<Checkpoint> = Vec::new();
+    for r in records.iter().filter(|r| r.seq.is_multiple_of(every)) {
+        let c = Checkpoint::of_record(id, r, out.last()).unwrap();
+        out.push(c);
+    }
+    out
+}
+
+fn history(n: u64) -> Vec<SlotRecord> {
+    let mut out = Vec::new();
+    let mut prev = [0u8; 32];
+    for seq in 0..n {
+        let r = record(&writer(), seq, prev, &format!("v{seq}"));
+        prev = r.record_hash();
+        out.push(r);
+    }
+    out
+}
+
+#[test]
+fn a_client_climbs_the_ladder_across_the_wire_instead_of_reading_every_record() {
+    // The §5.5 claim, end to end: fetch the rungs and the tail, and verify a
+    // head 39 records deep having read 10 of them.
+    let recs = history(40);
+    let cps = ladder(&writer(), &recs, 10);
+    let seeded = (recs.clone(), cps.clone());
+    let (_s, mut ch) = connected("skip", Hostility::HONEST, move |p| {
+        for r in seeded.0 {
+            p.publish_slot("laptop", r).unwrap();
+        }
+        for c in seeded.1 {
+            p.publish_checkpoint(c).unwrap();
+        }
+    });
+
+    let rungs = match ch
+        .call(&Request::Checkpoints {
+            slot: slot(),
+            from: 0,
+        })
+        .unwrap()
+    {
+        Response::Records(rs) => rs
+            .iter()
+            .map(|b| Checkpoint::decode(b).unwrap())
+            .collect::<Vec<_>>(),
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(rungs.len(), 4, "rungs at 0, 10, 20, 30");
+
+    let top = rungs.last().unwrap().seq;
+    let tail = match ch
+        .call(&Request::SlotHistory {
+            slot: slot(),
+            from: top,
+        })
+        .unwrap()
+    {
+        Response::Records(rs) => rs
+            .iter()
+            .map(|b| SlotRecord::decode(b).unwrap())
+            .collect::<Vec<_>>(),
+        other => panic!("{other:?}"),
+    };
+
+    let mut roster = Roster::new();
+    roster.add(writer().verifying_key()).unwrap();
+    let walk = verify_skip_chain(&rungs, &tail, slot(), &roster, None, &[]).unwrap();
+    assert_eq!(walk.head_seq, 39);
+    assert_eq!(walk.head_hash, recs[39].record_hash());
+    assert_eq!(walk.records, 10);
+    assert_eq!(walk.skipped, 30, "and it does not pretend otherwise");
+}
+
+#[test]
+fn the_ladder_is_served_from_a_height_so_an_anchored_client_asks_for_less() {
+    let recs = history(40);
+    let cps = ladder(&writer(), &recs, 10);
+    let seeded = cps.clone();
+    let (_s, mut ch) = connected("skip-from", Hostility::HONEST, move |p| {
+        for c in seeded {
+            p.publish_checkpoint(c).unwrap();
+        }
+    });
+
+    match ch
+        .call(&Request::Checkpoints {
+            slot: slot(),
+            from: 20,
+        })
+        .unwrap()
+    {
+        Response::Records(rs) => {
+            let got: Vec<u64> = rs
+                .iter()
+                .map(|b| Checkpoint::decode(b).unwrap().seq)
+                .collect();
+            assert_eq!(got, vec![20, 30]);
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn a_peer_that_drops_a_rung_cannot_hide_it() {
+    // The ladder is hash-linked, so a peer serving a subset of it serves
+    // something that does not verify -- which is the difference between a
+    // chain of checkpoints and a pile of signed claims.
+    let recs = history(40);
+    let cps = ladder(&writer(), &recs, 10);
+    let mut roster = Roster::new();
+    roster.add(writer().verifying_key()).unwrap();
+
+    let cut = vec![cps[0].clone(), cps[2].clone(), cps[3].clone()];
+    assert!(verify_skip_chain(&cut, &recs[30..], slot(), &roster, None, &[]).is_err());
+}
+
+#[test]
+fn a_rung_from_an_unrostered_writer_is_refused_over_the_wire() {
+    let stranger = NasIdentity::derive(&[42u8; 32], Role::Slot).unwrap();
+    let (_s, mut ch) = connected("skip-stranger", Hostility::HONEST, |_| {});
+    let g = record(&stranger, 0, [0u8; 32], "g");
+    let c = Checkpoint::of_record(&stranger, &g, None).unwrap();
+    match ch
+        .call(&Request::PublishCheckpoint(c.encode().unwrap()))
+        .unwrap()
+    {
+        Response::Error(_) => {}
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn undecodable_checkpoint_bytes_are_a_refusal_not_a_disconnect() {
+    let (_s, mut ch) = connected("skip-junk", Hostility::HONEST, |_| {});
+    match ch
+        .call(&Request::PublishCheckpoint(vec![0xFF; 40]))
+        .unwrap()
+    {
+        Response::Error(_) => {}
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(
+        ch.call(&Request::Checkpoints {
+            slot: slot(),
+            from: 0
+        })
+        .unwrap(),
+        Response::Records(vec![])
+    );
+}
+
+#[test]
+fn a_witness_only_node_holds_no_ladder_either() {
+    let (_s, mut ch) = connected("witness-only-skip", Hostility::HONEST, |p| {
+        p.witness_only = true;
+    });
+    for req in [
+        Request::PublishCheckpoint(vec![1u8; 10]),
+        Request::Checkpoints {
+            slot: slot(),
+            from: 0,
+        },
     ] {
         match ch.call(&req).unwrap() {
             Response::Error(m) => assert!(m.contains("witness-only"), "{req:?}: {m}"),

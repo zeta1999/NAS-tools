@@ -8,8 +8,8 @@ MANUAL-TESTING.md §7. **M1 is in progress:** the peer, the slot system and the
 transfer protocol are built and networked, and the CLI now drives them
 (`nas peer serve` / `nas peer sync`) — a namespace has been pushed over a real
 PQC socket between two `nas` processes on localhost, and again between three
-containers. The ownership handoff (§5.1) is built and served over the wire. Remaining
-M1: skip-chain checkpoints.
+containers. The ownership handoff (§5.1) and the skip-chain ladder (§5.5) are both built
+and served over the wire, which closes the last two M1 protocol items.
 
 `SPECS.md` is at **revision 5** (~1476 lines, 21 sections). It has survived one
 adversarial review (rev 1→2, 15 findings, all accepted), a round closing its own
@@ -236,6 +236,36 @@ chain crossing an authorised change still stops at `UnknownWriter` until a
 device can be told about another writer by something other than the peer. It
 changes no outcome today either way — every device of a namespace derives the
 same `Role::Slot` key, so the CLI has only ever had one writer per slot.
+
+**Skip-chain checkpoints (§5.5) are built.** A `Checkpoint` is the writer's
+signed assertion that the record at some sequence is a given hash and that the
+rung below it was a given checkpoint — hash-linked, so the ladder is a chain
+rather than a pile of independent claims, and a rung removed from the middle
+does not verify. `verify_skip_chain` climbs the ladder and then walks the tail
+records in full, which bounds the unverified span by the checkpoint interval:
+recent history, where an omission matters most, is never skipped.
+
+What it proves is stated in the type rather than left to the reader.
+`SkipWalk` reports `records` and `skipped` separately, because a skip walk
+proves the *writer* committed to this ancestry and does **not** prove the
+records between two rungs exist or chain — a peer may omit or substitute those
+unseen. It is strictly stronger than the degraded head-only path (which has no
+ancestry at all) and strictly weaker than a full walk, and §5.4 says to name
+that rather than round it up. Against a lying *writer* neither helps; that
+needs a second observer, which is what witnesses are for.
+
+`PublishCheckpoint` / `Checkpoints` carry it. The peer keeps **both** of two
+conflicting rungs at one sequence: the writer equivocating about its own
+history is evidence, and choosing which branch to keep is the one thing a
+distrusted peer must not decide. `nas peer sync` publishes a rung every 256
+records, verifies the served ladder against a pinned top rung, and pins a
+ladder it merely verified as well as one it published — so a peer that drops
+or replaces the ladder is refused by a device that never wrote a rung.
+Demonstrated across processes in MANUAL-TESTING §14.
+
+The saving §5.5 exists for is not yet taken: sync verifies the ladder but
+still walks the full retained history for the head, because nothing in this
+repo yet produces the 1024+ records where climbing would beat walking.
 
 **The deletion approval loop (§16.2) is built** (`crates/nas-delete`):
 `DeleteRequest` / `DeleteApproval` / `DeleteExecution`, quorum scaled by blast

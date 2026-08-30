@@ -112,6 +112,14 @@ pub enum Request {
     /// Every handoff a peer holds for a slot, so a client walking history
     /// across an ownership change can ask once rather than guess.
     Handoffs(SlotId),
+    /// An encoded `Checkpoint` (SPECS §5.5).
+    PublishCheckpoint(Vec<u8>),
+    /// The skip-chain ladder from `from` upwards, so a client far behind
+    /// climbs it instead of reading every record.
+    Checkpoints {
+        slot: SlotId,
+        from: u64,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -142,6 +150,8 @@ const REQ_PUBLISH_WITNESS: u8 = 7;
 const REQ_WITNESSES: u8 = 8;
 const REQ_PUBLISH_HANDOFF: u8 = 9;
 const REQ_HANDOFFS: u8 = 10;
+const REQ_PUBLISH_CHECKPOINT: u8 = 11;
+const REQ_CHECKPOINTS: u8 = 12;
 
 const RSP_BLOB: u8 = 0;
 const RSP_BOOL: u8 = 1;
@@ -176,6 +186,10 @@ impl Request {
             Self::Witnesses(s) => encode_fields(&[&[REQ_WITNESSES], s.as_bytes()])?,
             Self::PublishHandoff(h) => encode_fields(&[&[REQ_PUBLISH_HANDOFF], h])?,
             Self::Handoffs(s) => encode_fields(&[&[REQ_HANDOFFS], s.as_bytes()])?,
+            Self::PublishCheckpoint(c) => encode_fields(&[&[REQ_PUBLISH_CHECKPOINT], c])?,
+            Self::Checkpoints { slot, from } => {
+                encode_fields(&[&[REQ_CHECKPOINTS], slot.as_bytes(), &from.to_le_bytes()])?
+            }
         };
         check_size(out)
     }
@@ -246,6 +260,17 @@ impl Request {
             REQ_HANDOFFS => {
                 want(2)?;
                 Self::Handoffs(SlotId::from_bytes(fixed::<32>("slot", f[1])?))
+            }
+            REQ_PUBLISH_CHECKPOINT => {
+                want(2)?;
+                Self::PublishCheckpoint(f[1].to_vec())
+            }
+            REQ_CHECKPOINTS => {
+                want(3)?;
+                Self::Checkpoints {
+                    slot: SlotId::from_bytes(fixed::<32>("slot", f[1])?),
+                    from: u64::from_le_bytes(fixed::<8>("from", f[2])?),
+                }
             }
             other => return Err(WireError::UnknownTag { tag: other }),
         })
@@ -416,6 +441,11 @@ mod tests {
             Request::Witnesses(slot()),
             Request::PublishHandoff(vec![3u8; 200]),
             Request::Handoffs(slot()),
+            Request::PublishCheckpoint(vec![4u8; 200]),
+            Request::Checkpoints {
+                slot: slot(),
+                from: 256,
+            },
         ]
     }
 
@@ -449,6 +479,8 @@ mod tests {
             Request::Witnesses(_) => "Witnesses",
             Request::PublishHandoff(_) => "PublishHandoff",
             Request::Handoffs(_) => "Handoffs",
+            Request::PublishCheckpoint(_) => "PublishCheckpoint",
+            Request::Checkpoints { .. } => "Checkpoints",
         }
     }
 
@@ -469,6 +501,8 @@ mod tests {
             "Witnesses",
             "PublishHandoff",
             "Handoffs",
+            "PublishCheckpoint",
+            "Checkpoints",
         ];
         let have: std::collections::BTreeSet<&str> = requests().iter().map(name).collect();
         for n in ALL {

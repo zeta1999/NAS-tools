@@ -150,10 +150,21 @@ settled and the work that follows from them.
       a SlotRecord is 3502 B of which 3309 B is signature — **103x the 32-byte
       root address it authenticates**, which is the number behind SPECS §3.8.
       A witness is 5365 B, so a fork proof costs 10730 B.
-- [ ] Skip-chain checkpoints (SPECS §5.5): retain-N=1024 with a signed
-      checkpoint every 256 records, so a client 100k updates behind walks ~400
-      checkpoints rather than 100k records. The degraded path already exists
-      (`Verdict::Degraded`); the checkpoints that avoid needing it do not.
+- [x] Skip-chain checkpoints (SPECS §5.5) — `Checkpoint` in `nas-slots`,
+      hash-linked and signed at every rung, `verify_skip_chain` walking a
+      ladder then the tail records in full. On the wire as
+      `PublishCheckpoint` / `Checkpoints`; the peer stores rungs (bounded,
+      keeping *both* of two conflicting rungs because the writer equivocating
+      is evidence and the peer is not the party that judges it); `nas peer
+      sync` publishes a rung every 256 records and pins the top one, so a peer
+      serving a different ladder is refused the way a different record at a
+      pinned sequence is. Drill: `uc13_skip_chain.sh`, MANUAL-TESTING §14.
+- [ ] Use the ladder to *shorten* a walk. Today `verify_skip_chain` exists and
+      the ladder is verified on every sync, but `nas peer sync` still walks
+      the full retained history for the head — the saving §5.5 is for only
+      shows up past 1024 records, which nothing in this repo yet produces.
+      Wiring it needs the client to choose between the two walks and say which
+      one it did.
 - [x] Single-writer ownership handoff (SPECS §5.1) — `SlotHandoff` in
       `nas-slots`, signed by the **outgoing** writer, binding slot, sequence
       and both writers. `verify_chain_with_handoffs` accepts an authorised

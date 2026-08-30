@@ -11,6 +11,7 @@ mod exit;
 mod peercmd;
 mod repo;
 mod testcmds;
+mod worm;
 
 use nas_core::{KeyScheme, Mode, PaddingProfile};
 use repo::Repo;
@@ -265,11 +266,41 @@ fn ns(args: &[String]) -> i32 {
                     }
                 },
             };
-            for unsupported in ["--object-lock", "--retention"] {
-                if opt(args, unsupported).is_some() {
-                    return testcmds::unimplemented(unsupported, "M2 (§16)");
+            // Object Lock (SPECS §16.1). Recorded as policy; what is actually
+            // enforced today is printed below rather than implied.
+            let lock = match (opt(args, "--object-lock"), opt(args, "--retention")) {
+                (None, None) => None,
+                (Some(l), r) => {
+                    let Some(l) = repo::parse_object_lock(l) else {
+                        eprintln!(
+                            "unknown object-lock mode {l:?} (governance|compliance|legal-hold)"
+                        );
+                        return exit::ERROR;
+                    };
+                    // A period is required for governance and compliance: an
+                    // Object Lock with no horizon is a claim with no content.
+                    // A legal hold is indefinite by definition.
+                    let secs = match (l, r) {
+                        (repo::ObjectLock::LegalHold, None) => 0,
+                        (_, None) => {
+                            eprintln!("--object-lock {} needs --retention <7y|90d|…>", l.as_str());
+                            return exit::ERROR;
+                        }
+                        (_, Some(r)) => match repo::parse_retention(r) {
+                            Some(s) => s,
+                            None => {
+                                eprintln!("unparseable --retention {r:?} (try 7y, 90d, 24h)");
+                                return exit::ERROR;
+                            }
+                        },
+                    };
+                    Some((l, secs))
                 }
-            }
+                (None, Some(_)) => {
+                    eprintln!("--retention needs --object-lock <governance|compliance|legal-hold>");
+                    return exit::ERROR;
+                }
+            };
             if Repo::exists(name) {
                 eprintln!("namespace {name} already exists");
                 return exit::ERROR;
@@ -279,7 +310,7 @@ fn ns(args: &[String]) -> i32 {
                 eprintln!("passphrase mode needs --passphrase or $NAS_PASSPHRASE");
                 return exit::ERROR;
             }
-            match Repo::create(name, mode, KeyScheme::Convergent, padding, passphrase) {
+            match Repo::create(name, mode, KeyScheme::Convergent, padding, passphrase, lock) {
                 Ok(r) => {
                     println!("created {name} at {}", r.root.display());
                     println!(
@@ -288,6 +319,25 @@ fn ns(args: &[String]) -> i32 {
                         padding,
                         r.generation()
                     );
+                    if let Some((l, secs)) = lock {
+                        println!("  object-lock {}, retention {secs}s", l.as_str());
+                        // Say which half exists. §16.3's extend-only rule is
+                        // enforced by the peer today; the rest is not, and a
+                        // namespace that implied otherwise would be claiming a
+                        // protection it does not have.
+                        println!(
+                            "  ENFORCED: the retention set is extend-only — the everyday key can \
+                             add addresses and never drop one (SPECS §16.3, `nas test \
+                             retention-extend-only`)"
+                        );
+                        println!(
+                            "  NOT ENFORCED YET: the retention period itself, and shortening or \
+                             loosening the policy, which need the offline delete authority and its \
+                             quorum (SPECS §16.1-§16.2). `--object-lock {}` records intent; it does \
+                             not yet stop an owner who holds that key.",
+                            l.as_str()
+                        );
+                    }
                     // The writer id is what goes on a roster, so print it at
                     // creation rather than making the user derive it later.
                     match r.identity(nas_crypto::Role::Slot) {
@@ -334,8 +384,16 @@ fn ns(args: &[String]) -> i32 {
                         // would mean running Argon2id over 256 MiB first.
                         match Repo::describe(&n) {
                             Ok(d) => println!(
-                                "{n}\tmode={:?}\tkey_scheme={:?}\tpadding={:?}",
-                                d.mode, d.key_scheme, d.padding
+                                "{n}\tmode={:?}\tkey_scheme={:?}\tpadding={:?}{}",
+                                d.mode,
+                                d.key_scheme,
+                                d.padding,
+                                match (d.object_lock, d.retention_secs) {
+                                    (Some(l), Some(s)) =>
+                                        format!("\tobject_lock={}\tretention={s}s", l.as_str()),
+                                    (Some(l), None) => format!("\tobject_lock={}", l.as_str()),
+                                    _ => String::new(),
+                                }
                             ),
                             Err(e) => println!("{n}\tUNREADABLE: {e}"),
                         }
@@ -516,6 +574,17 @@ fn test(args: &[String]) -> i32 {
             }
         },
         Some("fork-detect-via-witness") => attack::fork_detect_via_witness(),
+        Some("retention-extend-only") => one_ns(&pos, worm::retention_extend_only),
+        Some("retention-shrink") => match pos.get(1) {
+            Some(ns) => worm::retention_shrink(ns, opt(args, "--key")),
+            None => {
+                eprintln!(
+                    "usage: nas test retention-shrink <ns> --key <everyday|delete-authority>"
+                );
+                exit::ERROR
+            }
+        },
+        Some("lease-cycle") => one_ns(&pos, worm::lease_cycle),
         Some("witness-node-holds-nothing") => attack::witness_node_holds_nothing(),
         Some("cross-tenant-dedup") => match (pos.get(1), pos.get(2)) {
             (Some(ns), Some(other)) => testcmds::cross_tenant_dedup(ns, other),

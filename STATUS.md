@@ -203,9 +203,29 @@ TLC is green with its three sanity checks still failing as required.
 
 ## Not built
 
-M2: lease-based GC with a caller and the lease-griefing quota,
-retention/Object Lock enforcement, quota admission (§6.4), and the
-single-writer handoff (§5.1). Fork detection over the wire against a live
+M2: the deletion approval loop (§16.2) — quorum, cooling-off, approval
+replay, and the `put`/`rm`/`delete-request` verbs that exercise it — plus the
+single-writer handoff (§5.1). Those are the 14 assertions still failing at
+`NAS_MILESTONE=M2`, nine of them in UC04.
+
+Lease-based GC **has** a caller now: `Peer::sweep` plans with
+`nas_lease::plan_sweep` and deletes through `delete_blob`, so retention is
+applied twice — as the floor handed to the planner, and again on the way out.
+Quota breaches are reported and never enforced by deleting (§6.4), which is
+the point: an accounting dispute must not become data loss. Retention is
+enforced as SPECS §16.3 specifies it — `Peer::publish_retention` takes the
+whole proposed set and refuses any publish that drops an address, a plaintext
+comparison the peer can make without reading anything.
+
+**What Object Lock does and does not do today.** `nas ns create --object-lock
+<governance|compliance|legal-hold> --retention <7y>` records the policy in the
+plaintext config, and `ns create` prints which half is live: the extend-only
+retention set is enforced; the retention *period*, and shortening or loosening
+the policy, are not — they need the offline delete authority and its quorum
+(§16.1–§16.2), which is unbuilt. A namespace created this way is not yet proof
+against an owner who holds that key, and says so on creation.
+
+Fork detection over the wire against a live
 forking peer now exists (`tests/usecases/uc12_fork_drill.sh`,
 MANUAL-TESTING.md §13): `nas peer sync` walks the peer's retained history
 from the lowest witnessed or pinned sequence and compares each witness and

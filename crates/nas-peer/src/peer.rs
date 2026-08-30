@@ -11,7 +11,8 @@
 
 use crate::acl::{Acl, Decision, Right};
 use crate::hostile::Hostility;
-use nas_core::{Addr, Mode};
+use nas_core::{Addr, Mode, Timestamp};
+use nas_lease::{plan_sweep, BlobInfo, GcPolicy, Holder, SweepPlan};
 use nas_slots::{Regime, Roster, SlotId, SlotRecord, Witness, WitnessError};
 use nas_store::{Addressing, BlobStore, StoreError};
 
@@ -73,6 +74,17 @@ pub enum PeerError {
     /// A witness-only node (SPECS §5.3): it relays witnesses and does nothing
     /// else, so it can hold no blobs and no capabilities to lose.
     WitnessOnly,
+    /// A retention publish that would drop an address (SPECS §16.3).
+    ///
+    /// The everyday write key may only ever *extend* the set. Shrinking it, or
+    /// pulling in the expiry, needs the offline delete authority and a §16.2
+    /// quorum — which is what stops ransomware holding the laptop's key from
+    /// clearing the protection before it deletes.
+    RetentionShrink {
+        dropped: Addr,
+        had: usize,
+        offered: usize,
+    },
 }
 
 impl std::fmt::Display for PeerError {
@@ -108,6 +120,17 @@ impl std::fmt::Display for PeerError {
             Self::WitnessOnly => write!(
                 f,
                 "witness-only node: relays witnesses and holds no blobs, slots or caps (SPECS §5.3)"
+            ),
+            Self::RetentionShrink {
+                dropped,
+                had,
+                offered,
+            } => write!(
+                f,
+                "retention may only be extended under the everyday key: \
+                 offered {offered} addresses, held {had}, dropping {} \
+                 (shrinking needs the offline delete authority, SPECS §16.3)",
+                dropped.to_hex()
             ),
         }
     }
@@ -620,8 +643,46 @@ impl Peer {
         self.persist_retention()
     }
 
+    /// Publish a **complete** retention set (SPECS §16.3).
+    ///
+    /// Unlike [`extend_retention`](Self::extend_retention), which can only add
+    /// and so makes a shrink unrepresentable, this takes the whole proposed set
+    /// — the shape a client actually publishes — and enforces `new ⊇ old`. The
+    /// check is a plaintext set comparison, which is precisely why the peer can
+    /// perform it in an encrypted mode: it needs to understand addresses, not
+    /// manifests (SPECS §2.2).
+    ///
+    /// A peer running `--hostile ignore-retention` accepts the shrink. Nothing
+    /// here stops it, and §16.3 does not pretend otherwise: the client's defence
+    /// is re-reading the set and noticing, plus pairing the namespace with a
+    /// second peer, not the hope that this one behaves.
+    pub fn publish_retention(&mut self, proposed: &[Addr]) -> Result<(), PeerError> {
+        let offered: std::collections::BTreeSet<[u8; 32]> =
+            proposed.iter().map(|a| *a.as_bytes()).collect();
+        if !self.hostility.ignore_retention {
+            if let Some(dropped) = self.retention.difference(&offered).next() {
+                return Err(PeerError::RetentionShrink {
+                    dropped: Addr::from_bytes(*dropped),
+                    had: self.retention.len(),
+                    offered: offered.len(),
+                });
+            }
+        }
+        self.retention = offered;
+        self.persist_retention()
+    }
+
     pub fn retains(&self, addr: &Addr) -> bool {
         self.retention.contains(addr.as_bytes())
+    }
+
+    /// The retention set as addresses, so a client can re-read what the peer
+    /// claims to be protecting and compare it against what it published.
+    pub fn retention_set(&self) -> Vec<Addr> {
+        self.retention
+            .iter()
+            .map(|a| Addr::from_bytes(*a))
+            .collect()
     }
 
     pub fn retention_len(&self) -> usize {
@@ -638,6 +699,69 @@ impl Peer {
             return Err(PeerError::RetentionHold { addr: *addr });
         }
         Ok(self.blobs.remove(addr)?)
+    }
+
+    // ── Garbage collection (SPECS §6) ───────────────────────────────────
+
+    /// Every blob with the size and upload time a sweep decision needs.
+    ///
+    /// `uploaded_at` is the file's mtime. That is the peer's own record of
+    /// when it received the bytes, not a client claim — which matters, because
+    /// §6.2's grace period exists to protect a blob whose lease has not
+    /// arrived yet, and a client-supplied time would let that same client
+    /// extend its own immunity.
+    pub fn inventory(&self) -> Result<Vec<BlobInfo>, PeerError> {
+        let mut out = Vec::new();
+        for addr in self.blobs.addrs()? {
+            let m = fs::metadata(self.blobs.path(&addr))?;
+            let uploaded_at = Timestamp(
+                m.modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0),
+            );
+            out.push(BlobInfo {
+                addr,
+                size: m.len(),
+                uploaded_at,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Plan a sweep, and carry it out unless `dry_run` (SPECS §6, §16.3).
+    ///
+    /// The plan is returned whether or not anything was deleted, so a caller
+    /// can show it before acting — for the only data-destroying operation in
+    /// the system, the difference between a bug and an incident.
+    ///
+    /// Retention is applied **twice on purpose**: once as the floor handed to
+    /// [`plan_sweep`], and again by [`delete_blob`] on the way out. An honest
+    /// peer therefore cannot sweep a retained blob even if the planner were
+    /// wrong. A peer running `--hostile ignore-retention` hands the planner an
+    /// empty floor, and its `delete_blob` does not object either: that is the
+    /// go-silent attack of §16.3, where the client's protection is noticing,
+    /// not the peer's restraint.
+    pub fn sweep(
+        &mut self,
+        holders: &[Holder],
+        policy: &GcPolicy,
+        now: Timestamp,
+        dry_run: bool,
+    ) -> Result<SweepPlan, PeerError> {
+        let floor = if self.hostility.ignore_retention {
+            std::collections::BTreeSet::new()
+        } else {
+            self.retention.clone()
+        };
+        let plan = plan_sweep(&self.inventory()?, holders, &floor, policy, now);
+        if !dry_run {
+            for addr in &plan.delete {
+                self.delete_blob(addr)?;
+            }
+        }
+        Ok(plan)
     }
 }
 
@@ -1436,5 +1560,229 @@ mod append_tests {
         // rather than loss.
         let p = Peer::open(&s.0, Mode::E2ee, Addressing::Content, Hostility::HONEST).unwrap();
         assert_eq!(p.witnesses(&slot()).len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod worm_tests {
+    //! SPECS §16.3: retention overrides leases, and the everyday key may only
+    //! ever extend it.
+    use super::*;
+    use nas_lease::{sweep::DAY, LeaseSet};
+
+    struct Scratch(PathBuf);
+    impl Scratch {
+        fn new(tag: &str) -> Self {
+            let p = std::env::temp_dir().join(format!("nas-worm-{}-{tag}", std::process::id()));
+            let _ = fs::remove_dir_all(&p);
+            Self(p)
+        }
+    }
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn peer(tag: &str, h: Hostility) -> (Scratch, Peer) {
+        let s = Scratch::new(tag);
+        let p = Peer::open(&s.0, Mode::E2ee, Addressing::Content, h).unwrap();
+        (s, p)
+    }
+
+    /// Three stored blobs, returned in the order written.
+    fn seed(p: &Peer, n: usize) -> Vec<Addr> {
+        (0..n)
+            .map(|i| p.put_blob(format!("blob-{i}").as_bytes()).unwrap())
+            .collect()
+    }
+
+    /// Wall clock, because `inventory` reads the blob's mtime: a sweep test
+    /// with an invented epoch would classify every blob as young and pass
+    /// while sweeping nothing.
+    fn real_now() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+    }
+
+    /// Far enough after the blobs were written that the young-blob grace has
+    /// lapsed for all of them.
+    fn later() -> Timestamp {
+        Timestamp(real_now() + 200 * DAY)
+    }
+
+    fn holder(id: u8, leases: &[Addr], last_seen: u64) -> Holder {
+        Holder {
+            id: [id; 32],
+            set: LeaseSet::from_addrs(leases),
+            last_seen: Timestamp(last_seen),
+        }
+    }
+
+    #[test]
+    fn retention_may_be_extended_but_not_shrunk() {
+        let (_s, mut p) = peer("extend", Hostility::HONEST);
+        let a = seed(&p, 3);
+
+        p.publish_retention(&a[..2]).unwrap();
+        assert_eq!(p.retention_set().len(), 2);
+        // Extending: the whole set, plus one more.
+        p.publish_retention(&a).unwrap();
+        assert_eq!(p.retention_set().len(), 3);
+
+        // Dropping a[0] is a shrink, whatever else it adds.
+        match p.publish_retention(&a[1..]) {
+            Err(PeerError::RetentionShrink {
+                dropped,
+                had,
+                offered,
+            }) => {
+                assert_eq!(dropped, a[0]);
+                assert_eq!((had, offered), (3, 2));
+            }
+            other => panic!("a shrink was not refused: {other:?}"),
+        }
+        assert_eq!(
+            p.retention_set().len(),
+            3,
+            "a refused publish must not apply"
+        );
+        assert!(a.iter().all(|x| p.retains(x)));
+    }
+
+    #[test]
+    fn a_peer_ignoring_retention_accepts_the_shrink() {
+        // The adversary §16.3 names. Its existence is why the client re-reads
+        // the set instead of trusting the peer's acknowledgement.
+        let (_s, mut p) = peer(
+            "shrink-hostile",
+            Hostility {
+                ignore_retention: true,
+                ..Hostility::HONEST
+            },
+        );
+        let a = seed(&p, 2);
+        p.publish_retention(&a).unwrap();
+        p.publish_retention(&[]).unwrap();
+        assert_eq!(p.retention_set().len(), 0, "the hostile peer dropped it");
+    }
+
+    #[test]
+    fn going_silent_does_not_destroy_retained_data() {
+        // §16.3's central claim: GC is lease-driven, so a client that simply
+        // stops renewing would otherwise be able to delete a WORM namespace by
+        // saying nothing at all.
+        let (_s, mut p) = peer("go-silent", Hostility::HONEST);
+        let a = seed(&p, 3);
+        p.publish_retention(&a[..2]).unwrap();
+
+        // One holder, long expired, leasing everything. Blobs are old enough
+        // that the young-blob grace does not carry them either.
+        let now = later();
+        let h = holder(9, &a, real_now());
+        let plan = p.sweep(&[h], &GcPolicy::default(), now, false).unwrap();
+
+        assert_eq!(plan.delete, vec![a[2]], "only the unretained blob may go");
+        assert!(
+            p.has_blob(&a[0]) && p.has_blob(&a[1]),
+            "retained data survived"
+        );
+        assert!(
+            !p.has_blob(&a[2]),
+            "the sweep must actually delete something"
+        );
+        // ...and the holder is told what it lost (§6.3).
+        assert_eq!(plan.warnings.get(&[9u8; 32]), Some(&vec![a[2]]));
+    }
+
+    #[test]
+    fn a_peer_ignoring_retention_sweeps_it_anyway() {
+        let (_s, mut p) = peer(
+            "sweep-hostile",
+            Hostility {
+                ignore_retention: true,
+                ..Hostility::HONEST
+            },
+        );
+        let a = seed(&p, 2);
+        p.publish_retention(&a).unwrap();
+        let plan = p.sweep(&[], &GcPolicy::default(), later(), false).unwrap();
+        assert_eq!(plan.delete.len(), 2);
+        assert!(a.iter().all(|x| !p.has_blob(x)), "retention was ignored");
+    }
+
+    #[test]
+    fn a_dry_run_deletes_nothing() {
+        let (_s, mut p) = peer("dry", Hostility::HONEST);
+        let a = seed(&p, 2);
+        let plan = p.sweep(&[], &GcPolicy::default(), later(), true).unwrap();
+        assert_eq!(plan.delete.len(), 2, "the plan still names them");
+        assert!(a.iter().all(|x| p.has_blob(x)), "a dry run must not delete");
+    }
+
+    #[test]
+    fn a_young_blob_survives_with_no_lease_at_all() {
+        // §6.2: the race between upload and lease publication.
+        let (_s, mut p) = peer("young", Hostility::HONEST);
+        let a = seed(&p, 1);
+        let plan = p
+            .sweep(&[], &GcPolicy::default(), Timestamp(real_now()), true)
+            .unwrap();
+        assert!(plan.delete.is_empty());
+        assert_eq!(plan.keep, vec![(a[0], nas_lease::Keep::YoungBlob)]);
+    }
+
+    #[test]
+    fn an_expiring_holder_still_protects_and_is_warned() {
+        // §6.3's window: past expiry, inside grace. Nothing is deleted, and
+        // the returning client is the one that needs telling.
+        let (_s, mut p) = peer("expiring", Hostility::HONEST);
+        let a = seed(&p, 1);
+        let policy = GcPolicy::default();
+        let now = later();
+        let last = now.0 - policy.lease_expiry - policy.grace / 2;
+        let plan = p.sweep(&[holder(7, &a, last)], &policy, now, true).unwrap();
+        assert!(plan.delete.is_empty(), "inside grace, nothing may be swept");
+        assert_eq!(plan.keep, vec![(a[0], nas_lease::Keep::LeasedByExpiring)]);
+    }
+
+    #[test]
+    fn the_retention_set_survives_a_restart() {
+        let s = Scratch::new("persist");
+        let a = {
+            let mut p =
+                Peer::open(&s.0, Mode::E2ee, Addressing::Content, Hostility::HONEST).unwrap();
+            let a = seed(&p, 2);
+            p.publish_retention(&a).unwrap();
+            a
+        };
+        let p = Peer::open(&s.0, Mode::E2ee, Addressing::Content, Hostility::HONEST).unwrap();
+        assert!(
+            a.iter().all(|x| p.retains(x)),
+            "Object Lock that dies on restart is not Object Lock"
+        );
+    }
+
+    #[test]
+    fn quota_is_reported_never_enforced_by_deleting() {
+        // §6.4: a quota breach is an accounting dispute. Resolving it by
+        // destroying data would turn it into data loss.
+        let (_s, mut p) = peer("quota", Hostility::HONEST);
+        let a = seed(&p, 2);
+        let policy = GcPolicy {
+            max_leased_bytes: 1,
+            ..GcPolicy::default()
+        };
+        let plan = p
+            .sweep(&[holder(3, &a, later().0)], &policy, later(), false)
+            .unwrap();
+        assert!(
+            plan.over_quota.contains_key(&[3u8; 32]),
+            "the breach is reported"
+        );
+        assert!(plan.delete.is_empty(), "and nothing is deleted for it");
+        assert!(a.iter().all(|x| p.has_blob(x)));
     }
 }

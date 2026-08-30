@@ -515,6 +515,8 @@ fn test(args: &[String]) -> i32 {
                 exit::ERROR
             }
         },
+        Some("fork-detect-via-witness") => attack::fork_detect_via_witness(),
+        Some("witness-node-holds-nothing") => attack::witness_node_holds_nothing(),
         Some("cross-tenant-dedup") => match (pos.get(1), pos.get(2)) {
             (Some(ns), Some(other)) => testcmds::cross_tenant_dedup(ns, other),
             _ => {

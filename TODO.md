@@ -154,9 +154,16 @@ settled and the work that follows from them.
       checkpoint every 256 records, so a client 100k updates behind walks ~400
       checkpoints rather than 100k records. The degraded path already exists
       (`Verdict::Degraded`); the checkpoints that avoid needing it do not.
-- [ ] Single-writer ownership handoff (SPECS §5.1) — an explicit signed
-      operation. `verify_chain` currently refuses any writer change under that
-      regime, which is the recoverable mistake but not the specified behaviour.
+- [x] Single-writer ownership handoff (SPECS §5.1) — `SlotHandoff` in
+      `nas-slots`, signed by the **outgoing** writer, binding slot, sequence
+      and both writers. `verify_chain_with_handoffs` accepts an authorised
+      change and still refuses a takeover; plain `verify_chain` refuses every
+      change, which is the safe reading for a caller that was handed no
+      handoffs. The peer stores them (`publish_handoff`), survives a restart,
+      and consults them in `publish_slot`.
+- [ ] Serve handoffs over the wire. `nas-transfer` has no `PublishHandoff` /
+      `Handoffs` request yet, so a peer can only learn one in-process — which
+      is enough for the tests and not enough for two devices.
 - [x] `nas-peer` core: blob store, slot ordering + history, CAS enforcement,
       roster checks, retention holds, PoP responder, the rights vocabulary and
       a peer-evaluated ACL, and **all six `--hostile` behaviours as branches in

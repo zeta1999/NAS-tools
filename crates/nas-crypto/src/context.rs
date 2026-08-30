@@ -29,6 +29,10 @@ pub enum SigContext {
     DeleteExecution,
     Wrap,
     MirrorPublish,
+    /// SPECS §5.1: single-writer ownership handoff, signed by the *outgoing*
+    /// writer. A distinct context so a handoff can never be replayed as, or
+    /// mistaken for, any other statement that writer signs.
+    SlotHandoff,
 }
 
 impl SigContext {
@@ -47,11 +51,12 @@ impl SigContext {
             Self::DeleteExecution => b"nas-tools/sig/delete-execution/v1",
             Self::Wrap => b"nas-tools/sig/wrap/v1",
             Self::MirrorPublish => b"nas-tools/sig/mirror-publish/v1",
+            Self::SlotHandoff => b"nas-tools/sig/slot-handoff/v1",
         }
     }
 
     /// Every variant, so tests can assert the list is complete and distinct.
-    pub const ALL: [SigContext; 12] = [
+    pub const ALL: [SigContext; 13] = [
         Self::Slot,
         Self::Lease,
         Self::Checkpoint,
@@ -64,6 +69,7 @@ impl SigContext {
         Self::DeleteExecution,
         Self::Wrap,
         Self::MirrorPublish,
+        Self::SlotHandoff,
     ];
 }
 
@@ -101,12 +107,13 @@ mod tests {
     use std::collections::HashSet;
 
     #[test]
-    fn all_twelve_contexts_are_present_and_distinct() {
-        // SPECS §3.1 names twelve. A collision here would silently let one
+    fn every_context_is_present_and_distinct() {
+        // SPECS §3.1 names twelve; `SlotHandoff` is the thirteenth, added with
+        // §5.1's handoff record. A collision here would silently let one
         // object's signature be accepted for another.
-        assert_eq!(SigContext::ALL.len(), 12);
+        assert_eq!(SigContext::ALL.len(), 13);
         let set: HashSet<&[u8]> = SigContext::ALL.iter().map(|c| c.as_bytes()).collect();
-        assert_eq!(set.len(), 12, "signing contexts must be pairwise distinct");
+        assert_eq!(set.len(), 13, "signing contexts must be pairwise distinct");
     }
 
     /// Every KDF context string in this module.

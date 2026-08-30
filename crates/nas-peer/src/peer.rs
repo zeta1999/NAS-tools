@@ -13,7 +13,9 @@ use crate::acl::{Acl, Decision, Right};
 use crate::hostile::Hostility;
 use nas_core::{Addr, Mode, Timestamp};
 use nas_lease::{plan_sweep, BlobInfo, GcPolicy, Holder, SweepPlan};
-use nas_slots::{Regime, Roster, SlotId, SlotRecord, Witness, WitnessError};
+use nas_slots::{
+    HandoffError, Regime, Roster, SlotHandoff, SlotId, SlotRecord, Witness, WitnessError,
+};
 use nas_store::{Addressing, BlobStore, StoreError};
 
 /// Witnesses retained per slot. A relay is append-only by design (SPECS
@@ -74,6 +76,9 @@ pub enum PeerError {
     /// A witness-only node (SPECS §5.3): it relays witnesses and does nothing
     /// else, so it can hold no blobs and no capabilities to lose.
     WitnessOnly,
+    /// A handoff that does not verify, or that names writers this peer has no
+    /// reason to accept (SPECS §5.1).
+    Handoff(HandoffError),
     /// A retention publish that would drop an address (SPECS §16.3).
     ///
     /// The everyday write key may only ever *extend* the set. Shrinking it, or
@@ -121,6 +126,7 @@ impl std::fmt::Display for PeerError {
                 f,
                 "witness-only node: relays witnesses and holds no blobs, slots or caps (SPECS §5.3)"
             ),
+            Self::Handoff(e) => write!(f, "handoff rejected: {e}"),
             Self::RetentionShrink {
                 dropped,
                 had,
@@ -184,6 +190,10 @@ pub struct Peer {
     /// (SPECS §5.3). One per observer per sequence: a witness re-observing
     /// the same head replaces its earlier note rather than accumulating.
     witnesses: BTreeMap<SlotId, BTreeMap<([u8; 32], u64), Witness>>,
+    /// Ownership handoffs, `slot -> records` (SPECS §5.1). Kept per slot
+    /// because that is how they are consulted: one lookup per writer change
+    /// during a walk.
+    handoffs: BTreeMap<SlotId, Vec<SlotHandoff>>,
     /// Serve the witness relay and refuse everything else (SPECS §5.3, "a
     /// witness-only node holds no blobs and no caps"). Enforced at the
     /// dispatch, where every request passes; a flag the store consulted
@@ -213,6 +223,7 @@ impl Peer {
             subjects: BTreeMap::new(),
             retention: std::collections::BTreeSet::new(),
             witnesses: BTreeMap::new(),
+            handoffs: BTreeMap::new(),
             witness_only: false,
             hostility,
         };
@@ -250,6 +261,23 @@ impl Peer {
                             .entry(rec.slot_id)
                             .or_default()
                             .insert(rec.seq, rec);
+                    }
+                }
+            }
+        }
+        if let Ok(rd) = fs::read_dir(self.root.join("handoffs")) {
+            for e in rd.flatten() {
+                let Ok(files) = fs::read_dir(e.path()) else {
+                    continue;
+                };
+                for f in files.flatten() {
+                    let Ok(bytes) = fs::read(f.path()) else {
+                        continue;
+                    };
+                    if let Ok(h) = SlotHandoff::decode(&bytes) {
+                        if h.verify().is_ok() {
+                            self.handoffs.entry(h.slot_id).or_default().push(h);
+                        }
                     }
                 }
             }
@@ -345,6 +373,47 @@ impl Peer {
             .get(slot)
             .map(|m| m.values().cloned().collect())
             .unwrap_or_default()
+    }
+
+    fn persist_handoff(&self, h: &SlotHandoff) -> Result<(), PeerError> {
+        let dir = self.root.join("handoffs").join(h.slot_id.to_hex());
+        fs::create_dir_all(&dir)?;
+        let bytes = h.encode().map_err(PeerError::Handoff)?;
+        let name = format!("{}-{}", h.at_seq, h.to.to_hex());
+        let tmp = dir.join(format!("{name}.tmp"));
+        fs::write(&tmp, &bytes)?;
+        fs::rename(&tmp, dir.join(name))?;
+        Ok(())
+    }
+
+    // ── Ownership handoff (SPECS §5.1) ──────────────────────────────────
+
+    /// Accept a signed ownership handoff.
+    ///
+    /// The peer checks the signature and nothing else: whether a handoff is
+    /// *relevant* is decided at the point a writer actually changes, against
+    /// the slot and sequence in the signed body. Storing an unverifiable one
+    /// would let anybody fill this map.
+    pub fn publish_handoff(&mut self, h: SlotHandoff) -> Result<(), PeerError> {
+        h.verify().map_err(PeerError::Handoff)?;
+        if self
+            .handoffs
+            .get(&h.slot_id)
+            .is_some_and(|hs| hs.contains(&h))
+        {
+            return Ok(());
+        }
+        // Persisted before it is acknowledged, like a slot record: a client
+        // told its handoff was accepted must find it after a restart.
+        self.persist_handoff(&h)?;
+        self.handoffs.entry(h.slot_id).or_default().push(h);
+        Ok(())
+    }
+
+    /// Every handoff this peer holds for a slot, so a client can walk the
+    /// chain across an ownership change without asking for them one at a time.
+    pub fn handoffs(&self, slot: &SlotId) -> Vec<SlotHandoff> {
+        self.handoffs.get(slot).cloned().unwrap_or_default()
     }
 
     /// Persist one record. Written before it is acknowledged, so a crash
@@ -552,8 +621,18 @@ impl Peer {
                 if rec.prev != prior.record_hash() {
                     return Err(PeerError::BrokenChain { seq: rec.seq });
                 }
+                // SPECS §5.1: a change of writer under single-writer needs a
+                // handoff the OUTGOING writer signed, naming this successor at
+                // this sequence on this slot. Without one it is a takeover.
                 if prior.regime == Regime::SingleWriter && prior.writer_id != rec.writer_id {
-                    return Err(PeerError::ConcurrentWriter { seq: rec.seq });
+                    let authorised = self.handoffs.get(&rec.slot_id).is_some_and(|hs| {
+                        hs.iter().any(|h| {
+                            h.authorises(rec.slot_id, rec.seq, prior.writer_id, rec.writer_id)
+                        })
+                    });
+                    if !authorised {
+                        return Err(PeerError::ConcurrentWriter { seq: rec.seq });
+                    }
                 }
             }
         }
@@ -1784,5 +1863,194 @@ mod worm_tests {
         );
         assert!(plan.delete.is_empty(), "and nothing is deleted for it");
         assert!(a.iter().all(|x| p.has_blob(x)));
+    }
+}
+
+#[cfg(test)]
+mod handoff_tests {
+    //! SPECS §5.1: ownership moves only when the outgoing writer says so.
+    use super::*;
+    use nas_crypto::{Identity, Role};
+    use nas_slots::{SlotHandoff, WriterId, ROOT_NONCE_LEN};
+
+    struct Scratch(PathBuf);
+    impl Scratch {
+        fn new(tag: &str) -> Self {
+            let p = std::env::temp_dir().join(format!("nas-handoff-{}-{tag}", std::process::id()));
+            let _ = fs::remove_dir_all(&p);
+            Self(p)
+        }
+    }
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn ident(seed: u8) -> Identity {
+        Identity::derive(&[seed; 32], Role::Slot).unwrap()
+    }
+
+    fn wid(id: &Identity) -> WriterId {
+        WriterId::of_key(id.verifying_key())
+    }
+
+    fn slot() -> SlotId {
+        SlotId::new(b"ns", b"refs/heads/main")
+    }
+
+    fn rec(id: &Identity, seq: u64, prev: [u8; 32]) -> SlotRecord {
+        SlotRecord::sign(
+            id,
+            slot(),
+            seq,
+            Addr::of_ciphertext(format!("root-{seq}").as_bytes()),
+            [1u8; ROOT_NONCE_LEN],
+            prev,
+            Regime::SingleWriter,
+        )
+        .unwrap()
+    }
+
+    /// A peer holding `a`'s genesis record under single-writer.
+    fn peer_with_genesis(tag: &str) -> (Scratch, Peer, Identity, Identity, [u8; 32]) {
+        let s = Scratch::new(tag);
+        let mut p = Peer::open(&s.0, Mode::E2ee, Addressing::Content, Hostility::HONEST).unwrap();
+        let (a, b) = (ident(1), ident(2));
+        p.roster.add(a.verifying_key()).unwrap();
+        p.roster.add(b.verifying_key()).unwrap();
+        p.acl.grant("laptop", &[Right::Write]);
+        let g = rec(&a, 0, [0u8; 32]);
+        let h = g.record_hash();
+        p.publish_slot("laptop", g).unwrap();
+        (s, p, a, b, h)
+    }
+
+    #[test]
+    fn without_a_handoff_a_second_writer_is_refused() {
+        let (_s, mut p, _a, b, prev) = peer_with_genesis("takeover");
+        assert!(matches!(
+            p.publish_slot("laptop", rec(&b, 1, prev)),
+            Err(PeerError::ConcurrentWriter { seq: 1 })
+        ));
+    }
+
+    #[test]
+    fn a_signed_handoff_lets_the_successor_write() {
+        let (_s, mut p, a, b, prev) = peer_with_genesis("handoff");
+        p.publish_handoff(SlotHandoff::sign(&a, slot(), 1, wid(&b)).unwrap())
+            .unwrap();
+        p.publish_slot("laptop", rec(&b, 1, prev)).unwrap();
+        assert_eq!(p.slot_head(&slot()).unwrap().writer_id, wid(&b));
+    }
+
+    #[test]
+    fn a_handoff_for_the_wrong_sequence_does_not_admit_the_successor() {
+        let (_s, mut p, a, b, prev) = peer_with_genesis("wrong-seq");
+        p.publish_handoff(SlotHandoff::sign(&a, slot(), 7, wid(&b)).unwrap())
+            .unwrap();
+        assert!(matches!(
+            p.publish_slot("laptop", rec(&b, 1, prev)),
+            Err(PeerError::ConcurrentWriter { seq: 1 })
+        ));
+    }
+
+    #[test]
+    fn a_handoff_signed_by_a_stranger_is_not_authority() {
+        // `c` is not the current writer, so its signature moves nothing --
+        // even though the record itself verifies.
+        let (_s, mut p, _a, b, prev) = peer_with_genesis("stranger");
+        let c = ident(3);
+        let h = SlotHandoff::sign(&c, slot(), 1, wid(&b)).unwrap();
+        h.verify()
+            .expect("the record is well-formed; it is just not authority");
+        p.publish_handoff(h).unwrap();
+        assert!(matches!(
+            p.publish_slot("laptop", rec(&b, 1, prev)),
+            Err(PeerError::ConcurrentWriter { seq: 1 })
+        ));
+    }
+
+    #[test]
+    fn a_forged_handoff_is_refused_at_publish() {
+        let (_s, mut p, a, b, _prev) = peer_with_genesis("forged");
+        let mut h = SlotHandoff::sign(&a, slot(), 1, wid(&b)).unwrap();
+        h.at_seq = 2;
+        assert!(matches!(p.publish_handoff(h), Err(PeerError::Handoff(_))));
+        assert!(
+            p.handoffs(&slot()).is_empty(),
+            "nothing unverifiable is kept"
+        );
+    }
+
+    #[test]
+    fn handoffs_survive_a_restart() {
+        // Ownership that forgot itself on restart would strand the slot: the
+        // successor's records would stop verifying against a peer that no
+        // longer knows why it may write.
+        let s = Scratch::new("persist");
+        let (a, b) = (ident(1), ident(2));
+        let prev = {
+            let mut p =
+                Peer::open(&s.0, Mode::E2ee, Addressing::Content, Hostility::HONEST).unwrap();
+            p.roster.add(a.verifying_key()).unwrap();
+            p.roster.add(b.verifying_key()).unwrap();
+            p.acl.grant("laptop", &[Right::Write]);
+            let g = rec(&a, 0, [0u8; 32]);
+            let h = g.record_hash();
+            p.publish_slot("laptop", g).unwrap();
+            p.publish_handoff(SlotHandoff::sign(&a, slot(), 1, wid(&b)).unwrap())
+                .unwrap();
+            h
+        };
+        let mut p = Peer::open(&s.0, Mode::E2ee, Addressing::Content, Hostility::HONEST).unwrap();
+        p.roster.add(a.verifying_key()).unwrap();
+        p.roster.add(b.verifying_key()).unwrap();
+        p.acl.grant("laptop", &[Right::Write]);
+        assert_eq!(p.handoffs(&slot()).len(), 1);
+        p.publish_slot("laptop", rec(&b, 1, prev)).unwrap();
+    }
+
+    #[test]
+    fn publishing_the_same_handoff_twice_is_idempotent() {
+        let (_s, mut p, a, b, _prev) = peer_with_genesis("idempotent");
+        let h = SlotHandoff::sign(&a, slot(), 1, wid(&b)).unwrap();
+        p.publish_handoff(h.clone()).unwrap();
+        p.publish_handoff(h).unwrap();
+        assert_eq!(p.handoffs(&slot()).len(), 1);
+    }
+
+    #[test]
+    fn cas_merge_slots_are_untouched_by_any_of_this() {
+        let s = Scratch::new("cas");
+        let mut p = Peer::open(&s.0, Mode::E2ee, Addressing::Content, Hostility::HONEST).unwrap();
+        let (a, b) = (ident(1), ident(2));
+        p.roster.add(a.verifying_key()).unwrap();
+        p.roster.add(b.verifying_key()).unwrap();
+        p.acl.grant("laptop", &[Right::Write]);
+        let g = SlotRecord::sign(
+            &a,
+            slot(),
+            0,
+            Addr::of_ciphertext(b"root-0"),
+            [1u8; ROOT_NONCE_LEN],
+            [0u8; 32],
+            Regime::CasMerge,
+        )
+        .unwrap();
+        let prev = g.record_hash();
+        p.publish_slot("laptop", g).unwrap();
+        let second = SlotRecord::sign(
+            &b,
+            slot(),
+            1,
+            Addr::of_ciphertext(b"root-1"),
+            [2u8; ROOT_NONCE_LEN],
+            prev,
+            Regime::CasMerge,
+        )
+        .unwrap();
+        p.publish_slot("laptop", second)
+            .expect("cas-merge has never needed a handoff");
     }
 }

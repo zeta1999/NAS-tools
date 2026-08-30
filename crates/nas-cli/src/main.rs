@@ -129,7 +129,15 @@ fn run(argv: &[String]) -> i32 {
         "peer" => peer(rest),
         "gateway" => testcmds::unimplemented("gateway", "M3 (§2.1)"),
         "mirror" => testcmds::unimplemented("mirror", "M5 (§7.6)"),
-        "put" | "rm" | "delete-request" => testcmds::unimplemented(cmd, "M2 (§16)"),
+        "delete-request" => match (positional(rest).first().copied(), positional(rest).get(1)) {
+            (Some("execute"), Some(target)) => worm::delete_request_execute(target),
+            _ => {
+                eprintln!("usage: nas delete-request execute <namespace>/<path>");
+                exit::ERROR
+            }
+        },
+        // The object verbs need the key->object mapping the S3 face brings.
+        "put" | "rm" => testcmds::unimplemented(cmd, "M3 (§7.1)"),
         other => {
             eprintln!("unknown command {other:?}\n");
             eprint!("{USAGE}");
@@ -585,6 +593,25 @@ fn test(args: &[String]) -> i32 {
             }
         },
         Some("lease-cycle") => one_ns(&pos, worm::lease_cycle),
+        Some("delete-quorum") => match pos.get(1) {
+            Some(ns) => {
+                let approvers = match pct(args, "--approvers", 1) {
+                    Ok(v) => v as usize,
+                    Err(e) => {
+                        eprintln!("{e}");
+                        return exit::ERROR;
+                    }
+                };
+                worm::delete_quorum(ns, approvers, opt(args, "--scope").unwrap_or("namespace"))
+            }
+            None => {
+                eprintln!("usage: nas test delete-quorum <ns> --approvers <n> --scope <scope>");
+                exit::ERROR
+            }
+        },
+        Some("cooling-off-bypass") => one_ns(&pos, worm::cooling_off_bypass),
+        Some("quorum-decomposition-attack") => one_ns(&pos, worm::quorum_decomposition_attack),
+        Some("approval-replay") => one_ns(&pos, worm::approval_replay),
         Some("witness-node-holds-nothing") => attack::witness_node_holds_nothing(),
         Some("cross-tenant-dedup") => match (pos.get(1), pos.get(2)) {
             (Some(ns), Some(other)) => testcmds::cross_tenant_dedup(ns, other),

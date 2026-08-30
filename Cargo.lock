@@ -568,6 +568,7 @@ dependencies = [
  "blake3",
  "nas-core",
  "nas-crypto",
+ "nas-delete",
  "nas-lease",
  "nas-peer",
  "nas-slots",
@@ -592,6 +593,15 @@ dependencies = [
  "proptest",
  "secure-memory",
  "zeroize",
+]
+
+[[package]]
+name = "nas-delete"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "nas-core",
+ "nas-crypto",
 ]
 
 [[package]]

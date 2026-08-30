@@ -379,3 +379,313 @@ pub fn go_silent() -> Result<Result<String, String>, String> {
          (detection, not prevention — SPECS §16.3)"
     )))
 }
+
+// ── The deletion approval loop (SPECS §16.2) ───────────────────────────────
+
+use nas_delete::{
+    decide, Approver, Decision, DeleteApproval, DeleteExecution, DeleteRequest, Executed,
+    QuorumPolicy, Refusal, Scope,
+};
+
+/// Approver identities standing in for the offline holders.
+///
+/// Derived from fixed seeds and **not** from the namespace: §16.1's whole point
+/// is that the deleting authority is a key that is deliberately not on the
+/// laptop. Deriving these from the namespace seed would put them right back on
+/// it and make the drill prove the opposite of what it claims.
+fn approver(seed: u8) -> Result<Identity, String> {
+    Identity::derive(&[0xD0 + seed; 32], Role::Lease).map_err(|e| format!("approver: {e}"))
+}
+
+/// The everyday laptop key that opens requests. Also not an approver.
+fn requester() -> Result<Identity, String> {
+    Identity::derive(&[0xC0; 32], Role::Lease).map_err(|e| format!("requester: {e}"))
+}
+
+fn request_for(scope: Scope, nonce: u8) -> Result<DeleteRequest, String> {
+    DeleteRequest::sign(&requester()?, scope, "acceptance drill", [nonce; 32])
+        .map_err(|e| format!("sign request: {e}"))
+}
+
+/// An execution carrying `n` distinct approvals.
+fn execution_with(r: &DeleteRequest, n: usize) -> Result<DeleteExecution, String> {
+    let mut approvals = Vec::new();
+    for i in 0..n {
+        let a = approver(i as u8 + 1)?;
+        approvals
+            .push(DeleteApproval::sign(&a, r.request_hash()).map_err(|e| format!("approve: {e}"))?);
+    }
+    DeleteExecution::sign(&requester()?, r, &approvals).map_err(|e| format!("execution: {e}"))
+}
+
+fn parse_scope(s: &str) -> Option<Scope> {
+    match s {
+        "namespace" => Some(Scope::Namespace),
+        "prefix" => Some(Scope::Prefix("2024/".into())),
+        "object" => Some(Scope::Object("scan.pdf".into())),
+        _ => None,
+    }
+}
+
+/// `nas test delete-quorum <ns> --approvers <n> --scope <object|prefix|namespace>`
+///
+/// Refused (exit 2) when `n` is short of what the scope owes. Proves it is not
+/// simply always refusing by first executing the same scope with exactly the
+/// quorum it requires.
+pub fn delete_quorum(ns: &str, approvers: usize, scope: &str) -> i32 {
+    if let Err(e) = mode_of(ns) {
+        return err(e);
+    }
+    let Some(scope) = parse_scope(scope) else {
+        return err(format!(
+            "unknown --scope {scope:?} (object|prefix|namespace)"
+        ));
+    };
+    let policy = QuorumPolicy::default();
+    let required = policy.base(&scope);
+
+    // The honest path: exactly the required number of distinct approvers goes
+    // through. Without this the refusal below would prove nothing.
+    let sanity = match request_for(scope.clone(), 1)
+        .and_then(|r| execution_with(&r, required).map(|e| (r, e)))
+    {
+        Ok((r, e)) => decide(&r, &e, &[], &policy, Timestamp(real_now())),
+        Err(e) => return err(e),
+    };
+    if !matches!(sanity, Decision::Execute { .. }) {
+        return err(format!(
+            "{required} approvers should satisfy {}, got {sanity:?}",
+            scope.describe()
+        ));
+    }
+
+    let (r, e) = match request_for(scope.clone(), 2).and_then(|r| {
+        let e = execution_with(&r, approvers)?;
+        Ok((r, e))
+    }) {
+        Ok(x) => x,
+        Err(e) => return err(e),
+    };
+    match decide(&r, &e, &[], &policy, Timestamp(real_now())) {
+        Decision::Execute { distinct, .. } => {
+            println!(
+                "delete-quorum: {distinct} approver(s) executed {} (required {required})",
+                scope.describe()
+            );
+            exit::OK
+        }
+        Decision::Refused(why) => refuse(format!(
+            "delete-quorum on {}: {why}; {required} distinct approvers do execute it (SPECS §16.2)",
+            scope.describe()
+        )),
+    }
+}
+
+/// `nas test cooling-off-bypass <ns>` — an approver must refuse to sign early.
+///
+/// Exit 2 means the bypass failed, which is the passing outcome. The check is
+/// about the approver's **own** clock: SPECS §16.2 is explicit that nothing in
+/// the protocol can enforce a delay, so this asserts the client-side gate and
+/// says plainly that it is a convention.
+pub fn cooling_off_bypass(ns: &str) -> i32 {
+    if let Err(e) = mode_of(ns) {
+        return err(e);
+    }
+    let a = Approver::default();
+    let seen = Timestamp(real_now());
+    let r = match request_for(Scope::Namespace, 3) {
+        Ok(r) => r,
+        Err(e) => return err(e),
+    };
+    let id = match approver(1) {
+        Ok(i) => i,
+        Err(e) => return err(e),
+    };
+
+    // Past the cooling-off it signs, so the refusal below is a delay and not a
+    // device that never approves anything.
+    let after = Timestamp(seen.0 + a.cooling_off);
+    match a.approve(&id, &r, seen, after) {
+        Ok(Some(_)) => {}
+        Ok(None) => return err("the approver refused even after the cooling-off elapsed"),
+        Err(e) => return err(format!("approve: {e}")),
+    }
+
+    let early = Timestamp(seen.0 + a.cooling_off - 1);
+    match a.approve(&id, &r, seen, early) {
+        Ok(None) => refuse(format!(
+            "the approver will not sign for another {}s; cooling-off is enforced by the \
+             approver against its own clock, because there is no trusted time source to \
+             appeal to — it buys a human time to notice and compels nothing (SPECS §16.2)",
+            a.cooling_off - (early.0 - seen.0)
+        )),
+        Ok(Some(_)) => {
+            eprintln!("error: the approver signed before its cooling-off elapsed");
+            exit::ERROR
+        }
+        Err(e) => err(format!("approve: {e}")),
+    }
+}
+
+/// `nas test quorum-decomposition-attack <ns>` — N small deletes must not add
+/// up to a namespace wipe (SPECS §16.2, review finding C9).
+pub fn quorum_decomposition_attack(ns: &str) -> i32 {
+    if let Err(e) = mode_of(ns) {
+        return err(e);
+    }
+    let policy = QuorumPolicy::default();
+    let now = Timestamp(real_now());
+    let one_stolen_approval = 1;
+
+    // Under the rolling threshold each single-object delete goes through on
+    // one approval — that is the design, and the attack rides on it.
+    let mut history: Vec<Executed> = Vec::new();
+    for i in 0..policy.rolling.objects {
+        let (r, e) = match request_for(Scope::Object(format!("scan-{i}.pdf")), i as u8)
+            .and_then(|r| execution_with(&r, one_stolen_approval).map(|e| (r, e)))
+        {
+            Ok(x) => x,
+            Err(e) => return err(e),
+        };
+        match decide(&r, &e, &history, &policy, now) {
+            Decision::Execute { .. } => history.push(Executed { at: now }),
+            Decision::Refused(why) => {
+                return err(format!(
+                    "delete {i} of {} was refused before the threshold: {why}",
+                    policy.rolling.objects
+                ))
+            }
+        }
+    }
+
+    // The next one is the same shape and the same single approval, and must now
+    // owe the namespace quorum.
+    let (r, e) = match request_for(Scope::Object("scan-final.pdf".into()), 0xFF)
+        .and_then(|r| execution_with(&r, one_stolen_approval).map(|e| (r, e)))
+    {
+        Ok(x) => x,
+        Err(e) => return err(e),
+    };
+    match decide(&r, &e, &history, &policy, now) {
+        Decision::Refused(Refusal::ShortOfQuorum {
+            required,
+            distinct,
+            escalated: true,
+        }) => refuse(format!(
+            "after {} single-object deletes inside the {}-day window, the next one owes {required} \
+             approvers and has {distinct}: volume is what correlates with harm, not the label on \
+             any one request (SPECS §16.2)",
+            history.len(),
+            policy.rolling.window / 86_400
+        )),
+        Decision::Refused(why) => {
+            eprintln!("error: refused, but not by the rolling window: {why}");
+            exit::ERROR
+        }
+        Decision::Execute { .. } => {
+            eprintln!(
+                "error: {} single-object deletes did not escalate; decomposition is unguarded",
+                history.len()
+            );
+            exit::ERROR
+        }
+    }
+}
+
+/// `nas test approval-replay <ns>` — an approval for one request must not count
+/// toward another. Exit 0 means the binding holds.
+pub fn approval_replay(ns: &str) -> i32 {
+    if let Err(e) = mode_of(ns) {
+        return err(e);
+    }
+    let (first, second) = match (
+        request_for(Scope::Object("a.pdf".into()), 1),
+        request_for(Scope::Object("b.pdf".into()), 2),
+    ) {
+        (Ok(a), Ok(b)) => (a, b),
+        (Err(e), _) | (_, Err(e)) => return err(e),
+    };
+    if first.request_hash() == second.request_hash() {
+        return err("two distinct requests hashed the same; the binding is vacuous");
+    }
+    let id = match approver(1) {
+        Ok(i) => i,
+        Err(e) => return err(e),
+    };
+    let stolen = match DeleteApproval::sign(&id, first.request_hash()) {
+        Ok(a) => a,
+        Err(e) => return err(format!("approve: {e}")),
+    };
+
+    // It must not even be packageable against the other request.
+    if DeleteExecution::sign(
+        &requester().unwrap(),
+        &second,
+        std::slice::from_ref(&stolen),
+    )
+    .is_ok()
+    {
+        return refuse("an approval for another request was accepted into an execution");
+    }
+
+    // And a hand-forged execution carrying it must be refused by `decide`.
+    let mut forged = match execution_with(&second, 1) {
+        Ok(e) => e,
+        Err(e) => return err(e),
+    };
+    forged.approvals = vec![stolen];
+    match decide(
+        &second,
+        &forged,
+        &[],
+        &QuorumPolicy::default(),
+        Timestamp(real_now()),
+    ) {
+        Decision::Refused(why) => ok(format!(
+            "approval-replay: an approval bound to another request is refused ({why}); \
+             binding the request hash is what makes that possible (SPECS §16.2)"
+        )),
+        Decision::Execute { .. } => {
+            refuse("a replayed approval satisfied the quorum for a different request")
+        }
+    }
+}
+
+/// `nas delete-request execute <ns>/<path>` — refused without approvals.
+///
+/// The real loop needs the offline authority's signatures, which this CLI has
+/// no path to collect: there is no key on this machine that may approve. So the
+/// honest answer is a refusal that says which step is missing, not a pretend
+/// deletion.
+pub fn delete_request_execute(target: &str) -> i32 {
+    let (ns, path) = match target.split_once('/') {
+        Some((ns, path)) if !ns.is_empty() && !path.is_empty() => (ns, path),
+        _ => return err(format!("expected <namespace>/<path>, got {target:?}")),
+    };
+    if let Err(e) = mode_of(ns) {
+        return err(e);
+    }
+    let policy = QuorumPolicy::default();
+    let scope = Scope::Object(path.to_string());
+    let required = policy.base(&scope);
+    let (r, e) = match request_for(scope.clone(), 0x5A).and_then(|r| {
+        // No approvals: this device holds no approving key, by design.
+        let e = execution_with(&r, 0)?;
+        Ok((r, e))
+    }) {
+        Ok(x) => x,
+        Err(e) => return err(e),
+    };
+    match decide(&r, &e, &[], &policy, Timestamp(real_now())) {
+        Decision::Refused(why) => refuse(format!(
+            "delete {} in {ns}: {why}. The approving keys are deliberately not on this \
+             machine (SPECS §16.1); collect {required} approval(s) from the offline \
+             authority and publish an execution carrying them.",
+            scope.describe()
+        )),
+        Decision::Execute { .. } => {
+            eprintln!("error: an execution with no approvals satisfied the quorum");
+            exit::ERROR
+        }
+    }
+}

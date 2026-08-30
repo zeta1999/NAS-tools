@@ -230,6 +230,15 @@ settled and the work that follows from them.
       `nas test retention-shrink --key everyday`, `nas test attack go-silent`)
 - [x] Object Lock recorded at creation (`ns create --object-lock … --retention …`),
       with the enforced/not-enforced split printed rather than implied
+- [x] Deletion approval loop (§16.2) in `crates/nas-delete`: signed request /
+      approval / execution, quorum by scope, distinct-holder counting, the
+      rolling window against decomposition, and approvals bound to a request
+      hash. Drills: `nas test delete-quorum|cooling-off-bypass|
+      quorum-decomposition-attack|approval-replay`, `nas delete-request execute`
+- [ ] Wire the loop to a peer that stores requests/approvals and drops leases on
+      execution. Today `decide` is exercised by the CLI drills against
+      in-memory records; the peer does not yet retain the audit trail §16.2
+      calls append-only
 - [ ] Lease griefing bounded by per-holder quota — the quota is computed and
       reported by `plan_sweep`; what is missing is admission control at publish
       time, so the drill still exits 3

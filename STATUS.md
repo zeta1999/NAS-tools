@@ -203,10 +203,29 @@ TLC is green with its three sanity checks still failing as required.
 
 ## Not built
 
-M2: the deletion approval loop (§16.2) — quorum, cooling-off, approval
-replay, and the `put`/`rm`/`delete-request` verbs that exercise it — plus the
-single-writer handoff (§5.1). Those are the 14 assertions still failing at
-`NAS_MILESTONE=M2`, nine of them in UC04.
+M2: the single-writer handoff (§5.1), and the object verbs `put`/`rm` — which
+need the key→object mapping the S3 face brings, so they are reclassified M3
+(§7.1) rather than pending here. Nine assertions still fail at
+`NAS_MILESTONE=M2`.
+
+**The deletion approval loop (§16.2) is built** (`crates/nas-delete`):
+`DeleteRequest` / `DeleteApproval` / `DeleteExecution`, quorum scaled by blast
+radius, and the rolling window that makes decomposition expensive — past ten
+single-object deletes in thirty days, the next owes the namespace quorum
+whatever its scope. `decide` is pure, like `plan_sweep`: it returns a verdict
+and deletes nothing, because the data-destroying operations should be
+inspectable before they run. Approvals bind the request hash, so one cannot be
+replayed against another request, and two approvals from one holder count as
+one holder.
+
+Cooling-off is where the honesty matters. SPECS §16.2 is explicit that there
+is no trusted time source in this design — the peer's clock is adversarial by
+assumption and the requester signs its own timestamp — so **nothing in the
+protocol can enforce a delay**. `Approver::may_sign` is a client-side gate
+against the device's own clock: it buys a human time to notice and compels
+nothing. Key separation is what defeats ransomware; the delay is a convention.
+`nas delete-request execute` accordingly refuses and names the missing step
+rather than pretending to delete.
 
 Lease-based GC **has** a caller now: `Peer::sweep` plans with
 `nas_lease::plan_sweep` and deletes through `delete_blob`, so retention is

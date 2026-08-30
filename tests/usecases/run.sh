@@ -26,6 +26,10 @@ export NAS_PASSPHRASE="${NAS_PASSPHRASE:-acceptance suite five diceware words}"
 
 tp=0; tf=0; tpend=0; rc=0
 for f in uc*.sh; do
+  # The manual drills (uc10+: fixed ports, a release binary, docker) print no
+  # summary by design and are run by hand; a script that never calls
+  # uc_summary is not an acceptance test.
+  grep -q '^uc_summary' "$f" || continue
   out=$(bash "$f" 2>&1); status=$?      # capture the SCRIPT's status, not echo's
   echo "$out"
   [ $status -ne 0 ] && rc=1

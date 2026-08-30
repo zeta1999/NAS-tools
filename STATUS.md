@@ -101,9 +101,12 @@ listing; lease-based GC with deltas; **three confidentiality modes** (`e2ee`,
 - **`tests/usecases/`** — 88 acceptance assertions, milestone-gated; 58 are
   M0–M2. Measured on the current binary: **5 passing, 0 failing, 83 pending**
   at `NAS_MILESTONE=M0`; **36 passing, 0 failing, 52 pending** at
-  `NAS_MILESTONE=M1` (what `ci.sh` gates on); **37 passing, 21 failing, 30
-  pending** at `NAS_MILESTONE=M2` — the 21 are the deletion-resistance and
-  lifecycle assertions that M2 builds. UC01 (transit-only), UC02 (passphrase)
+  `NAS_MILESTONE=M1` (what `ci.sh` gates on); **39 passing, 19 failing, 30
+  pending** at `NAS_MILESTONE=M2` — the 19 are the deletion-resistance and
+  lifecycle assertions that M2 builds. UC07's two witness-node assertions
+  (a fork detected by devices that never meet; the node holds no blobs and no
+  slot data) pass in-process via `nas test fork-detect-via-witness` and
+  `nas test witness-node-holds-nothing`. UC01 (transit-only), UC02 (passphrase)
   and UC03 (e2ee) are all green end to end; UC09 (hostile peer) is 6 of 8, the
   two remaining being lease griefing and the `all` drill that contains it,
   both waiting on §16 leases. Verified to
@@ -194,19 +197,24 @@ TLC is green with its three sanity checks still failing as required.
 > The TLA+ model constrains SPECS §5, which is **M2** code. It is assurance
 > about the design, not about anything shipped. Its correspondence to
 > `nas-slots` is **partial**: same-sequence equivocation only, asserted as such
-> by `a_fork_at_disjoint_sequences_is_not_detected`.
+> by `a_fork_at_disjoint_sequences_is_not_detected`. Once the peer's history
+> is offered it does see it (`…is_detected_once_the_chain_is_walked`), which
+> is what `nas peer sync` does over the wire.
 
 ## Not built
 
-M2: fork detection over the wire against a live hostile peer (the in-process
-drills exist; the socket is not in their loop), lease-based GC with a caller
-and the lease-griefing quota, retention/Object Lock enforcement, quota
-admission (§6.4), and the single-writer handoff (§5.1). The three-node
-container simulation now exists (`tests/usecases/uc11_containers.sh`,
-MANUAL-TESTING.md §13): host-built `nas` binary, three slim runtime
-containers on one compose network, honest peer restarted `--hostile
-rollback`, a `--witness` node, three devices — same assertions as the
-localhost drill, all passing under colima.
+M2: lease-based GC with a caller and the lease-griefing quota,
+retention/Object Lock enforcement, quota admission (§6.4), and the
+single-writer handoff (§5.1). Fork detection over the wire against a live
+forking peer now exists (`tests/usecases/uc12_fork_drill.sh`,
+MANUAL-TESTING.md §13): `nas peer sync` walks the peer's retained history
+from the lowest witnessed or pinned sequence and compares each witness and
+the pin at its own sequence, so a fork *below* the served head is refused
+over a real socket. The three-node container simulation exists too
+(`tests/usecases/uc11_containers.sh`, MANUAL-TESTING.md §10b): host-built
+`nas` binary, three slim runtime containers on one compose network, honest
+peer restarted `--hostile rollback`, a `--witness` node, three devices —
+same assertions as the localhost drill, all passing under colima.
 
 ## Environment constraints
 

@@ -1,4 +1,6 @@
 //! `nas test attack <kind>` — the UC09 hostile-peer drills (SPECS §19, §20).
+//! Also home to UC07's two witness-node checks (SPECS §5.3), which are the
+//! same lab pointed at the node's reason to exist.
 //!
 //! Each drill runs the **same dispatch the network server uses**
 //! ([`nas_transfer::handle`]) against a [`Peer`] opened with one hostility
@@ -623,4 +625,207 @@ pub fn attack(kind: &str, o: AttackOpts) -> i32 {
         return unimplemented(&format!("test attack {k}"), ms);
     }
     exit::OK
+}
+
+// ── UC07: the witness node's reason to exist (SPECS §5.3) ──────────────────
+
+/// `nas test fork-detect-via-witness` — two devices that never talk to each
+/// other, sharing only a forking relay and an honest witness-only node, still
+/// detect the fork. The honest topology runs first: A's witness relayed to B
+/// over one straight history must NOT read as a fork, otherwise the control is
+/// a tripwire on every witness rather than a fork detector.
+pub fn fork_detect_via_witness() -> i32 {
+    match fork_via_witness() {
+        Ok(Ok(m)) => {
+            println!("fork-detect-via-witness: detected — {m}");
+            exit::OK
+        }
+        Ok(Err(m)) => {
+            eprintln!("refused: fork-detect-via-witness: NOT detected — {m}");
+            exit::REFUSED
+        }
+        Err(e) => {
+            eprintln!("error: fork-detect-via-witness: harness: {e}");
+            exit::ERROR
+        }
+    }
+}
+
+fn fork_via_witness() -> Result<Result<String, String>, String> {
+    let writer = identity(0x0A, Role::Slot)?;
+    let base = chain(&writer, 2)?;
+    let (r0, r1a) = (&base[0], &base[1]);
+    let r1b = record(&writer, 1, r0.record_hash(), 0xB2)?;
+    let roster = roster_of(&writer)?;
+    // Device A's witness key. B never meets A — it only ever sees A's signed
+    // observation, and only through the node.
+    let observer = identity(0x0B, Role::Witness)?;
+    let w = Witness::sign(&observer, slot(), 1, r1a.sig_hash(), 1)
+        .map_err(|e| format!("witness: {e}"))?;
+
+    // Honest topology: one straight history, A's witness carried by the node.
+    {
+        let mut relay = Lab::honest("fvw-honest", &writer)?;
+        let mut node = Lab::honest("fvw-honest-node", &writer)?;
+        node.peer.witness_only = true;
+        relay.publish(r0)?;
+        relay.publish(r1a)?;
+        node.publish_witness(&w)?;
+        let mut b = walk(&mut relay, &roster, r0)?;
+        b.trust_witness(observer.verifying_key())
+            .map_err(|e| format!("trust witness: {e}"))?;
+        for x in &node.witnesses(slot())? {
+            b.observe_witness(x);
+        }
+        if let Some(seq) = b.forked() {
+            return Err(format!(
+                "an honest history read as a fork at seq {seq}: the control is a tripwire"
+            ));
+        }
+    }
+
+    // Forking relay that also withholds witnesses: A was shown branch A, B is
+    // shown branch B, and the relay carries nothing between them. The node is
+    // the only path A's observation has to B.
+    let mut relay = Lab::open(
+        "fvw",
+        Hostility {
+            fork: true,
+            withhold_witnesses: true,
+            ..Hostility::HONEST
+        },
+        &writer,
+    )?;
+    let mut node = Lab::honest("fvw-node", &writer)?;
+    node.peer.witness_only = true;
+    relay.publish(r0)?;
+    relay.publish(r1a)?;
+    relay
+        .publish(&r1b)
+        .map_err(|e| format!("forking relay refused the conflicting write: {e}"))?;
+    relay.publish_witness(&w)?;
+    node.publish_witness(&w)?;
+
+    relay.peer.set_view(1);
+    let mut b = walk(&mut relay, &roster, r0)?;
+    b.trust_witness(observer.verifying_key())
+        .map_err(|e| format!("trust witness: {e}"))?;
+    for x in &relay.witnesses(slot())? {
+        b.observe_witness(x);
+    }
+    let relay_alone = b.forked();
+    let from_node = node.witnesses(slot())?;
+    for x in &from_node {
+        b.observe_witness(x);
+    }
+    Ok(match b.forked() {
+        Some(seq) => Ok(format!(
+            "relay alone: {relay_alone:?}; with {} witness(es) from the node: fork evidence at seq {seq}",
+            from_node.len()
+        )),
+        None => Err(format!(
+            "no fork evidence ({} witnesses from the node)",
+            from_node.len()
+        )),
+    })
+}
+
+/// Device B's walk of whatever the relay serves, verified on its own terms.
+fn walk(relay: &mut Lab, roster: &Roster, r0: &SlotRecord) -> Result<SlotClient, String> {
+    let served = relay.history(slot(), 0)?;
+    let mut b = SlotClient::new(slot(), Regime::SingleWriter, anchored_at(r0));
+    match b.offer(&served, roster) {
+        Verdict::Accepted { .. } => Ok(b),
+        v => Err(format!("served history did not verify on its own: {v:?}")),
+    }
+}
+
+/// `nas test witness-node-holds-nothing` — a witness-only node accepts
+/// witnesses, refuses every other request at the dispatch, and leaves no blob
+/// or slot data on disk. The same requests are first made to a full peer and
+/// must succeed there, so a refusal below is a control and not a broken lab.
+pub fn witness_node_holds_nothing() -> i32 {
+    match node_holds_nothing() {
+        Ok(Ok(m)) => {
+            println!("witness-node-holds-nothing: {m}");
+            exit::OK
+        }
+        Ok(Err(m)) => {
+            eprintln!("refused: witness-node-holds-nothing: {m}");
+            exit::REFUSED
+        }
+        Err(e) => {
+            eprintln!("error: witness-node-holds-nothing: harness: {e}");
+            exit::ERROR
+        }
+    }
+}
+
+fn node_holds_nothing() -> Result<Result<String, String>, String> {
+    let writer = identity(0x0A, Role::Slot)?;
+    let base = chain(&writer, 2)?;
+    let observer = identity(0x0B, Role::Witness)?;
+    let w = Witness::sign(&observer, slot(), 1, base[1].sig_hash(), 1)
+        .map_err(|e| format!("witness: {e}"))?;
+    let rec = base[0].encode().map_err(|e| e.to_string())?;
+
+    let mut full = Lab::honest("wn-full", &writer)?;
+    full.put(&ciphertext(7))?;
+    full.publish(&base[0])?;
+    full.publish_witness(&w)?;
+
+    let mut node = Lab::honest("wn-node", &writer)?;
+    node.peer.witness_only = true;
+    let probes: Vec<(&str, Request)> = vec![
+        ("put-blob", Request::PutBlob(ciphertext(7))),
+        ("publish-slot", Request::PublishSlot(rec)),
+        (
+            "get-blob",
+            Request::GetBlob(Addr::of_ciphertext(&ciphertext(7))),
+        ),
+        ("slot-head", Request::SlotHead(slot())),
+    ];
+    let (mut refused, mut accepted) = (Vec::new(), Vec::new());
+    for (name, req) in probes {
+        match node.call(req) {
+            Response::Error(_) => refused.push(name),
+            other => accepted.push(format!("{name} → {other:?}")),
+        }
+    }
+    node.publish_witness(&w)
+        .map_err(|e| format!("witness-only node refused a witness: {e}"))?;
+    let relayed = node.witnesses(slot())?.len();
+
+    // What it answered is one thing; what it holds is the ground truth.
+    let blobs = count_files(&node.dir.join("blobs"));
+    let slots = count_files(&node.dir.join("slots"));
+    if !accepted.is_empty() {
+        return Ok(Err(format!("accepted: {}", accepted.join("; "))));
+    }
+    if blobs + slots > 0 {
+        return Ok(Err(format!(
+            "on disk: {blobs} blob file(s), {slots} slot file(s)"
+        )));
+    }
+    if relayed != 1 {
+        return Ok(Err(format!("relayed {relayed} witnesses, expected 1")));
+    }
+    Ok(Ok(format!(
+        "refused {}; relayed {relayed} witness; 0 blob files and 0 slot files on disk",
+        refused.join(", ")
+    )))
+}
+
+fn count_files(dir: &std::path::Path) -> usize {
+    let Ok(rd) = fs::read_dir(dir) else { return 0 };
+    rd.flatten()
+        .map(|e| {
+            let p = e.path();
+            if p.is_dir() {
+                count_files(&p)
+            } else {
+                1
+            }
+        })
+        .sum()
 }

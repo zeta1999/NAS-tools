@@ -17,6 +17,7 @@
 //! Keeping those two apart matters: a walk that verified would otherwise be
 //! read as "no fork", which is exactly the overclaim SPECS §5.4 warns against.
 
+use crate::handoff::SlotHandoff;
 use crate::id::{SlotId, WriterId};
 use crate::record::{RecordError, Regime, SlotRecord};
 use crate::roster::Roster;
@@ -116,6 +117,26 @@ pub fn verify_chain(
     roster: &Roster,
     expect_prev: Option<[u8; 32]>,
 ) -> Result<Walk, ChainError> {
+    // No handoffs known: under `single-writer` any writer change is refused.
+    // That is the safe direction — a caller that has not been given the
+    // handoff records cannot tell an authorised change from a takeover, and
+    // refusing is the recoverable mistake (SPECS §5.1).
+    verify_chain_with_handoffs(records, slot_id, roster, expect_prev, &[])
+}
+
+/// [`verify_chain`], with the §5.1 handoff records the caller knows about.
+///
+/// Under `single-writer` a change of writer at sequence `s` is accepted only
+/// when some handoff authorises exactly `from → to` at exactly `s` on this
+/// slot, signed by the outgoing writer. Anything else is still
+/// [`ChainError::ConcurrentWriters`].
+pub fn verify_chain_with_handoffs(
+    records: &[SlotRecord],
+    slot_id: SlotId,
+    roster: &Roster,
+    expect_prev: Option<[u8; 32]>,
+    handoffs: &[SlotHandoff],
+) -> Result<Walk, ChainError> {
     let Some(first) = records.first() else {
         return Err(ChainError::Empty);
     };
@@ -162,18 +183,25 @@ pub fn verify_chain(
         })?;
 
         // SPECS §5.1: under single-writer, two writers in one chain is an
-        // alarm rather than something to merge. Handoff is an explicit signed
-        // operation and is not modelled yet, so any change is refused rather
-        // than silently allowed -- refusing is the recoverable mistake.
+        // alarm rather than something to merge -- unless the outgoing writer
+        // signed a handoff naming this successor at this exact sequence. The
+        // signature that matters is the OUTGOING writer's: anyone can announce
+        // that they are the new writer, and only the current one can say so.
         if regime == Regime::SingleWriter {
             match sole_writer {
                 None => sole_writer = Some(r.writer_id),
                 Some(w) if w != r.writer_id => {
-                    return Err(ChainError::ConcurrentWriters {
-                        seq: r.seq,
-                        first: w,
-                        second: r.writer_id,
-                    })
+                    let authorised = handoffs
+                        .iter()
+                        .any(|h| h.authorises(slot_id, r.seq, w, r.writer_id));
+                    if !authorised {
+                        return Err(ChainError::ConcurrentWriters {
+                            seq: r.seq,
+                            first: w,
+                            second: r.writer_id,
+                        });
+                    }
+                    sole_writer = Some(r.writer_id);
                 }
                 Some(_) => {}
             }
@@ -392,5 +420,179 @@ mod tests {
             verify_chain(&c, slot(), &roster_with(&[&id]), None),
             Err(ChainError::BrokenLink { seq: 2 }) | Err(ChainError::Record { seq: 1, .. })
         ));
+    }
+    // ── §5.1 ownership handoff ─────────────────────────────────────────
+
+    /// `a` writes seqs `0..split`, then `b` writes `split..n`.
+    fn two_writer_chain(a: &Identity, b: &Identity, split: u64, n: u64) -> Vec<SlotRecord> {
+        let mut out: Vec<SlotRecord> = Vec::new();
+        let mut prev = [0u8; 32];
+        for seq in 0..n {
+            let who = if seq < split { a } else { b };
+            let r = SlotRecord::sign(
+                who,
+                slot(),
+                seq,
+                Addr::of_ciphertext(format!("root-{seq}").as_bytes()),
+                [(seq as u8).wrapping_add(1); crate::ROOT_NONCE_LEN],
+                prev,
+                Regime::SingleWriter,
+            )
+            .unwrap();
+            prev = r.record_hash();
+            out.push(r);
+        }
+        out
+    }
+
+    fn wid(id: &Identity) -> WriterId {
+        WriterId::of_key(id.verifying_key())
+    }
+
+    #[test]
+    fn a_signed_handoff_lets_ownership_move() {
+        let (a, b) = (ident(1), ident(2));
+        let c = two_writer_chain(&a, &b, 3, 6);
+        let rost = roster_with(&[&a, &b]);
+
+        // Without the handoff record this is indistinguishable from a takeover.
+        assert!(matches!(
+            verify_chain(&c, slot(), &rost, None),
+            Err(ChainError::ConcurrentWriters { seq: 3, .. })
+        ));
+
+        let h = SlotHandoff::sign(&a, slot(), 3, wid(&b)).unwrap();
+        let w = verify_chain_with_handoffs(&c, slot(), &rost, None, &[h]).unwrap();
+        assert_eq!((w.first_seq, w.head_seq), (0, 5));
+    }
+
+    #[test]
+    fn a_handoff_authorises_one_change_not_a_free_pass() {
+        // Having handed off at 3, `a` may not simply resume at 4: that needs
+        // its own handoff, signed by `b`.
+        let (a, b) = (ident(1), ident(2));
+        let mut out: Vec<SlotRecord> = Vec::new();
+        let mut prev = [0u8; 32];
+        for seq in 0..6u64 {
+            let who = match seq {
+                0..=2 => &a,
+                3 => &b,
+                _ => &a,
+            };
+            let r = SlotRecord::sign(
+                who,
+                slot(),
+                seq,
+                Addr::of_ciphertext(format!("root-{seq}").as_bytes()),
+                [(seq as u8).wrapping_add(1); crate::ROOT_NONCE_LEN],
+                prev,
+                Regime::SingleWriter,
+            )
+            .unwrap();
+            prev = r.record_hash();
+            out.push(r);
+        }
+        let h = SlotHandoff::sign(&a, slot(), 3, wid(&b)).unwrap();
+        assert!(matches!(
+            verify_chain_with_handoffs(&out, slot(), &roster_with(&[&a, &b]), None, &[h]),
+            Err(ChainError::ConcurrentWriters { seq: 4, .. })
+        ));
+    }
+
+    #[test]
+    fn a_handoff_at_the_wrong_sequence_does_not_apply() {
+        // The sequence is inside the signed body precisely so a handoff cannot
+        // be floated to wherever it would be convenient.
+        let (a, b) = (ident(1), ident(2));
+        let c = two_writer_chain(&a, &b, 3, 6);
+        let wrong = SlotHandoff::sign(&a, slot(), 4, wid(&b)).unwrap();
+        assert!(matches!(
+            verify_chain_with_handoffs(&c, slot(), &roster_with(&[&a, &b]), None, &[wrong]),
+            Err(ChainError::ConcurrentWriters { seq: 3, .. })
+        ));
+    }
+
+    #[test]
+    fn a_handoff_for_another_slot_does_not_apply() {
+        let (a, b) = (ident(1), ident(2));
+        let c = two_writer_chain(&a, &b, 3, 6);
+        let elsewhere = SlotHandoff::sign(&a, SlotId::new(b"ns", b"other"), 3, wid(&b)).unwrap();
+        assert!(matches!(
+            verify_chain_with_handoffs(&c, slot(), &roster_with(&[&a, &b]), None, &[elsewhere]),
+            Err(ChainError::ConcurrentWriters { seq: 3, .. })
+        ));
+    }
+
+    #[test]
+    fn the_incoming_writer_cannot_authorise_itself() {
+        // The takeover case, at the level that matters: `b` appends to `a`'s
+        // slot and signs its own permission slip.
+        let (a, b, c_id) = (ident(1), ident(2), ident(3));
+        let c = two_writer_chain(&a, &b, 3, 6);
+        // `b` cannot sign a handoff naming itself (SelfHandoff), so the best
+        // it can do is name a third party -- which does not match the chain.
+        let forged = SlotHandoff::sign(&b, slot(), 3, wid(&c_id)).unwrap();
+        assert!(matches!(
+            verify_chain_with_handoffs(&c, slot(), &roster_with(&[&a, &b]), None, &[forged]),
+            Err(ChainError::ConcurrentWriters { seq: 3, .. })
+        ));
+    }
+
+    #[test]
+    fn ownership_can_move_twice() {
+        let (a, b, c_id) = (ident(1), ident(2), ident(3));
+        let mut out: Vec<SlotRecord> = Vec::new();
+        let mut prev = [0u8; 32];
+        for seq in 0..6u64 {
+            let who = match seq {
+                0..=1 => &a,
+                2..=3 => &b,
+                _ => &c_id,
+            };
+            let r = SlotRecord::sign(
+                who,
+                slot(),
+                seq,
+                Addr::of_ciphertext(format!("root-{seq}").as_bytes()),
+                [(seq as u8).wrapping_add(1); crate::ROOT_NONCE_LEN],
+                prev,
+                Regime::SingleWriter,
+            )
+            .unwrap();
+            prev = r.record_hash();
+            out.push(r);
+        }
+        let hs = [
+            SlotHandoff::sign(&a, slot(), 2, wid(&b)).unwrap(),
+            SlotHandoff::sign(&b, slot(), 4, wid(&c_id)).unwrap(),
+        ];
+        let w = verify_chain_with_handoffs(&out, slot(), &roster_with(&[&a, &b, &c_id]), None, &hs)
+            .unwrap();
+        assert_eq!(w.head_seq, 5);
+    }
+
+    #[test]
+    fn cas_merge_never_needed_a_handoff() {
+        // Two writers under cas-merge is ordinary, and the handoff machinery
+        // must not have quietly become a requirement there.
+        let (a, b) = (ident(1), ident(2));
+        let mut out: Vec<SlotRecord> = Vec::new();
+        let mut prev = [0u8; 32];
+        for seq in 0..4u64 {
+            let who = if seq % 2 == 0 { &a } else { &b };
+            let r = SlotRecord::sign(
+                who,
+                slot(),
+                seq,
+                Addr::of_ciphertext(format!("root-{seq}").as_bytes()),
+                [(seq as u8).wrapping_add(1); crate::ROOT_NONCE_LEN],
+                prev,
+                Regime::CasMerge,
+            )
+            .unwrap();
+            prev = r.record_hash();
+            out.push(r);
+        }
+        verify_chain(&out, slot(), &roster_with(&[&a, &b]), None).unwrap();
     }
 }

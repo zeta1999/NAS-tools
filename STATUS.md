@@ -203,10 +203,19 @@ TLC is green with its three sanity checks still failing as required.
 
 ## Not built
 
-M2: the single-writer handoff (§5.1), and the object verbs `put`/`rm` — which
-need the key→object mapping the S3 face brings, so they are reclassified M3
-(§7.1) rather than pending here. Nine assertions still fail at
-`NAS_MILESTONE=M2`.
+M2: the object verbs `put`/`rm` — which need the key→object mapping the S3
+face brings, so they are reclassified M3 (§7.1) rather than pending here. Nine
+assertions still fail at `NAS_MILESTONE=M2`.
+
+**The single-writer handoff (§5.1) is built.** `SlotHandoff` is signed by the
+*outgoing* writer and binds slot, sequence and both writers, so it authorises
+one change rather than granting a reusable token — the distinction between a
+handover and a takeover, which is the whole of §5.1. It is a standalone record
+rather than a field on `SlotRecord`, because that format is peer-facing and
+frozen (§20). `verify_chain_with_handoffs` accepts an authorised change;
+`verify_chain` still refuses every change, which is the right default for a
+caller that was handed no handoffs. Not yet on the wire: `nas-transfer` has no
+request for them, so a peer can learn a handoff in-process only.
 
 **The deletion approval loop (§16.2) is built** (`crates/nas-delete`):
 `DeleteRequest` / `DeleteApproval` / `DeleteExecution`, quorum scaled by blast

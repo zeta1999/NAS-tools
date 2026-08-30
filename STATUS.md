@@ -7,8 +7,8 @@ spec by 2-3×**. The review found **four reproduced defects**, all fixed; see
 MANUAL-TESTING.md §7. **M1 is in progress:** the peer, the slot system and the
 transfer protocol are built and networked, and the CLI now drives them
 (`nas peer serve` / `nas peer sync`) — a namespace has been pushed over a real
-PQC socket between two `nas` processes on localhost. Remaining M1: the
-two-peers-plus-witness simulation, skip-chain checkpoints, ownership handoff.
+PQC socket between two `nas` processes on localhost, and again between three
+containers. Remaining M1: skip-chain checkpoints and the ownership handoff.
 
 `SPECS.md` is at **revision 5** (~1476 lines, 21 sections). It has survived one
 adversarial review (rev 1→2, 15 findings, all accepted), a round closing its own
@@ -101,15 +101,15 @@ listing; lease-based GC with deltas; **three confidentiality modes** (`e2ee`,
 - **`tests/usecases/`** — 88 acceptance assertions, milestone-gated; 58 are
   M0–M2. Measured on the current binary: **5 passing, 0 failing, 83 pending**
   at `NAS_MILESTONE=M0`; **36 passing, 0 failing, 52 pending** at
-  `NAS_MILESTONE=M1` (what `ci.sh` gates on); **39 passing, 19 failing, 30
-  pending** at `NAS_MILESTONE=M2` — the 19 are the deletion-resistance and
-  lifecycle assertions that M2 builds. UC07's two witness-node assertions
+  `NAS_MILESTONE=M1` (what `ci.sh` gates on); **49 passing, 9 failing, 30
+  pending** at `NAS_MILESTONE=M2`. UC07's two witness-node assertions
   (a fork detected by devices that never meet; the node holds no blobs and no
   slot data) pass in-process via `nas test fork-detect-via-witness` and
   `nas test witness-node-holds-nothing`. UC01 (transit-only), UC02 (passphrase)
-  and UC03 (e2ee) are all green end to end; UC09 (hostile peer) is 6 of 8, the
-  two remaining being lease griefing and the `all` drill that contains it,
-  both waiting on §16 leases. Verified to
+  and UC03 (e2ee) are all green end to end; UC04 (WORM) is 9 of 13, the four
+  remaining being the object verbs and the ACL grant they need; UC09 (hostile
+  peer) is 6 of 8, the two remaining being lease griefing and the `all` drill
+  that contains it. Verified to
   bite: a stub that always exits 0 fails the refusal assertion, and one that
   always exits 1 is reported BROKEN rather than refused (MANUAL-TESTING.md §6a).
 

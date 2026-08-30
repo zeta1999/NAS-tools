@@ -744,6 +744,34 @@ mod tests {
     }
 
     #[test]
+    fn a_fork_at_disjoint_sequences_is_detected_once_the_chain_is_walked() {
+        // The complement of the gap above, and what `nas peer sync` relies
+        // on: a witness carries no ancestry, but the peer's retained history
+        // does. Once the served chain has been offered, every record on it is
+        // evidence at its own sequence, so a witness citing a different hash
+        // *below* the served head collides with the chain right there.
+        let id = ident(1);
+        let c = chain_of(&id, 6, "a");
+        let mut cl = fresh(&c);
+        let ia = witness_ident(10);
+        cl.trust_witness(ia.verifying_key()).unwrap();
+        // Another device witnessed seq 3 on a branch this chain does not hold.
+        let wa = Witness::sign(&ia, slot(), 3, [0xA1; 32], 0).unwrap();
+        assert!(cl.observe_witness(&wa));
+        assert_eq!(cl.forked(), None, "one observation alone is not a fork");
+
+        let v = cl.offer(&c, &roster_of(&id));
+        assert!(
+            !matches!(v, Verdict::Alarm(_)),
+            "one witness is not a publishable proof, so no Alarm: {v:?}"
+        );
+        // ...but the evidence is there, and a caller that consults `forked`
+        // -- as the CLI does before believing a head -- sees it.
+        assert_eq!(cl.forked(), Some(3));
+        assert!(cl.fork_proof().is_none());
+    }
+
+    #[test]
     fn forked_can_be_true_without_a_publishable_proof() {
         // An honest distinction rather than a gap: the client was served two
         // histories but holds only one signed observation, so it knows and

@@ -64,13 +64,18 @@ settled and the work that follows from them.
 - [x] CI gate that fails on `sorry` in any Lean file — and a stronger one: every
       theorem carries `#print axioms`, and the gate fails on anything outside
       `propext` / `Classical.choice` / `Quot.sound`. Both verified to bite.
-- [ ] **Close the `ForkDetected` gap.** `SlotClient::forked` detects only
-      same-sequence equivocation; the TLA+ `Compatible` relation is a full
-      ancestry check that also catches branches at *different* sequence numbers
-      — which is what a real fork usually looks like, since each device
-      witnesses its own head. Needs witnesses to carry a `prev`/checkpoint link,
-      and a model whose witness abstraction matches. Asserted as a known gap by
-      `a_fork_at_disjoint_sequences_is_NOT_detected`.
+- [ ] **Close the `ForkDetected` gap in `nas-slots` alone.** `SlotClient::forked`
+      on witnesses only detects same-sequence equivocation; the TLA+
+      `Compatible` relation is a full ancestry check that also catches branches
+      at *different* sequence numbers — which is what a real fork usually looks
+      like, since each device witnesses its own head. **Closed over the wire:**
+      `nas peer sync` walks the peer's retained history from the lowest
+      witnessed/pinned sequence, so every witness is compared at its own
+      sequence (`a_fork_at_disjoint_sequences_is_detected_once_the_chain_is_walked`,
+      `uc12_fork_drill.sh` conns 6 and 10). Still open without a history to
+      walk — a witness carries no ancestry: needs witnesses to carry a
+      `prev`/checkpoint link, and a model whose witness abstraction matches.
+      Asserted by `a_fork_at_disjoint_sequences_is_NOT_detected`.
 - [ ] **Vary `ForkAt` in the TLC configs.** Both `MC_small.cfg` and
       `MC_full.cfg` fix it at 2, so the model never explores forks originating
       at different points.
@@ -205,6 +210,10 @@ settled and the work that follows from them.
 - [x] Freshness anchors, client pins, chain walking (`nas-slots` `client.rs`:
       `Anchor`, `Verdict`, pinned-seq refusal; exercised by the rollback and
       fork drills)
+- [x] Fork detection over the wire against a live `--hostile fork` peer: pin
+      carries seq + record hash, `sync` walks `SlotHistory` from the lowest
+      witnessed/pinned seq (`tests/usecases/uc12_fork_drill.sh`,
+      MANUAL-TESTING.md §13)
 - [ ] Skip-chain checkpoints (SPECS §5.5) — see the M1 entry
 - [x] Witness publication and relay (`PublishWitness`/`Witnesses` in
       `nas_transfer::handle`, `nas-slots` `witness.rs`; relay is

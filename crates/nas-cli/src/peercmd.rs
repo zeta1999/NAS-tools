@@ -41,7 +41,7 @@ use crate::repo::{self, Repo};
 use nas_core::{Addr, Mode};
 use nas_crypto::{Identity, Role};
 use nas_peer::{Acl, Hostility, Peer, Right};
-use nas_slots::{Regime, SlotId, SlotRecord, Witness, ROOT_NONCE_LEN};
+use nas_slots::{verify_chain, Regime, Roster, SlotId, SlotRecord, Witness, ROOT_NONCE_LEN};
 use nas_store::{Addressing, BlobStore};
 use nas_transfer::{transport_identity, Channel, Request, Response};
 use std::collections::BTreeMap;
@@ -415,6 +415,7 @@ pub fn serve(dir: &str, o: ServeOpts<'_>) -> i32 {
         mode
     );
 
+    let mut conns: u64 = 0;
     loop {
         let (sock, from) = match listener.accept() {
             Ok(x) => x,
@@ -441,9 +442,21 @@ pub fn serve(dir: &str, o: ServeOpts<'_>) -> i32 {
             .subject_for(ch.peer_identity())
             .unwrap_or("?")
             .to_string();
+        // Which branch this connection is shown (SPECS §5.3). A forking peer
+        // cannot tell one device of a namespace from another — they share the
+        // transport key — so it equivocates blindly: alternate connections
+        // are served alternate branches. An honest peer ignores the view.
+        let view = (conns % 2) as u8;
+        conns += 1;
+        peer.set_view(view);
+        let tag = if peer.hostility.fork {
+            format!(" (view {view})")
+        } else {
+            String::new()
+        };
         match nas_transfer::serve(&mut peer, &mut ch) {
-            Ok(n) => println!("  {from} as {subject}: {n} requests"),
-            Err(e) => eprintln!("  {from} as {subject}: {e}"),
+            Ok(n) => println!("  {from} as {subject}{tag}: {n} requests"),
+            Err(e) => eprintln!("  {from} as {subject}{tag}: {e}"),
         }
         if o.once {
             return exit::OK;
@@ -520,21 +533,41 @@ fn pin_path(repo: &Repo) -> PathBuf {
     repo.root.join("state/peer-seq")
 }
 
+/// What this device last saw served or published: a specific record, not a
+/// height (SPECS §5.3). A pin written before the hash was recorded (`seq`
+/// only) still bounds rollback and is upgraded on the next accepted head.
+#[derive(Clone, Copy)]
+struct Pin {
+    seq: u64,
+    record_hash: Option<[u8; 32]>,
+}
+
 /// A device that joined by copying `config` + `wraps/` has no `state/` yet;
 /// the pin must still land, since it is that device's only memory of what it
 /// has seen served.
-fn write_pin(repo: &Repo, seq: u64) -> Result<(), String> {
+fn write_pin(repo: &Repo, seq: u64, record_hash: [u8; 32]) -> Result<(), String> {
     let p = pin_path(repo);
     if let Some(dir) = p.parent() {
         fs::create_dir_all(dir).map_err(|e| format!("pin: {e}"))?;
     }
-    fs::write(p, format!("{seq}\n")).map_err(|e| format!("pin: {e}"))
+    fs::write(p, format!("{seq} {}\n", hex(&record_hash))).map_err(|e| format!("pin: {e}"))
 }
 
-fn read_pin(repo: &Repo) -> Option<u64> {
-    fs::read_to_string(pin_path(repo))
-        .ok()
-        .and_then(|s| s.trim().parse().ok())
+fn read_pin(repo: &Repo) -> Option<Pin> {
+    let s = fs::read_to_string(pin_path(repo)).ok()?;
+    let mut it = s.split_whitespace();
+    let seq = it.next()?.parse().ok()?;
+    let record_hash = it.next().and_then(|h| {
+        if h.len() != 64 {
+            return None;
+        }
+        let mut out = [0u8; 32];
+        for (i, o) in out.iter_mut().enumerate() {
+            *o = u8::from_str_radix(&h[2 * i..2 * i + 2], 16).ok()?;
+        }
+        Some(out)
+    });
+    Some(Pin { seq, record_hash })
 }
 
 /// `nas peer sync <ns> --peer <host:port> --peer-pub <file>`
@@ -645,20 +678,25 @@ pub fn sync(ns: &str, o: SyncOpts<'_>) -> i32 {
         },
     };
 
-    // The local pin is the client's memory of what it has already published.
-    // A peer serving anything older, or nothing at all when there was
-    // something, is rolling back (SPECS §5.2) — the defence the socket tests
-    // exercise, now on the CLI path.
-    //
-    // `None` means there is nothing to publish (the peer already serves this
-    // HEAD, or there is no local HEAD); `Some` is the next record to publish.
-    let next = match (&served, pinned) {
+    // The local pin is this device's memory of what it has already seen
+    // served or published: a specific record, not merely a height (SPECS
+    // §5.3). A peer serving anything older, or nothing at all when there was
+    // something, is rolling back (SPECS §5.2). A peer serving a *different*
+    // record at the pinned sequence is forking — and since the pin is one
+    // point, the chain from it to the served head is walked below so that
+    // nothing between them was swapped either.
+    let mut roster = Roster::new();
+    if let Err(e) = roster.add(writer.verifying_key()) {
+        return err(format!("roster: {e}"));
+    }
+    match (&served, pinned) {
         (None, Some(p)) => {
             return refused(format!(
-                "peer serves no head, but seq {p} was seen here before (rollback or withholding)"
+                "peer serves no head, but seq {} was seen here before (rollback or withholding)",
+                p.seq
             ));
         }
-        (None, None) => root.map(|r| (0, [0u8; 32], r)),
+        (None, None) => {}
         (Some(h), pin) => {
             if h.slot_id != slot {
                 return refused("peer served a record for a different slot");
@@ -669,34 +707,15 @@ pub fn sync(ns: &str, o: SyncOpts<'_>) -> i32 {
                 ));
             }
             if let Some(p) = pin {
-                if h.seq < p {
+                if h.seq < p.seq {
                     return refused(format!(
-                        "peer serves seq {}, but seq {p} was seen here before (rollback)",
-                        h.seq
+                        "peer serves seq {}, but seq {} was seen here before (rollback)",
+                        h.seq, p.seq
                     ));
                 }
             }
-            match root {
-                Some(r) if h.root == r => {
-                    println!(
-                        "head: seq {} already points at {}; up to date",
-                        h.seq,
-                        r.to_hex()
-                    );
-                    None
-                }
-                Some(r) => Some((h.seq + 1, h.record_hash(), r)),
-                None => {
-                    println!(
-                        "head: peer serves seq {} -> {}; nothing local to publish",
-                        h.seq,
-                        h.root.to_hex()
-                    );
-                    None
-                }
-            }
         }
-    };
+    }
 
     // ── Witness node (SPECS §5.3) ──
     //
@@ -727,7 +746,7 @@ pub fn sync(ns: &str, o: SyncOpts<'_>) -> i32 {
                 Ok(other) => return err(format!("unexpected reply to Witnesses: {other:?}")),
                 Err(e) => return err(e),
             };
-            let mut ours = 0usize;
+            let mut ours = Vec::new();
             for bytes in &held {
                 let w = match Witness::decode(bytes) {
                     Ok(w) => w,
@@ -738,37 +757,153 @@ pub fn sync(ns: &str, o: SyncOpts<'_>) -> i32 {
                 if w.witness_pk != wid.verifying_key() || w.slot_id != slot || w.verify().is_err() {
                     continue;
                 }
-                ours += 1;
-                match &served {
-                    None => {
-                        return refused(format!(
-                            "peer serves no head, but seq {} was witnessed (rollback or withholding)",
-                            w.seq
-                        ))
-                    }
-                    Some(h) if w.seq > h.seq => {
-                        return refused(format!(
-                            "peer serves seq {}, but seq {} was witnessed (rollback)",
-                            h.seq, w.seq
-                        ))
-                    }
-                    Some(h) if w.seq == h.seq && w.sig_hash != h.sig_hash() => {
-                        return refused(format!(
-                            "fork: the witness saw a different record at seq {} than the peer serves (SPECS §5.3)",
-                            w.seq
-                        ))
-                    }
-                    _ => {}
-                }
+                ours.push(w);
             }
-            println!(
-                "witnesses: {ours} of {} relayed by {addr} are this namespace's; none contradict the served head",
-                held.len()
-            );
-            Some((wch, wid, addr))
+            Some((wch, wid, addr, held.len(), ours))
         }
         (None, None) => None,
         _ => return err("--witness and --witness-pub go together"),
+    };
+    let witnessed: &[Witness] = witness_node.as_ref().map(|w| w.4.as_slice()).unwrap_or(&[]);
+
+    // A witness ahead of the served head is a rollback (or withholding) that
+    // no pin here can see: the observation was another device's.
+    for w in witnessed {
+        match &served {
+            None => {
+                return refused(format!(
+                    "peer serves no head, but seq {} was witnessed (rollback or withholding)",
+                    w.seq
+                ))
+            }
+            Some(h) if w.seq > h.seq => {
+                return refused(format!(
+                    "peer serves seq {}, but seq {} was witnessed (rollback)",
+                    h.seq, w.seq
+                ))
+            }
+            _ => {}
+        }
+    }
+
+    // ── Chain walk (SPECS §5.3, mechanism 2) ──
+    //
+    // Everything at or below the served head that this namespace has a
+    // memory of — this device's pin, every witness its devices published —
+    // must lie on the chain the peer serves *now*. A forking peer keeps two
+    // consistent histories and shows each client one; every record on both
+    // is genuinely signed, so no signature check can tell. Comparing what was
+    // seen before against what is served now, at the same sequence, can.
+    //
+    // A witness *below* the head is the case `SlotClient::forked` cannot
+    // check on its own — a witness carries no ancestry — and the usual shape
+    // of a real fork, since each device witnesses its own head. With the
+    // peer's retained history it is checkable, and checked here.
+    if let Some(h) = &served {
+        let from = witnessed
+            .iter()
+            .map(|w| w.seq)
+            .chain(pinned.map(|p| p.seq))
+            .min()
+            .unwrap_or(h.seq)
+            .min(h.seq);
+        let history = match call(&mut ch, &Request::SlotHistory { slot, from }) {
+            Ok(Response::Records(rs)) => rs,
+            Ok(Response::Error(m)) => return refused(format!("history: {m}")),
+            Ok(other) => return err(format!("unexpected reply to SlotHistory: {other:?}")),
+            Err(e) => return err(e),
+        };
+        let mut chain = Vec::with_capacity(history.len());
+        for bytes in &history {
+            match SlotRecord::decode(bytes) {
+                Ok(r) => chain.push(r),
+                Err(e) => {
+                    return refused(format!("peer served an undecodable history record: {e}"))
+                }
+            }
+        }
+        // The first link is open unless the walk starts at genesis: a walk
+        // from a witnessed sequence has no memory of that record's
+        // predecessor. Contiguity and every later link are verified.
+        let expect_prev = chain.first().filter(|f| f.seq > 0).map(|f| f.prev);
+        let walk = match verify_chain(&chain, slot, &roster, expect_prev) {
+            Ok(w) => w,
+            Err(e) => {
+                return refused(format!(
+                    "peer's history from seq {from} does not verify: {e}"
+                ))
+            }
+        };
+        if walk.head_seq != h.seq || walk.head_hash != h.record_hash() {
+            return refused(format!(
+                "peer serves seq {} but its retained history from seq {from} reaches seq {} (SPECS §5.5; the wire returns at most {} records)",
+                h.seq,
+                walk.head_seq,
+                nas_transfer::MAX_RECORDS
+            ));
+        }
+        let at = |seq: u64| chain.iter().find(|r| r.seq == seq);
+        if let Some(p) = pinned {
+            if let (Some(want), Some(r)) = (p.record_hash, at(p.seq)) {
+                if r.record_hash() != want {
+                    return refused(format!(
+                        "fork: the peer serves a different record at seq {} than the one seen here before (SPECS §5.3)",
+                        p.seq
+                    ));
+                }
+            }
+        }
+        for w in witnessed {
+            match at(w.seq) {
+                Some(r) if r.sig_hash() != w.sig_hash => {
+                    return refused(format!(
+                        "fork: the witness saw a different record at seq {} than the chain the peer now serves (SPECS §5.3)",
+                        w.seq
+                    ))
+                }
+                Some(_) => {}
+                None => return err(format!("verified chain has no record at seq {}", w.seq)),
+            }
+        }
+        println!(
+            "chain: walked seq {from}..{} from the peer's history; {} on it",
+            h.seq,
+            match (pinned, witnessed.len()) {
+                (Some(_), n) => format!("the pin and {n} witnesses lie"),
+                (None, n) => format!("{n} witnesses lie"),
+            }
+        );
+    }
+    if let Some((_, _, addr, total, ours)) = &witness_node {
+        println!(
+            "witnesses: {} of {total} relayed by {addr} are this namespace's; none contradict the served head",
+            ours.len()
+        );
+    }
+
+    // `None` means there is nothing to publish (the peer already serves this
+    // HEAD, or there is no local HEAD); `Some` is the next record to publish.
+    let next = match &served {
+        None => root.map(|r| (0, [0u8; 32], r)),
+        Some(h) => match root {
+            Some(r) if h.root == r => {
+                println!(
+                    "head: seq {} already points at {}; up to date",
+                    h.seq,
+                    r.to_hex()
+                );
+                None
+            }
+            Some(r) => Some((h.seq + 1, h.record_hash(), r)),
+            None => {
+                println!(
+                    "head: peer serves seq {} -> {}; nothing local to publish",
+                    h.seq,
+                    h.root.to_hex()
+                );
+                None
+            }
+        },
     };
 
     let (seq, sig_hash) = match next {
@@ -782,8 +917,8 @@ pub fn sync(ns: &str, o: SyncOpts<'_>) -> i32 {
             // A served head this device accepted is now its floor too: the
             // pin is what was *seen* here, not only what was published here,
             // so a later rollback is caught even by a device that never wrote.
-            if pinned.is_none_or(|p| h.seq > p) {
-                if let Err(e) = write_pin(&repo, h.seq) {
+            if pinned.is_none_or(|p| h.seq > p.seq || p.record_hash.is_none()) {
+                if let Err(e) = write_pin(&repo, h.seq, h.record_hash()) {
                     return err(e);
                 }
             }
@@ -809,7 +944,7 @@ pub fn sync(ns: &str, o: SyncOpts<'_>) -> i32 {
                 Ok(other) => return err(format!("unexpected reply to PublishSlot: {other:?}")),
                 Err(e) => return err(e),
             }
-            if let Err(e) = write_pin(&repo, seq) {
+            if let Err(e) = write_pin(&repo, seq, rec.record_hash()) {
                 return err(e);
             }
             println!(
@@ -821,7 +956,7 @@ pub fn sync(ns: &str, o: SyncOpts<'_>) -> i32 {
         }
     };
 
-    if let Some((mut wch, wid, addr)) = witness_node {
+    if let Some((mut wch, wid, addr, _, _)) = witness_node {
         // `logical_time` is this observer's own counter, not a clock; the slot
         // sequence is monotone for one namespace's observations of its own slot.
         let w = match Witness::sign(&wid, slot, seq, sig_hash, seq) {

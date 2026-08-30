@@ -981,3 +981,45 @@ One defect, and it is the same one §12 found, one call site over:
   if someone reads the output against them. `set_head` now creates the
   directory. The unit tests could not have caught either: they all create
   namespaces, none joins one.
+
+## 14. The skip-chain ladder over the socket (SPECS §5.5)
+
+`tests/usecases/uc13_skip_chain.sh`, two processes, fixed port 47345. Not run
+by `run.sh` — it needs a live listener and a `--release` binary.
+
+§5.5's checkpoint is easy to over-read as "the history is verified", so the
+drill is arranged to show the three things that are actually true and the one
+that is not.
+
+- **The writer publishes a rung and pins it.** First sync: `head: published
+  seq 0`, then `checkpointed seq 0 (SPECS §5.5)`, and
+  `state/peer-checkpoint` holds `0 4c1d0add…`. Seq 0 is a rung because the
+  default interval is 256 and `0 % 256 == 0`.
+- **The ladder is verified against that pin, not merely fetched.** Second
+  sync: `ladder: 1 rung verified, seq 0..0, continuing the rung pinned here`.
+- **A device that only *verified* a ladder pins it too.** Device 2 joins by
+  copying `config` + `wraps`, has no rung pin, so it anchors at genesis —
+  `ladder: 1 rung verified, seq 0..0, from genesis` — and writes the same pin
+  device 1 has. This is the record pin's rule one level up: what was *seen*
+  here bounds a rollback, not only what was published here.
+- **A peer that drops the ladder is refused by both.** With
+  `data/checkpoints` deleted and the records left intact, device 1 and device
+  2 both get `refused: peer serves no checkpoint at or above seq 0, which was
+  pinned here (SPECS §5.5)`, exit 2. Device 2 is the interesting one: it never
+  published a rung, and is still not fooled.
+- **And the blind spot, stated rather than papered over.** A third device with
+  no memory syncs happily against the same peer, exit 0. Nothing was pinned,
+  so nothing is contradicted. That is §5.4's honest bar again: the ladder
+  detects divergence from what an observer *remembers*, and an observer with
+  no memory remembers nothing.
+
+What the drill deliberately does not claim: a verified ladder says nothing
+about the records *between* rungs. A peer may omit or substitute those and the
+skip walk will not see it — which is why `verify_skip_chain` returns `records`
+and `skipped` separately, and why the full walk remains what `nas peer sync`
+does over the retained history.
+
+No defects found by this drill. Two were found while building it, both by
+running it rather than by the unit tests: the ladder was fetched but a device
+that verified one never pinned it (so it would have accepted the same peer
+dropping to genesis the next day), and the report said "1 rungs".

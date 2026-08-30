@@ -347,7 +347,7 @@ impl LeaseCheckpoint {
         let root = merkle::root(&set);
         let count = set.len() as u64;
         let b = cp_body(epoch, seq, &root, count, &prev);
-        let sig = identity.sign(SigContext::Checkpoint, &b)?;
+        let sig = identity.sign(SigContext::LeaseCheckpoint, &b)?;
         Ok(Self {
             holder_pk: identity.verifying_key().to_vec(),
             epoch,
@@ -362,7 +362,7 @@ impl LeaseCheckpoint {
     pub fn verify(&self) -> Result<(), LeaseError> {
         check_genesis(self.seq, &self.prev)?;
         let b = cp_body(self.epoch, self.seq, &self.root, self.count, &self.prev);
-        verify(&self.holder_pk, SigContext::Checkpoint, &b, &self.sig)
+        verify(&self.holder_pk, SigContext::LeaseCheckpoint, &b, &self.sig)
             .map_err(|_| LeaseError::BadSignature)
     }
 

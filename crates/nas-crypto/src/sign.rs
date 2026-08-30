@@ -288,7 +288,7 @@ mod tests {
         let id = Identity::derive(&SEED, Role::Slot).unwrap();
         let msg = b"same bytes, different meaning";
         let sig = id.sign(SigContext::Slot, msg).unwrap();
-        assert!(verify(id.verifying_key(), SigContext::Checkpoint, msg, &sig).is_err());
+        assert!(verify(id.verifying_key(), SigContext::LeaseCheckpoint, msg, &sig).is_err());
         for ctx in SigContext::ALL {
             let ok = verify(id.verifying_key(), ctx, msg, &sig).is_ok();
             assert_eq!(ok, ctx == SigContext::Slot, "{ctx:?}");

@@ -10,7 +10,7 @@
 //! precisely the mistake the list exists to prevent — so the list is code here,
 //! not prose, and `SigContext` is an enum so a new variant cannot be forgotten.
 
-/// The twelve signing contexts of SPECS §3.1.
+/// The signing contexts of SPECS §3.1.
 ///
 /// An enum rather than loose constants: adding a signed object means adding a
 /// variant, and every `match` over it then fails to compile until the new case
@@ -19,7 +19,16 @@
 pub enum SigContext {
     Slot,
     Lease,
-    Checkpoint,
+    /// SPECS §6: the **lease** checkpoint. Named for what it signs, because
+    /// there is now a slot checkpoint too and "Checkpoint" alone was a trap.
+    /// The bytes are unchanged — they are already signed into every lease
+    /// checkpoint in existence, and renaming a variant is not a reason to
+    /// invalidate them.
+    LeaseCheckpoint,
+    /// SPECS §5.5: the **slot** skip-chain checkpoint, signed by the writer.
+    /// A distinct context from the lease one so neither can ever stand in for
+    /// the other, whatever key happens to have signed it.
+    SlotCheckpoint,
     Roster,
     Cap,
     Witness,
@@ -41,7 +50,8 @@ impl SigContext {
         match self {
             Self::Slot => b"nas-tools/sig/slot/v1",
             Self::Lease => b"nas-tools/sig/lease/v1",
-            Self::Checkpoint => b"nas-tools/sig/checkpoint/v1",
+            Self::LeaseCheckpoint => b"nas-tools/sig/checkpoint/v1",
+            Self::SlotCheckpoint => b"nas-tools/sig/slot-checkpoint/v1",
             Self::Roster => b"nas-tools/sig/roster/v1",
             Self::Cap => b"nas-tools/sig/cap/v1",
             Self::Witness => b"nas-tools/sig/witness/v1",
@@ -56,10 +66,11 @@ impl SigContext {
     }
 
     /// Every variant, so tests can assert the list is complete and distinct.
-    pub const ALL: [SigContext; 13] = [
+    pub const ALL: [SigContext; 14] = [
         Self::Slot,
         Self::Lease,
-        Self::Checkpoint,
+        Self::LeaseCheckpoint,
+        Self::SlotCheckpoint,
         Self::Roster,
         Self::Cap,
         Self::Witness,
@@ -108,12 +119,13 @@ mod tests {
 
     #[test]
     fn every_context_is_present_and_distinct() {
-        // SPECS §3.1 names twelve; `SlotHandoff` is the thirteenth, added with
-        // §5.1's handoff record. A collision here would silently let one
-        // object's signature be accepted for another.
-        assert_eq!(SigContext::ALL.len(), 13);
+        // SPECS §3.1 names twelve. `SlotHandoff` is the thirteenth (§5.1's
+        // handoff record) and `SlotCheckpoint` the fourteenth (§5.5's
+        // skip-chain link). A collision here would silently let one object's
+        // signature be accepted for another.
+        assert_eq!(SigContext::ALL.len(), 14);
         let set: HashSet<&[u8]> = SigContext::ALL.iter().map(|c| c.as_bytes()).collect();
-        assert_eq!(set.len(), 13, "signing contexts must be pairwise distinct");
+        assert_eq!(set.len(), 14, "signing contexts must be pairwise distinct");
     }
 
     /// Every KDF context string in this module.

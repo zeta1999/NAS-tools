@@ -14,7 +14,8 @@ use crate::hostile::Hostility;
 use nas_core::{Addr, Mode, Timestamp};
 use nas_lease::{plan_sweep, BlobInfo, GcPolicy, Holder, SweepPlan};
 use nas_slots::{
-    HandoffError, Regime, Roster, SlotHandoff, SlotId, SlotRecord, Witness, WitnessError,
+    Checkpoint, CheckpointError, HandoffError, Regime, Roster, SlotHandoff, SlotId, SlotRecord,
+    Witness, WitnessError,
 };
 use nas_store::{Addressing, BlobStore, StoreError};
 
@@ -34,6 +35,16 @@ pub const MAX_WITNESSES_PER_SLOT: usize = 1024;
 /// disk. A full slot refuses rather than evicting, because dropping a handoff
 /// would make an authorised change look like a takeover.
 pub const MAX_HANDOFFS_PER_SLOT: usize = 1024;
+
+/// Skip-chain checkpoints retained per slot (SPECS §5.5).
+///
+/// At the default interval of 256 records this is one rung per 256 updates,
+/// so it covers a slot written about 262 000 times — two orders of magnitude
+/// past retain-N, which stops keeping the records themselves at 1024. Bounded
+/// for the reason the other two stores are: `publish_checkpoint` is reachable
+/// from the network, and an append-only store with no bound is a way to fill a
+/// peer's disk.
+pub const MAX_CHECKPOINTS_PER_SLOT: usize = 1024;
 
 /// What identifies one authorisation: the sequence it applies at, and the two
 /// writers. Every component is one the signed body binds, so two handoffs with
@@ -99,6 +110,12 @@ pub enum PeerError {
     /// A witness-only node (SPECS §5.3): it relays witnesses and does nothing
     /// else, so it can hold no blobs and no capabilities to lose.
     WitnessOnly,
+    /// A checkpoint that does not verify against the key it carries.
+    Checkpoint(CheckpointError),
+    /// Too many checkpoints for one slot. See [`MAX_CHECKPOINTS_PER_SLOT`].
+    CheckpointsFull {
+        slot: SlotId,
+    },
     /// A handoff that does not verify, or that names writers this peer has no
     /// reason to accept (SPECS §5.1).
     Handoff(HandoffError),
@@ -148,6 +165,12 @@ impl std::fmt::Display for PeerError {
             Self::WitnessOnly => write!(
                 f,
                 "witness-only node: relays witnesses and holds no blobs, slots or caps (SPECS §5.3)"
+            ),
+            Self::Checkpoint(e) => write!(f, "checkpoint rejected: {e}"),
+            Self::CheckpointsFull { slot } => write!(
+                f,
+                "slot {} already holds {MAX_CHECKPOINTS_PER_SLOT} checkpoints",
+                slot.to_hex()
             ),
             Self::Handoff(e) => write!(f, "handoff rejected: {e}"),
             Self::HandoffsFull { slot } => write!(
@@ -231,6 +254,16 @@ pub struct Peer {
     /// restart came back holding fewer than had been accepted. Keying memory
     /// and disk the same way is what stops those two disagreeing.
     handoffs: BTreeMap<SlotId, BTreeMap<HandoffKey, SlotHandoff>>,
+    /// Skip-chain checkpoints, `slot -> (seq, checkpoint hash) -> rung`
+    /// (SPECS §5.5).
+    ///
+    /// Keyed by the hash as well as the sequence, so two *conflicting* rungs
+    /// at one sequence are both kept. They are the writer equivocating about
+    /// its own history — evidence a client should be able to see, in the way a
+    /// pair of contradictory witnesses is (§5.3). Keeping one and dropping the
+    /// other would make the peer the judge of which history is real, which is
+    /// the one thing a distrusted peer must not decide.
+    checkpoints: BTreeMap<SlotId, BTreeMap<(u64, [u8; 32]), Checkpoint>>,
     /// Serve the witness relay and refuse everything else (SPECS §5.3, "a
     /// witness-only node holds no blobs and no caps"). Enforced at the
     /// dispatch, where every request passes; a flag the store consulted
@@ -261,6 +294,7 @@ impl Peer {
             retention: std::collections::BTreeSet::new(),
             witnesses: BTreeMap::new(),
             handoffs: BTreeMap::new(),
+            checkpoints: BTreeMap::new(),
             witness_only: false,
             hostility,
         };
@@ -320,6 +354,31 @@ impl Peer {
                                 .entry(h.slot_id)
                                 .or_default()
                                 .insert(handoff_key(&h), h);
+                        }
+                    }
+                }
+            }
+        }
+        if let Ok(rd) = fs::read_dir(self.root.join("checkpoints")) {
+            for e in rd.flatten() {
+                let Ok(files) = fs::read_dir(e.path()) else {
+                    continue;
+                };
+                for f in files.flatten() {
+                    let Ok(bytes) = fs::read(f.path()) else {
+                        continue;
+                    };
+                    // Not roster-checked here, unlike `publish_checkpoint`:
+                    // the roster is loaded by the caller after `open`, so a
+                    // check now would drop every rung on every restart. The
+                    // signature it carries is re-verified, and the client
+                    // checks the roster where it matters -- during the walk.
+                    if let Ok(c) = Checkpoint::decode(&bytes) {
+                        if c.verify_self().is_ok() {
+                            self.checkpoints
+                                .entry(c.slot_id)
+                                .or_default()
+                                .insert((c.seq, c.checkpoint_hash()), c);
                         }
                     }
                 }
@@ -431,6 +490,72 @@ impl Peer {
         fs::write(&tmp, &bytes)?;
         fs::rename(&tmp, dir.join(name))?;
         Ok(())
+    }
+
+    fn persist_checkpoint(&self, c: &Checkpoint) -> Result<(), PeerError> {
+        let dir = self.root.join("checkpoints").join(c.slot_id.to_hex());
+        fs::create_dir_all(&dir)?;
+        let bytes = c.encode().map_err(PeerError::Checkpoint)?;
+        let h = c.checkpoint_hash();
+        let name = format!(
+            "{}-{}",
+            c.seq,
+            h.iter().map(|b| format!("{b:02x}")).collect::<String>()
+        );
+        let tmp = dir.join(format!("{name}.tmp"));
+        fs::write(&tmp, &bytes)?;
+        fs::rename(&tmp, dir.join(name))?;
+        Ok(())
+    }
+
+    // ── Skip-chain checkpoints (SPECS §5.5) ─────────────────────────────
+
+    /// Accept a signed checkpoint.
+    ///
+    /// Checked against the roster as well as its own signature, unlike the
+    /// witness relay: a checkpoint is the *writer* asserting its history, and
+    /// this peer already refuses records from writers it does not roster. A
+    /// relay open to anyone would be a store anyone can fill with statements
+    /// no client will ever believe.
+    ///
+    /// Whether a rung is *usable* is decided by the client walking the ladder,
+    /// against the anchor it holds. The peer neither links them nor prunes
+    /// them.
+    pub fn publish_checkpoint(&mut self, c: Checkpoint) -> Result<(), PeerError> {
+        let Some(vk) = self.roster.get(&c.writer_id()) else {
+            return Err(PeerError::NotRostered);
+        };
+        c.verify(vk).map_err(PeerError::Checkpoint)?;
+        let key = (c.seq, c.checkpoint_hash());
+        let held = self.checkpoints.get(&c.slot_id);
+        if held.is_some_and(|cs| cs.contains_key(&key)) {
+            return Ok(());
+        }
+        if held.map(|cs| cs.len() >= MAX_CHECKPOINTS_PER_SLOT) == Some(true) {
+            return Err(PeerError::CheckpointsFull { slot: c.slot_id });
+        }
+        self.persist_checkpoint(&c)?;
+        self.checkpoints
+            .entry(c.slot_id)
+            .or_default()
+            .insert(key, c);
+        Ok(())
+    }
+
+    /// Every checkpoint at or above `from`, ascending.
+    ///
+    /// Ascending by `(seq, hash)`, so a conflicting pair at one sequence
+    /// arrives together and a client can see the equivocation rather than
+    /// having to ask twice and compare.
+    pub fn checkpoints(&self, slot: &SlotId, from: u64) -> Vec<Checkpoint> {
+        self.checkpoints
+            .get(slot)
+            .map(|cs| {
+                cs.range((from, [0u8; 32])..)
+                    .map(|(_, c)| c.clone())
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     // ── Ownership handoff (SPECS §5.1) ──────────────────────────────────
@@ -2160,5 +2285,179 @@ mod handoff_tests {
         .unwrap();
         p.publish_slot("laptop", second)
             .expect("cas-merge has never needed a handoff");
+    }
+}
+
+#[cfg(test)]
+mod checkpoint_tests {
+    //! SPECS §5.5: the peer stores rungs; the client decides what they mean.
+    use super::*;
+    use nas_crypto::{Identity, Role};
+    use nas_slots::ROOT_NONCE_LEN;
+
+    struct Scratch(PathBuf);
+    impl Scratch {
+        fn new(tag: &str) -> Self {
+            let p = std::env::temp_dir().join(format!("nas-cp-{}-{tag}", std::process::id()));
+            let _ = fs::remove_dir_all(&p);
+            Self(p)
+        }
+    }
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn ident(seed: u8) -> Identity {
+        Identity::derive(&[seed; 32], Role::Slot).unwrap()
+    }
+
+    fn slot() -> SlotId {
+        SlotId::new(b"ns", b"refs/heads/main")
+    }
+
+    fn rec(id: &Identity, seq: u64, prev: [u8; 32], tag: &str) -> SlotRecord {
+        SlotRecord::sign(
+            id,
+            slot(),
+            seq,
+            Addr::of_ciphertext(tag.as_bytes()),
+            [1u8; ROOT_NONCE_LEN],
+            prev,
+            Regime::CasMerge,
+        )
+        .unwrap()
+    }
+
+    fn open(s: &Scratch, writer: &Identity) -> Peer {
+        let mut p = Peer::open(&s.0, Mode::E2ee, Addressing::Content, Hostility::HONEST).unwrap();
+        p.roster.add(writer.verifying_key()).unwrap();
+        p
+    }
+
+    #[test]
+    fn a_rung_is_stored_and_served_from_a_height() {
+        let s = Scratch::new("serve");
+        let a = ident(1);
+        let mut p = open(&s, &a);
+        let g = rec(&a, 0, [0u8; 32], "g");
+        let c0 = Checkpoint::of_record(&a, &g, None).unwrap();
+        let r10 = rec(&a, 10, c0.checkpoint_hash(), "ten");
+        let c10 = Checkpoint::of_record(&a, &r10, Some(&c0)).unwrap();
+        p.publish_checkpoint(c0.clone()).unwrap();
+        p.publish_checkpoint(c10.clone()).unwrap();
+
+        assert_eq!(p.checkpoints(&slot(), 0), vec![c0, c10.clone()]);
+        assert_eq!(p.checkpoints(&slot(), 1), vec![c10]);
+        assert_eq!(p.checkpoints(&slot(), 11), vec![]);
+    }
+
+    #[test]
+    fn an_unrostered_writer_cannot_fill_the_ladder() {
+        // A checkpoint is the writer asserting its own history. A peer that
+        // stored assertions from anyone would be holding statements no client
+        // will ever believe.
+        let s = Scratch::new("unrostered");
+        let (a, stranger) = (ident(1), ident(2));
+        let mut p = open(&s, &a);
+        let g = rec(&stranger, 0, [0u8; 32], "g");
+        let c = Checkpoint::of_record(&stranger, &g, None).unwrap();
+        c.verify_self().expect("it is a real signature");
+        assert!(matches!(
+            p.publish_checkpoint(c),
+            Err(PeerError::NotRostered)
+        ));
+        assert!(p.checkpoints(&slot(), 0).is_empty());
+    }
+
+    #[test]
+    fn two_conflicting_rungs_at_one_sequence_are_both_kept() {
+        // The writer equivocating about its own history is evidence, and the
+        // peer is not the party that gets to decide which branch is real.
+        let s = Scratch::new("equivocation");
+        let a = ident(1);
+        let mut p = open(&s, &a);
+        let left = rec(&a, 0, [0u8; 32], "left");
+        let right = rec(&a, 0, [0u8; 32], "right");
+        p.publish_checkpoint(Checkpoint::of_record(&a, &left, None).unwrap())
+            .unwrap();
+        p.publish_checkpoint(Checkpoint::of_record(&a, &right, None).unwrap())
+            .unwrap();
+        let held = p.checkpoints(&slot(), 0);
+        assert_eq!(held.len(), 2, "both rungs at seq 0 survive");
+        assert_ne!(held[0].record_hash, held[1].record_hash);
+    }
+
+    #[test]
+    fn a_tampered_rung_is_refused_and_not_kept() {
+        let s = Scratch::new("tampered");
+        let a = ident(1);
+        let mut p = open(&s, &a);
+        let g = rec(&a, 0, [0u8; 32], "g");
+        let mut c = Checkpoint::of_record(&a, &g, None).unwrap();
+        c.record_hash = [9u8; 32];
+        assert!(matches!(
+            p.publish_checkpoint(c),
+            Err(PeerError::Checkpoint(_))
+        ));
+        assert!(p.checkpoints(&slot(), 0).is_empty());
+    }
+
+    #[test]
+    fn rungs_survive_a_restart() {
+        // A ladder that forgot itself would put every far-behind client back
+        // on the degraded path, which is the thing §5.5 exists to avoid.
+        let s = Scratch::new("persist");
+        let a = ident(1);
+        let g = rec(&a, 0, [0u8; 32], "g");
+        let c0 = Checkpoint::of_record(&a, &g, None).unwrap();
+        {
+            let mut p = open(&s, &a);
+            p.publish_checkpoint(c0.clone()).unwrap();
+        }
+        let p = open(&s, &a);
+        assert_eq!(p.checkpoints(&slot(), 0), vec![c0]);
+    }
+
+    #[test]
+    fn publishing_the_same_rung_twice_is_idempotent() {
+        let s = Scratch::new("idempotent");
+        let a = ident(1);
+        let mut p = open(&s, &a);
+        let g = rec(&a, 0, [0u8; 32], "g");
+        let c = Checkpoint::of_record(&a, &g, None).unwrap();
+        p.publish_checkpoint(c.clone()).unwrap();
+        p.publish_checkpoint(c).unwrap();
+        assert_eq!(p.checkpoints(&slot(), 0).len(), 1);
+    }
+
+    #[test]
+    fn the_ladder_is_bounded() {
+        let s = Scratch::new("bounded");
+        let a = ident(1);
+        let mut p = open(&s, &a);
+        let g = rec(&a, 0, [0u8; 32], "g");
+        let c0 = Checkpoint::of_record(&a, &g, None).unwrap();
+        p.publish_checkpoint(c0.clone()).unwrap();
+        // Rungs signed directly rather than built from records: each still
+        // carries a real signature over a distinct sequence, which is what
+        // the bound counts, and the test does not pay for a record signature
+        // it never uses.
+        let (anchor, back) = (c0.record_hash, c0.checkpoint_hash());
+        let fill = |p: &mut Peer, seq: u64| {
+            p.publish_checkpoint(Checkpoint::sign(&a, slot(), seq, anchor, 0, back).unwrap())
+        };
+        for seq in 1..MAX_CHECKPOINTS_PER_SLOT as u64 {
+            fill(&mut p, seq).unwrap();
+        }
+        assert!(matches!(
+            fill(&mut p, MAX_CHECKPOINTS_PER_SLOT as u64),
+            Err(PeerError::CheckpointsFull { .. })
+        ));
+        // A full slot still accepts one it already holds, so a retry after a
+        // dropped connection is not reported as a refusal.
+        fill(&mut p, 1).unwrap();
+        assert_eq!(p.checkpoints(&slot(), 0).len(), MAX_CHECKPOINTS_PER_SLOT);
     }
 }

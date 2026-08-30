@@ -41,7 +41,10 @@ use crate::repo::{self, Repo};
 use nas_core::{Addr, Mode};
 use nas_crypto::{Identity, Role};
 use nas_peer::{Acl, Hostility, Peer, Right};
-use nas_slots::{verify_chain, Regime, Roster, SlotId, SlotRecord, Witness, ROOT_NONCE_LEN};
+use nas_slots::{
+    verify_chain_with_handoffs, Regime, Roster, SlotHandoff, SlotId, SlotRecord, Witness,
+    ROOT_NONCE_LEN,
+};
 use nas_store::{Addressing, BlobStore};
 use nas_transfer::{transport_identity, Channel, Request, Response};
 use std::collections::BTreeMap;
@@ -786,6 +789,66 @@ pub fn sync(ns: &str, o: SyncOpts<'_>) -> i32 {
         }
     }
 
+    // ── Ownership handoffs (SPECS §5.1) ──
+    //
+    // Under `single-writer` a change of writer is an alarm unless the
+    // *outgoing* writer signed it away. The client cannot judge that without
+    // the signed record, so it asks for what the peer holds and hands it to
+    // the walk. Only the signature is trusted: an unverifiable handoff, or
+    // one for another slot, is dropped here rather than left for the walk to
+    // trip over.
+    //
+    // The roster is deliberately **not** extended from what comes back. A
+    // handoff carries the outgoing writer's key in full, so it is tempting to
+    // add it — and that would let the peer decide who may have written this
+    // namespace's history, which is the one thing the roster exists to say.
+    // A chain by a writer this device does not know still refuses.
+    //
+    // Today every device of a namespace derives the same `Role::Slot` key, so
+    // there is only ever one writer and this changes no outcome. It is here
+    // so that a chain which does cross an authorised change is refused for a
+    // reason, rather than because nobody asked.
+    let handoffs = match call(&mut ch, &Request::Handoffs(slot)) {
+        Ok(Response::Records(rs)) => rs,
+        Ok(Response::Error(m)) => return refused(format!("handoffs: {m}")),
+        Ok(other) => return err(format!("unexpected reply to Handoffs: {other:?}")),
+        Err(e) => return err(e),
+    };
+    let mut authorisations = Vec::new();
+    for bytes in &handoffs {
+        let Ok(h) = SlotHandoff::decode(bytes) else {
+            return refused("peer served an undecodable handoff".to_string());
+        };
+        if h.slot_id == slot && h.verify().is_ok() {
+            authorisations.push(h);
+        }
+    }
+    // Someone asserting this namespace signed its own slot away is worth a
+    // human's attention: either it is a forgery, or this device's writer key
+    // is not only this device's any more.
+    //
+    // Reported, not refused. Any admitted client can publish a handoff — the
+    // signature is what makes one authority, not the right to send it — so
+    // refusing on the mere existence of one would hand every client a way to
+    // wedge the namespace.
+    for h in &authorisations {
+        if h.from_pk == writer.verifying_key() {
+            println!(
+                "  !! a handoff claims this namespace signed seq {} over to {}; \
+                 if that was not done here, the slot key is compromised (SPECS §5.1)",
+                h.at_seq,
+                h.to.to_hex()
+            );
+        }
+    }
+    if !authorisations.is_empty() {
+        println!(
+            "handoffs: {} of {} served verify for this slot",
+            authorisations.len(),
+            handoffs.len()
+        );
+    }
+
     // ── Chain walk (SPECS §5.3, mechanism 2) ──
     //
     // Everything at or below the served head that this namespace has a
@@ -826,14 +889,15 @@ pub fn sync(ns: &str, o: SyncOpts<'_>) -> i32 {
         // from a witnessed sequence has no memory of that record's
         // predecessor. Contiguity and every later link are verified.
         let expect_prev = chain.first().filter(|f| f.seq > 0).map(|f| f.prev);
-        let walk = match verify_chain(&chain, slot, &roster, expect_prev) {
-            Ok(w) => w,
-            Err(e) => {
-                return refused(format!(
-                    "peer's history from seq {from} does not verify: {e}"
-                ))
-            }
-        };
+        let walk =
+            match verify_chain_with_handoffs(&chain, slot, &roster, expect_prev, &authorisations) {
+                Ok(w) => w,
+                Err(e) => {
+                    return refused(format!(
+                        "peer's history from seq {from} does not verify: {e}"
+                    ))
+                }
+            };
         if walk.head_seq != h.seq || walk.head_hash != h.record_hash() {
             return refused(format!(
                 "peer serves seq {} but its retained history from seq {from} reaches seq {} (SPECS §5.5; the wire returns at most {} records)",

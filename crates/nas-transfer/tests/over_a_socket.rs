@@ -9,7 +9,7 @@
 use nas_core::{Addr, Mode};
 use nas_crypto::{Identity as NasIdentity, Role};
 use nas_peer::{Hostility, Peer, Right};
-use nas_slots::{Regime, SlotId, SlotRecord, ROOT_NONCE_LEN};
+use nas_slots::{Regime, SlotHandoff, SlotId, SlotRecord, WriterId, ROOT_NONCE_LEN};
 use nas_store::{Addressing, BlobStore};
 use nas_transfer::{Channel, Request, Response};
 use simple_network::security::pqc::Identity;
@@ -393,4 +393,164 @@ fn the_subject_follows_the_key_that_handshook() {
 fn server_id_clone(id: &Identity) -> Identity {
     let (sk, vk) = id.export().unwrap();
     Identity::from_bytes(&sk, &vk).unwrap()
+}
+
+// ── Ownership handoff over the wire (SPECS §5.1) ───────────────────────────
+//
+// The peer's §5.1 check reads a store nothing could reach from the network
+// until these two requests existed: a handoff could only be learned in
+// process, which is enough for a test and not enough for two devices. What
+// these check is that crossing a socket neither weakens the rule nor makes an
+// authorised change unlearnable by a device that did not make it.
+
+fn successor() -> NasIdentity {
+    NasIdentity::derive(&[9u8; 32], Role::Slot).unwrap()
+}
+
+fn sw_record(id: &NasIdentity, seq: u64, prev: [u8; 32]) -> SlotRecord {
+    SlotRecord::sign(
+        id,
+        slot(),
+        seq,
+        Addr::of_ciphertext(format!("sw-{seq}").as_bytes()),
+        [1u8; ROOT_NONCE_LEN],
+        prev,
+        Regime::SingleWriter,
+    )
+    .unwrap()
+}
+
+/// A peer serving a single-writer slot at seq 0, with both writers rostered.
+fn single_writer_peer(tag: &str) -> (Scratch, Channel, [u8; 32]) {
+    let g = sw_record(&writer(), 0, [0u8; 32]);
+    let prev = g.record_hash();
+    let (s, ch) = connected(tag, Hostility::HONEST, move |p| {
+        p.roster.add(successor().verifying_key()).unwrap();
+        p.publish_slot("laptop", g).unwrap();
+    });
+    (s, ch, prev)
+}
+
+fn handoff_at(seq: u64) -> SlotHandoff {
+    SlotHandoff::sign(
+        &writer(),
+        slot(),
+        seq,
+        WriterId::of_key(successor().verifying_key()),
+    )
+    .unwrap()
+}
+
+#[test]
+fn ownership_moves_over_the_wire_only_when_the_outgoing_writer_says_so() {
+    let (_s, mut ch, prev) = single_writer_peer("handoff");
+    let next = sw_record(&successor(), 1, prev).encode().unwrap();
+
+    // The successor announcing itself is a takeover, and the wire does not
+    // make it anything else.
+    match ch.call(&Request::PublishSlot(next.clone())).unwrap() {
+        Response::Error(m) => assert!(m.contains("second writer"), "{m}"),
+        other => panic!("a takeover was accepted: {other:?}"),
+    }
+
+    // The outgoing writer's signature is the whole difference.
+    assert_eq!(
+        ch.call(&Request::PublishHandoff(handoff_at(1).encode().unwrap()))
+            .unwrap(),
+        Response::Ok
+    );
+    assert_eq!(
+        ch.call(&Request::PublishSlot(next)).unwrap(),
+        Response::Ok,
+        "the authorised successor may write"
+    );
+}
+
+#[test]
+fn a_handoff_is_served_back_so_a_device_can_learn_of_a_change_it_did_not_make() {
+    // This is what the two requests are for. A second device walking the
+    // chain across an ownership change has no way to tell an authorised one
+    // from a takeover unless it can ask for the record that authorised it.
+    let (_s, mut ch, _prev) = single_writer_peer("serve-back");
+    let h = handoff_at(1);
+    ch.call(&Request::PublishHandoff(h.encode().unwrap()))
+        .unwrap();
+
+    match ch.call(&Request::Handoffs(slot())).unwrap() {
+        Response::Records(rs) => {
+            assert_eq!(rs.len(), 1);
+            assert_eq!(SlotHandoff::decode(&rs[0]).unwrap(), h);
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn a_handoff_for_another_sequence_does_not_travel_any_better_than_it_verifies() {
+    let (_s, mut ch, prev) = single_writer_peer("wrong-seq");
+    // Signed for seq 7; the successor tries to write seq 1.
+    ch.call(&Request::PublishHandoff(handoff_at(7).encode().unwrap()))
+        .unwrap();
+    match ch
+        .call(&Request::PublishSlot(
+            sw_record(&successor(), 1, prev).encode().unwrap(),
+        ))
+        .unwrap()
+    {
+        Response::Error(m) => assert!(m.contains("second writer"), "{m}"),
+        other => panic!("a handoff for seq 7 authorised seq 1: {other:?}"),
+    }
+}
+
+#[test]
+fn a_tampered_handoff_is_refused_at_the_far_end_and_nothing_is_kept() {
+    let (_s, mut ch, _prev) = single_writer_peer("tampered");
+    let mut h = handoff_at(1);
+    h.at_seq = 2; // the signature still covers seq 1
+
+    match ch
+        .call(&Request::PublishHandoff(h.encode().unwrap()))
+        .unwrap()
+    {
+        Response::Error(_) => {}
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(
+        ch.call(&Request::Handoffs(slot())).unwrap(),
+        Response::Records(vec![]),
+        "an unverifiable handoff must not be stored, or the store is a dumping ground"
+    );
+}
+
+#[test]
+fn undecodable_handoff_bytes_are_a_refusal_not_a_disconnect() {
+    let (_s, mut ch, _prev) = single_writer_peer("junk");
+    match ch.call(&Request::PublishHandoff(vec![0xFF; 40])).unwrap() {
+        Response::Error(_) => {}
+        other => panic!("{other:?}"),
+    }
+    // The session survives, so a client can tell a refusal from a dead peer.
+    assert_eq!(
+        ch.call(&Request::Handoffs(slot())).unwrap(),
+        Response::Records(vec![])
+    );
+}
+
+#[test]
+fn a_witness_only_node_relays_witnesses_and_still_holds_no_handoffs() {
+    // SPECS §5.3 says a witness-only node holds no blobs and no caps. A
+    // handoff is an authorisation, not an observation, so adding the two
+    // requests must not have widened what that node accepts.
+    let (_s, mut ch) = connected("witness-only-handoff", Hostility::HONEST, |p| {
+        p.witness_only = true;
+    });
+    for req in [
+        Request::PublishHandoff(handoff_at(1).encode().unwrap()),
+        Request::Handoffs(slot()),
+    ] {
+        match ch.call(&req).unwrap() {
+            Response::Error(m) => assert!(m.contains("witness-only"), "{req:?}: {m}"),
+            other => panic!("{req:?} was accepted: {other:?}"),
+        }
+    }
 }

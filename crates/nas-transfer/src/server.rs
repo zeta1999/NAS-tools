@@ -8,7 +8,7 @@
 use crate::session::{Channel, SessionError};
 use crate::wire::{Request, Response, MAX_RECORDS};
 use nas_peer::{Peer, PeerError};
-use nas_slots::{SlotRecord, Witness};
+use nas_slots::{SlotHandoff, SlotRecord, Witness};
 
 /// Handle one request against `peer`.
 ///
@@ -78,6 +78,32 @@ pub fn handle(peer: &mut Peer, subject: &str, req: Request) -> Response {
                     break;
                 }
                 match w.encode() {
+                    Ok(b) => out.push(b),
+                    Err(e) => return Response::Error(e.to_string()),
+                }
+            }
+            Response::Records(out)
+        }
+        // Ownership handoff (SPECS §5.1). The peer checks the signature and
+        // stores it; whether a handoff is *relevant* is decided where a
+        // writer actually changes -- in `publish_slot` here, and in the
+        // client's own chain walk, both against the slot and sequence in the
+        // signed body. Serving them is what lets a second device learn of a
+        // change it did not make.
+        Request::PublishHandoff(bytes) => match SlotHandoff::decode(&bytes) {
+            Ok(h) => match peer.publish_handoff(h) {
+                Ok(()) => Response::Ok,
+                Err(e) => Response::Error(e.to_string()),
+            },
+            Err(e) => Response::Error(format!("{e}")),
+        },
+        Request::Handoffs(slot) => {
+            let mut out = Vec::new();
+            for h in peer.handoffs(&slot) {
+                if out.len() == MAX_RECORDS {
+                    break;
+                }
+                match h.encode() {
                     Ok(b) => out.push(b),
                     Err(e) => return Response::Error(e.to_string()),
                 }

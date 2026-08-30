@@ -161,9 +161,23 @@ settled and the work that follows from them.
       change, which is the safe reading for a caller that was handed no
       handoffs. The peer stores them (`publish_handoff`), survives a restart,
       and consults them in `publish_slot`.
-- [ ] Serve handoffs over the wire. `nas-transfer` has no `PublishHandoff` /
-      `Handoffs` request yet, so a peer can only learn one in-process — which
-      is enough for the tests and not enough for two devices.
+- [x] Serve handoffs over the wire — `PublishHandoff` / `Handoffs` on the
+      protocol, dispatched like the witness pair, so a device can learn of an
+      ownership change it did not make. Publishing turned the handoff store
+      into a network-reachable append-only map, so it is now bounded
+      (`MAX_HANDOFFS_PER_SLOT`, a refusal not an eviction) and keyed by the
+      authorisation — which also fixed a filename collision that lost one of
+      two handoffs across a restart. A witness-only node still refuses both.
+      `nas peer sync` fetches them, verifies them and walks with them, and
+      reports any handoff claiming *this* namespace signed its slot away.
+- [ ] Give the client roster a source other than its own key. `nas peer sync`
+      deliberately does not add a handoff's `from_pk` to its roster — that
+      would let the peer decide who may have written this namespace's history
+      — so a chain crossing an authorised change still stops at
+      `UnknownWriter`. Until a device can be told about another writer
+      (a repo-side roster, `nas ns roster add`), the handoff path is correct
+      and unreachable from the CLI: every device of a namespace derives the
+      same `Role::Slot` key, so there is only ever one writer.
 - [x] `nas-peer` core: blob store, slot ordering + history, CAS enforcement,
       roster checks, retention holds, PoP responder, the rights vocabulary and
       a peer-evaluated ACL, and **all six `--hostile` behaviours as branches in

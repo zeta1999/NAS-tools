@@ -8,7 +8,8 @@ MANUAL-TESTING.md §7. **M1 is in progress:** the peer, the slot system and the
 transfer protocol are built and networked, and the CLI now drives them
 (`nas peer serve` / `nas peer sync`) — a namespace has been pushed over a real
 PQC socket between two `nas` processes on localhost, and again between three
-containers. Remaining M1: skip-chain checkpoints and the ownership handoff.
+containers. The ownership handoff (§5.1) is built and served over the wire. Remaining
+M1: skip-chain checkpoints.
 
 `SPECS.md` is at **revision 5** (~1476 lines, 21 sections). It has survived one
 adversarial review (rev 1→2, 15 findings, all accepted), a round closing its own
@@ -214,8 +215,27 @@ handover and a takeover, which is the whole of §5.1. It is a standalone record
 rather than a field on `SlotRecord`, because that format is peer-facing and
 frozen (§20). `verify_chain_with_handoffs` accepts an authorised change;
 `verify_chain` still refuses every change, which is the right default for a
-caller that was handed no handoffs. Not yet on the wire: `nas-transfer` has no
-request for them, so a peer can learn a handoff in-process only.
+caller that was handed no handoffs.
+
+**It is now on the wire.** `PublishHandoff` / `Handoffs` are dispatched like
+the witness pair, so a device can learn of an ownership change it did not
+make; `nas peer sync` fetches them, keeps only those that verify for the slot,
+and walks with them. Making the store network-reachable is what forced two
+fixes to it: it is bounded (`MAX_HANDOFFS_PER_SLOT`, refusing rather than
+evicting — evicting a handoff turns an authorised change back into a
+takeover), and it is keyed by the authorisation rather than held in a `Vec`,
+which closed a filename collision that let one of two handoffs vanish across a
+restart. A witness-only node refuses both requests: a handoff is an
+authorisation, not an observation, and §5.3 says that node holds no caps.
+
+Sync deliberately does **not** add a handoff's `from_pk` to its roster, though
+the record carries the key in full and it would be easy. That would let the
+peer decide who may have written this namespace's history, which is the one
+thing a roster exists to say. The consequence is stated rather than hidden: a
+chain crossing an authorised change still stops at `UnknownWriter` until a
+device can be told about another writer by something other than the peer. It
+changes no outcome today either way — every device of a namespace derives the
+same `Role::Slot` key, so the CLI has only ever had one writer per slot.
 
 **The deletion approval loop (§16.2) is built** (`crates/nas-delete`):
 `DeleteRequest` / `DeleteApproval` / `DeleteExecution`, quorum scaled by blast

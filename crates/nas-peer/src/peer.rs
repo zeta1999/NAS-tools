@@ -24,6 +24,25 @@ use nas_store::{Addressing, BlobStore, StoreError};
 /// population produces; a full slot refuses, it does not evict — evicting is
 /// how a relay would quietly become a withholding one.
 pub const MAX_WITNESSES_PER_SLOT: usize = 1024;
+
+/// Handoffs retained per slot (SPECS §5.1).
+///
+/// An ownership change is a rare, deliberate event — a slot that has had a
+/// thousand of them is not a slot in normal use. The bound exists for the
+/// same reason the witness one does: `publish_handoff` is reachable from the
+/// network, and an append-only store with no bound is a way to fill a peer's
+/// disk. A full slot refuses rather than evicting, because dropping a handoff
+/// would make an authorised change look like a takeover.
+pub const MAX_HANDOFFS_PER_SLOT: usize = 1024;
+
+/// What identifies one authorisation: the sequence it applies at, and the two
+/// writers. Every component is one the signed body binds, so two handoffs with
+/// the same key authorise the same change.
+type HandoffKey = (u64, [u8; 32], [u8; 32]);
+
+fn handoff_key(h: &SlotHandoff) -> HandoffKey {
+    (h.at_seq, *h.from().as_bytes(), *h.to.as_bytes())
+}
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -70,6 +89,10 @@ pub enum PeerError {
     /// relay that stores garbage is a relay that can be filled with garbage.
     Witness(WitnessError),
     /// The slot holds [`MAX_WITNESSES_PER_SLOT`] already.
+    /// Too many handoffs for one slot. See [`MAX_HANDOFFS_PER_SLOT`].
+    HandoffsFull {
+        slot: SlotId,
+    },
     WitnessesFull {
         slot: SlotId,
     },
@@ -127,6 +150,11 @@ impl std::fmt::Display for PeerError {
                 "witness-only node: relays witnesses and holds no blobs, slots or caps (SPECS §5.3)"
             ),
             Self::Handoff(e) => write!(f, "handoff rejected: {e}"),
+            Self::HandoffsFull { slot } => write!(
+                f,
+                "slot {} already holds {MAX_HANDOFFS_PER_SLOT} handoffs",
+                slot.to_hex()
+            ),
             Self::RetentionShrink {
                 dropped,
                 had,
@@ -190,10 +218,19 @@ pub struct Peer {
     /// (SPECS §5.3). One per observer per sequence: a witness re-observing
     /// the same head replaces its earlier note rather than accumulating.
     witnesses: BTreeMap<SlotId, BTreeMap<([u8; 32], u64), Witness>>,
-    /// Ownership handoffs, `slot -> records` (SPECS §5.1). Kept per slot
-    /// because that is how they are consulted: one lookup per writer change
-    /// during a walk.
-    handoffs: BTreeMap<SlotId, Vec<SlotHandoff>>,
+    /// Ownership handoffs, `slot -> (at_seq, from, to) -> handoff` (SPECS
+    /// §5.1). Kept per slot because that is how they are consulted: one
+    /// lookup per writer change during a walk.
+    ///
+    /// The key is the authorisation — sequence and both writers — and it is
+    /// also the on-disk filename, deliberately. When it was a `Vec` the name
+    /// omitted `from`, so two handoffs authorising *different* changes (two
+    /// would-be outgoing writers naming the same successor at the same
+    /// sequence, only one of them actually holding the slot) shared a file:
+    /// both were held in memory, one overwrote the other on disk, and a
+    /// restart came back holding fewer than had been accepted. Keying memory
+    /// and disk the same way is what stops those two disagreeing.
+    handoffs: BTreeMap<SlotId, BTreeMap<HandoffKey, SlotHandoff>>,
     /// Serve the witness relay and refuse everything else (SPECS §5.3, "a
     /// witness-only node holds no blobs and no caps"). Enforced at the
     /// dispatch, where every request passes; a flag the store consulted
@@ -275,8 +312,14 @@ impl Peer {
                         continue;
                     };
                     if let Ok(h) = SlotHandoff::decode(&bytes) {
+                        // Re-verified on load: a handoff on disk is only as
+                        // trustworthy as the disk, and the signature is
+                        // cheap next to having accepted a takeover.
                         if h.verify().is_ok() {
-                            self.handoffs.entry(h.slot_id).or_default().push(h);
+                            self.handoffs
+                                .entry(h.slot_id)
+                                .or_default()
+                                .insert(handoff_key(&h), h);
                         }
                     }
                 }
@@ -379,7 +422,11 @@ impl Peer {
         let dir = self.root.join("handoffs").join(h.slot_id.to_hex());
         fs::create_dir_all(&dir)?;
         let bytes = h.encode().map_err(PeerError::Handoff)?;
-        let name = format!("{}-{}", h.at_seq, h.to.to_hex());
+        // Named by the authorisation it carries, which is also the in-memory
+        // key. Leaving `from` out would let two handoffs that authorise
+        // different changes share a filename, so a restart would silently
+        // hold fewer than were accepted.
+        let name = format!("{}-{}-{}", h.at_seq, h.from().to_hex(), h.to.to_hex());
         let tmp = dir.join(format!("{name}.tmp"));
         fs::write(&tmp, &bytes)?;
         fs::rename(&tmp, dir.join(name))?;
@@ -396,24 +443,30 @@ impl Peer {
     /// would let anybody fill this map.
     pub fn publish_handoff(&mut self, h: SlotHandoff) -> Result<(), PeerError> {
         h.verify().map_err(PeerError::Handoff)?;
-        if self
-            .handoffs
-            .get(&h.slot_id)
-            .is_some_and(|hs| hs.contains(&h))
-        {
+        let key = handoff_key(&h);
+        let held = self.handoffs.get(&h.slot_id);
+        // Already held: idempotent, so a client that retries after a dropped
+        // connection is not told its handoff was refused.
+        if held.is_some_and(|hs| hs.contains_key(&key)) {
             return Ok(());
+        }
+        if held.map(|hs| hs.len() >= MAX_HANDOFFS_PER_SLOT) == Some(true) {
+            return Err(PeerError::HandoffsFull { slot: h.slot_id });
         }
         // Persisted before it is acknowledged, like a slot record: a client
         // told its handoff was accepted must find it after a restart.
         self.persist_handoff(&h)?;
-        self.handoffs.entry(h.slot_id).or_default().push(h);
+        self.handoffs.entry(h.slot_id).or_default().insert(key, h);
         Ok(())
     }
 
     /// Every handoff this peer holds for a slot, so a client can walk the
     /// chain across an ownership change without asking for them one at a time.
     pub fn handoffs(&self, slot: &SlotId) -> Vec<SlotHandoff> {
-        self.handoffs.get(slot).cloned().unwrap_or_default()
+        self.handoffs
+            .get(slot)
+            .map(|hs| hs.values().cloned().collect())
+            .unwrap_or_default()
     }
 
     /// Persist one record. Written before it is acknowledged, so a crash
@@ -626,7 +679,7 @@ impl Peer {
                 // this sequence on this slot. Without one it is a takeover.
                 if prior.regime == Regime::SingleWriter && prior.writer_id != rec.writer_id {
                     let authorised = self.handoffs.get(&rec.slot_id).is_some_and(|hs| {
-                        hs.iter().any(|h| {
+                        hs.values().any(|h| {
                             h.authorises(rec.slot_id, rec.seq, prior.writer_id, rec.writer_id)
                         })
                     });
@@ -2018,6 +2071,61 @@ mod handoff_tests {
         p.publish_handoff(h.clone()).unwrap();
         p.publish_handoff(h).unwrap();
         assert_eq!(p.handoffs(&slot()).len(), 1);
+    }
+
+    #[test]
+    fn two_handoffs_that_authorise_different_changes_both_survive_a_restart() {
+        // Regression. The on-disk name was `<at_seq>-<to>`, which two
+        // handoffs differing only in `from` share -- so both were held in
+        // memory, one overwrote the other on disk, and a restart came back
+        // holding one. Only one of these is authority (`c` does not hold the
+        // slot), but the peer cannot tell which without knowing the prior
+        // record, and dropping either would decide that question by accident.
+        let s = Scratch::new("collide");
+        let (a, b, c) = (ident(1), ident(2), ident(3));
+        {
+            let mut p =
+                Peer::open(&s.0, Mode::E2ee, Addressing::Content, Hostility::HONEST).unwrap();
+            p.publish_handoff(SlotHandoff::sign(&a, slot(), 1, wid(&b)).unwrap())
+                .unwrap();
+            p.publish_handoff(SlotHandoff::sign(&c, slot(), 1, wid(&b)).unwrap())
+                .unwrap();
+            assert_eq!(p.handoffs(&slot()).len(), 2, "both are held");
+        }
+        let p = Peer::open(&s.0, Mode::E2ee, Addressing::Content, Hostility::HONEST).unwrap();
+        assert_eq!(
+            p.handoffs(&slot()).len(),
+            2,
+            "and a restart holds what was accepted"
+        );
+    }
+
+    #[test]
+    fn the_handoff_store_is_bounded() {
+        // `publish_handoff` is reachable from the network now, so an
+        // append-only store with no bound is a way to fill a peer's disk.
+        // A full slot refuses rather than evicting: dropping a handoff would
+        // turn an authorised change back into a takeover.
+        let s = Scratch::new("bounded");
+        let mut p = Peer::open(&s.0, Mode::E2ee, Addressing::Content, Hostility::HONEST).unwrap();
+        let a = ident(1);
+        let b = ident(2);
+        // One signature, replayed under many sequences -- cheap for the test
+        // and exactly the shape of the flood, since each is a distinct key.
+        for seq in 0..MAX_HANDOFFS_PER_SLOT as u64 {
+            p.publish_handoff(SlotHandoff::sign(&a, slot(), seq, wid(&b)).unwrap())
+                .unwrap();
+        }
+        let over = SlotHandoff::sign(&a, slot(), MAX_HANDOFFS_PER_SLOT as u64, wid(&b)).unwrap();
+        assert!(matches!(
+            p.publish_handoff(over),
+            Err(PeerError::HandoffsFull { .. })
+        ));
+        // A full slot still accepts one it already holds, so a client
+        // retrying after a dropped connection is not told it was refused.
+        p.publish_handoff(SlotHandoff::sign(&a, slot(), 0, wid(&b)).unwrap())
+            .unwrap();
+        assert_eq!(p.handoffs(&slot()).len(), MAX_HANDOFFS_PER_SLOT);
     }
 
     #[test]

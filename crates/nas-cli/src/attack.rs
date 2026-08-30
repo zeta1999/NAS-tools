@@ -535,6 +535,16 @@ fn witness_withholding(writer: &Identity, with_node: bool, cold: bool) -> Result
     })
 }
 
+/// SPECS §16.3: a client that stops renewing must not be able to destroy a
+/// WORM namespace by silence alone. Delegated to `worm`, which owns the
+/// retention machinery.
+fn go_silent() -> Result<Outcome, String> {
+    Ok(match crate::worm::go_silent()? {
+        Ok(m) => Outcome::Detected(m),
+        Err(m) => Outcome::Undetected(m),
+    })
+}
+
 fn lease_griefing() -> Outcome {
     Outcome::Pending("M2 (§16)")
 }
@@ -549,6 +559,7 @@ const KINDS: &[&str] = &[
     "cas-non-enforcement",
     "lease-griefing",
     "witness-withholding",
+    "go-silent",
 ];
 
 fn run(kind: &str, writer: &Identity, o: &AttackOpts) -> Result<Outcome, String> {
@@ -560,6 +571,7 @@ fn run(kind: &str, writer: &Identity, o: &AttackOpts) -> Result<Outcome, String>
         "cas-non-enforcement" => cas_non_enforcement(writer, o.cold_start)?,
         "witness-withholding" => witness_withholding(writer, o.with_witness_node, o.cold_start)?,
         "lease-griefing" => lease_griefing(),
+        "go-silent" => go_silent()?,
         other => {
             return Err(format!(
                 "unknown attack `{other}`; one of {}, all",

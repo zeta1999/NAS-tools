@@ -221,8 +221,18 @@ settled and the work that follows from them.
 - [x] One named test per attack: tamper, rollback, withhold, dedup-lie,
       CAS-non-enforcement, witness withholding (`nas test attack <kind>`,
       `crates/nas-cli/src/attack.rs`; UC09 scores 6 of 8 at M1)
-- [ ] Lease griefing bounded by per-holder quota — needs §16 leases; the drill
-      exits 3 (unimplemented) until then
+- [x] Lease-based GC with a caller: `Peer::sweep` + `Peer::inventory` drive
+      `nas_lease::plan_sweep` and delete through `delete_blob`, so retention is
+      the floor *and* the last gate. Quota breaches are reported, never
+      enforced by deleting (§6.4)
+- [x] Retention enforced as §16.3 specifies: `publish_retention` takes the whole
+      proposed set and refuses a drop (`nas test retention-extend-only`,
+      `nas test retention-shrink --key everyday`, `nas test attack go-silent`)
+- [x] Object Lock recorded at creation (`ns create --object-lock … --retention …`),
+      with the enforced/not-enforced split printed rather than implied
+- [ ] Lease griefing bounded by per-holder quota — the quota is computed and
+      reported by `plan_sweep`; what is missing is admission control at publish
+      time, so the drill still exits 3
 - [x] Cold-start test: `nas test attack all --cold-start` — six drills detected
       against a cap-only client; exits 3 only because lease griefing is pending
 

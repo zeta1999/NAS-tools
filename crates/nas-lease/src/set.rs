@@ -65,6 +65,20 @@ impl LeaseSet {
         Self::default()
     }
 
+    /// A set built directly from addresses.
+    ///
+    /// [`replay`] is how a peer reconstructs a holder's set from its *signed*
+    /// history, and remains the only path that authenticates anything. This
+    /// constructor exists for the callers that already hold a verified set —
+    /// a checkpoint's addresses, a sweep planned against known state — and
+    /// for tests. It authenticates nothing by itself, which is why the
+    /// signature checks live in `replay` rather than here.
+    pub fn from_addrs(addrs: &[Addr]) -> Self {
+        Self {
+            addrs: addrs.iter().map(|a| *a.as_bytes()).collect(),
+        }
+    }
+
     pub fn contains(&self, a: &Addr) -> bool {
         self.addrs.contains(a.as_bytes())
     }

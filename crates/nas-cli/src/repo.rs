@@ -142,6 +142,54 @@ fn padding_str(p: PaddingProfile) -> &'static str {
     }
 }
 
+/// Object Lock mode (SPECS §16.1). Recorded at creation; what each mode
+/// *costs* to loosen is the §16.2 quorum, which is not built.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ObjectLock {
+    /// The owner may shorten retention, with the delete authority's signature.
+    Governance,
+    /// Nobody may shorten it before expiry — not even the owner.
+    Compliance,
+    /// An indefinite hold, orthogonal to any expiry.
+    LegalHold,
+}
+
+impl ObjectLock {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Governance => "governance",
+            Self::Compliance => "compliance",
+            Self::LegalHold => "legal-hold",
+        }
+    }
+}
+
+pub fn parse_object_lock(s: &str) -> Option<ObjectLock> {
+    match s {
+        "governance" => Some(ObjectLock::Governance),
+        "compliance" => Some(ObjectLock::Compliance),
+        "legal-hold" | "legal_hold" => Some(ObjectLock::LegalHold),
+        _ => None,
+    }
+}
+
+/// `7y`, `90d`, `24h`, or bare seconds. Returns seconds.
+///
+/// Years are 365 days: a retention period is a policy horizon, not a calendar,
+/// and pretending otherwise would invite a leap-year argument over an archive.
+pub fn parse_retention(s: &str) -> Option<u64> {
+    let (digits, unit) = s.split_at(s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len()));
+    let n: u64 = digits.parse().ok()?;
+    let secs = match unit {
+        "" | "s" => 1,
+        "h" => 3_600,
+        "d" => 86_400,
+        "y" => 365 * 86_400,
+        _ => return None,
+    };
+    n.checked_mul(secs)
+}
+
 pub fn parse_padding(s: &str) -> Option<PaddingProfile> {
     match s {
         "none" => Some(PaddingProfile::None),
@@ -194,6 +242,10 @@ pub struct Description {
     pub mode: Mode,
     pub key_scheme: KeyScheme,
     pub padding: PaddingProfile,
+    /// SPECS §16.1. `None` for a namespace created without Object Lock.
+    pub object_lock: Option<ObjectLock>,
+    /// Retention period in seconds, if one was set.
+    pub retention_secs: Option<u64>,
 }
 
 impl Repo {
@@ -204,6 +256,8 @@ impl Repo {
             mode: Mode::E2ee,
             key_scheme: KeyScheme::Convergent,
             padding: PaddingProfile::None,
+            object_lock: None,
+            retention_secs: None,
         };
         for line in cfg.lines() {
             let mut it = line.split_whitespace();
@@ -216,6 +270,17 @@ impl Repo {
                 }
                 (Some("key_scheme"), Some("indexed-random")) => {
                     d.key_scheme = KeyScheme::IndexedRandom
+                }
+                (Some("object_lock"), Some(v)) => {
+                    d.object_lock = Some(
+                        parse_object_lock(v).ok_or_else(|| io::Error::other("bad object_lock"))?,
+                    )
+                }
+                (Some("retention_secs"), Some(v)) => {
+                    d.retention_secs = Some(
+                        v.parse()
+                            .map_err(|_| io::Error::other("bad retention_secs"))?,
+                    )
                 }
                 _ => {}
             }
@@ -233,6 +298,7 @@ impl Repo {
         key_scheme: KeyScheme,
         padding: PaddingProfile,
         passphrase: Option<Vec<u8>>,
+        lock: Option<(ObjectLock, u64)>,
     ) -> io::Result<Self> {
         let root = path_of(ns);
         fs::create_dir_all(root.join("state"))?;
@@ -247,10 +313,18 @@ impl Repo {
             Mode::E2ee | Mode::Passphrase => key_scheme,
         };
 
+        // Object Lock is recorded in the plaintext config on purpose: the
+        // peer must be able to read the policy without reading the data, and
+        // §16.3's enforcement is a set comparison over addresses, not a
+        // decision that needs the manifest (SPECS §2.2).
+        let lock_lines = match lock {
+            Some((l, secs)) => format!("object_lock {}\nretention_secs {secs}\n", l.as_str()),
+            None => String::new(),
+        };
         fs::write(
             root.join("config"),
             format!(
-                "version 1\nmode {}\nkey_scheme {}\npadding_profile {}\ntenant_salt {}\n",
+                "version 1\nmode {}\nkey_scheme {}\npadding_profile {}\ntenant_salt {}\n{lock_lines}",
                 mode_str(mode),
                 key_scheme_str(key_scheme),
                 padding_str(padding),

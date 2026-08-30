@@ -522,6 +522,10 @@ impl Repo {
     }
 
     pub fn set_head(&self, addr: &str) -> io::Result<()> {
+        // A device joins a namespace by copying `config` and `wraps` alone
+        // (MANUAL-TESTING.md §10); `state/` is this device's own memory and
+        // may not exist yet if the first thing it does is write.
+        fs::create_dir_all(self.root.join("state"))?;
         fs::write(self.root.join("state/HEAD"), format!("{addr}\n"))
     }
 }

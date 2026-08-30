@@ -470,6 +470,15 @@ impl Peer {
         };
         rec.verify(vk).map_err(PeerError::Slot)?;
 
+        // A forking peer keeps a private branch for the connections it chose
+        // to equivocate to (`view != 0`): their writes land there and never
+        // on the branch everyone else is shown. Nothing is forged — the record
+        // is signed by a rostered writer — which is exactly why the writer
+        // cannot tell from its own view (SPECS §5.3).
+        if self.hostility.fork && self.view != 0 {
+            return self.publish_on_fork(rec);
+        }
+
         // Read the head first rather than holding a mutable borrow across the
         // decision: the forking branch below needs to touch a second map.
         let head = self
@@ -532,6 +541,45 @@ impl Peer {
             .entry(rec.slot_id)
             .or_default()
             .insert(rec.seq, rec);
+        Ok(())
+    }
+
+    /// `fork`, from the branch nobody else is shown (SPECS §5.3).
+    ///
+    /// Seeded with the shared prefix of the main history so a walk of it
+    /// verifies end to end, then chained and compare-and-swapped exactly as
+    /// the honest branch is: a forking peer is not a broken peer, it is a
+    /// consistent one twice over. In memory only — this adversary forgets its
+    /// second branch on restart, which no drill needs it to survive.
+    fn publish_on_fork(&mut self, rec: SlotRecord) -> Result<(), PeerError> {
+        let prefix: Vec<(u64, SlotRecord)> = self
+            .slots
+            .get(&rec.slot_id)
+            .map(|h| h.range(..rec.seq).map(|(k, v)| (*k, v.clone())).collect())
+            .unwrap_or_default();
+        let alt = self.forks.entry(rec.slot_id).or_default();
+        if alt.is_empty() {
+            alt.extend(prefix);
+        }
+        match alt.keys().next_back().copied() {
+            None if rec.seq != 0 => {
+                return Err(PeerError::CasConflict {
+                    head: 0,
+                    offered: rec.seq,
+                })
+            }
+            Some(head) if rec.seq != head + 1 => {
+                return Err(PeerError::CasConflict {
+                    head,
+                    offered: rec.seq,
+                })
+            }
+            Some(head) if rec.prev != alt[&head].record_hash() => {
+                return Err(PeerError::BrokenChain { seq: rec.seq })
+            }
+            _ => {}
+        }
+        alt.insert(rec.seq, rec);
         Ok(())
     }
 

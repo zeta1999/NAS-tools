@@ -924,3 +924,60 @@ Two defects only a multi-process drill could have found, both fixed:
   therefore had no memory of seq 1 and would have accepted the rollback the
   moment the witness node was unreachable. `write_pin` now creates the
   directory. The drill's `device 2 pin:` line exists to make this visible.
+
+## 13. A live forking peer over the socket
+
+UC09's fork drill runs the forking peer in-process and hands `SlotClient` two
+views. `tests/usecases/uc12_fork_drill.sh` runs `nas peer serve --hostile
+fork` as a real process, with a `--witness` node and three devices, and lets
+`nas peer sync` find the fork through the wire. The forking peer holds one
+transport key for all three devices and cannot tell them apart, so it
+equivocates blindly: even-numbered connections are served branch 0 (main),
+odd-numbered branch 1 (private). The private branch is seeded from the shared
+prefix, and every record on both is genuinely signed by the rostered writer,
+so no signature check can tell — only comparing what was seen before against
+what is served now, at the same sequence, can (SPECS §5.3). Manual (fixed
+ports 47343/47344, `target/release/nas`), not run by `run.sh`.
+
+Observed, in order:
+
+- conn 0, main: device 1 publishes seq 0, witnessed. conn 1, private: device 2
+  joins by copy, writes, publishes seq 1 — which the peer keeps on the private
+  branch — and witnesses it.
+- conns 2–5, no witness node: device 1 publishes seq 1 and seq 2 on main,
+  device 2 publishes seq 2 on private, each walks its own branch (`walked seq
+  1..1 from the peer's history; the pin and 0 witnesses lie on it`), exit 0
+  every time. That is the fork, and from either side alone it is invisible:
+  every record verifies, every pin holds.
+- conn 6, main, device 1 **with** the witness node: `refused: fork: the
+  witness saw a different record at seq 1 than the chain the peer now serves
+  (SPECS §5.3)`, exit 2. The served head is seq 2; the contradicting witness
+  is device 2's, at seq 1 — *below* the head, which is the case
+  `SlotClient::forked` cannot see on its own (a witness carries no ancestry).
+  `nas peer sync` walks the peer's retained history (`SlotHistory`) from the
+  lowest witnessed or pinned sequence and compares each witness at its own
+  sequence.
+- conn 7, private, device 2 with the witness node: accepted (`walked seq 0..2;
+  the pin and 2 witnesses lie on it`), witnesses seq 2, exit 0. Correct, and
+  worth stating: nothing device 1 saw has reached the relay, because device 1
+  was refused before it could witness. Convergence is a property of witness
+  propagation (SPECS §5.4), not of any one connection.
+- conn 8, main: device 3, brand new, no pin, no witness node, accepts seq 2 and
+  pins it — sequence **and record hash** (`device 3 pin: 2 c793eb09…`).
+  conn 9, private, same seq 2, different record, still no witness node:
+  `refused: fork: the peer serves a different record at seq 2 than the one
+  seen here before`, exit 2 — the pin's hash alone, no witness needed.
+- conn 10, main, device 3 with the witness node: refused at seq 1, exit 2.
+
+One defect, and it is the same one §12 found, one call site over:
+
+- **`Repo::set_head` wrote `state/HEAD` without creating `state/`.** On a
+  device that joined by copy, the first *write* before any sync failed with
+  `No such file or directory`; §12's fix had gone into `write_pin` only. The
+  first run of this drill therefore had device 2 never publish seq 1, so no
+  contradicting witness ever existed: conns 6 and 10 were *accepted*, conn 7
+  was refused — the exact inverse of the script's expectations, and a reminder
+  that a drill whose expectations live in `step` labels only checks anything
+  if someone reads the output against them. `set_head` now creates the
+  directory. The unit tests could not have caught either: they all create
+  namespaces, none joins one.

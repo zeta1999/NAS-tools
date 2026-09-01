@@ -10,8 +10,8 @@ use nas_core::{Addr, Mode};
 use nas_crypto::{Identity as NasIdentity, Role};
 use nas_peer::{Hostility, Peer, Right};
 use nas_slots::{
-    verify_skip_chain, Checkpoint, Regime, Roster, SlotHandoff, SlotId, SlotRecord, WriterId,
-    ROOT_NONCE_LEN,
+    plan_walk, verify_chain, verify_skip_chain, Checkpoint, Regime, Roster, SlotHandoff, SlotId,
+    SlotRecord, WalkPlan, WriterId, ROOT_NONCE_LEN,
 };
 use nas_store::{Addressing, BlobStore};
 use nas_transfer::{Channel, Request, Response};
@@ -731,4 +731,163 @@ fn a_witness_only_node_holds_no_ladder_either() {
             other => panic!("{req:?} was accepted: {other:?}"),
         }
     }
+}
+
+#[test]
+fn a_client_too_far_behind_for_one_response_climbs_instead_of_giving_up() {
+    // The §5.5 case, and the one thing the ladder is actually FOR. A history
+    // longer than `MAX_RECORDS` cannot be walked in one response: before the
+    // ladder this was a dead end, and a client 600 records behind was refused
+    // however honest the peer was.
+    const N: u64 = 600;
+    let recs = history(N);
+    let cps = ladder(&writer(), &recs, 256);
+    assert_eq!(
+        cps.iter().map(|c| c.seq).collect::<Vec<_>>(),
+        vec![0, 256, 512]
+    );
+    let seeded = (recs.clone(), cps.clone());
+    let (_s, mut ch) = connected("skip-long", Hostility::HONEST, move |p| {
+        for r in seeded.0 {
+            p.publish_slot("laptop", r).unwrap();
+        }
+        for c in seeded.1 {
+            p.publish_checkpoint(c).unwrap();
+        }
+    });
+
+    let mut roster = Roster::new();
+    roster.add(writer().verifying_key()).unwrap();
+    let head = &recs[(N - 1) as usize];
+
+    let page = |ch: &mut Channel, from: u64| -> Vec<SlotRecord> {
+        match ch
+            .call(&Request::SlotHistory { slot: slot(), from })
+            .unwrap()
+        {
+            Response::Records(rs) => rs.iter().map(|b| SlotRecord::decode(b).unwrap()).collect(),
+            other => panic!("{other:?}"),
+        }
+    };
+    // Paged, as the client does: one response carries what fits in `MAX_FRAME`,
+    // and the checkpoint interval is larger than that, so without paging no
+    // rung could ever leave a walkable tail and the ladder would be decorative.
+    let fetch = |ch: &mut Channel, from: u64| -> Vec<SlotRecord> {
+        let mut out: Vec<SlotRecord> = Vec::new();
+        let mut next = from;
+        loop {
+            let p = page(ch, next);
+            if p.is_empty() {
+                break;
+            }
+            let last = p.last().unwrap().seq;
+            out.extend(p);
+            if last >= N - 1 || last < next {
+                break;
+            }
+            next = last + 1;
+        }
+        out
+    };
+
+    // The dead end: an honest peer, an honest client, and the walk still does
+    // not arrive, because one response cannot carry 600 records.
+    //
+    // Note what bounds it. `MAX_RECORDS` is 256, but a `SlotRecord` is ~3.5 KB
+    // and 256 of them are three times `MAX_FRAME` — so the byte budget binds
+    // first, well below the count. A client must therefore plan from what a
+    // response actually carried, never from the ceiling.
+    let one = page(&mut ch, 0);
+    assert!(
+        one.len() < nas_transfer::MAX_RECORDS,
+        "the byte budget binds before the count: {} records",
+        one.len()
+    );
+    let short = verify_chain(&one, slot(), &roster, None).unwrap();
+    assert_eq!(
+        short.head_seq,
+        one.len() as u64 - 1,
+        "it verifies, and reaches nowhere near {}",
+        N - 1
+    );
+
+    // The ladder, and the plan that chooses it.
+    let rungs: Vec<Checkpoint> = match ch
+        .call(&Request::Checkpoints {
+            slot: slot(),
+            from: 0,
+        })
+        .unwrap()
+    {
+        Response::Records(rs) => rs.iter().map(|b| Checkpoint::decode(b).unwrap()).collect(),
+        other => panic!("{other:?}"),
+    };
+    let seqs: Vec<u64> = rungs.iter().map(|c| c.seq).collect();
+    // A budget of 300 rather than the client's real `RETAIN_N` of 1024: this
+    // is testing that climbing works over a socket, not what a sensible budget
+    // is, and 1024 would mean signing 1024 records to make the point. The
+    // arithmetic itself is covered by `plan_tests` with no peer at all.
+    let plan = plan_walk(0, N - 1, &seqs, 300);
+    assert_eq!(
+        plan,
+        WalkPlan::Skip {
+            top_seq: 512,
+            skipped: 512,
+            records: 88
+        },
+        "planned from what one response actually carried"
+    );
+
+    let tail = fetch(&mut ch, 512);
+    let walk = verify_skip_chain(&rungs, &tail, slot(), &roster, None, &[]).unwrap();
+    assert_eq!(walk.head_seq, N - 1, "the head is reached");
+    assert_eq!(walk.head_hash, head.record_hash());
+    // And the cost of arriving is reported rather than hidden: 88 records
+    // verified link by link, 512 taken on the writer's word.
+    assert_eq!(walk.records, 88);
+    assert_eq!(walk.skipped, 512);
+    assert_eq!(walk.records as u64 + walk.skipped, N);
+}
+
+#[test]
+fn a_response_too_large_to_send_is_shortened_not_dropped() {
+    // Regression, and the rule it broke: a partial answer must never arrive as
+    // the connection going away. The peer built a 256-record response, failed
+    // to encode it because it was three times `MAX_FRAME`, and dropped the
+    // socket; the client saw `Truncated`, which is indistinguishable from the
+    // peer dying.
+    let recs = history(400);
+    let seeded = recs.clone();
+    let (_s, mut ch) = connected("oversize", Hostility::HONEST, move |p| {
+        for r in seeded {
+            p.publish_slot("laptop", r).unwrap();
+        }
+    });
+
+    let got = match ch
+        .call(&Request::SlotHistory {
+            slot: slot(),
+            from: 0,
+        })
+        .unwrap()
+    {
+        Response::Records(rs) => rs,
+        other => panic!("{other:?}"),
+    };
+    assert!(!got.is_empty(), "a short answer, not no answer");
+    assert!(got.len() < 400);
+    // What came back is contiguous from the start, so the client can walk it
+    // and ask again from where it ended.
+    let chain: Vec<SlotRecord> = got.iter().map(|b| SlotRecord::decode(b).unwrap()).collect();
+    let mut roster = Roster::new();
+    roster.add(writer().verifying_key()).unwrap();
+    let w = verify_chain(&chain, slot(), &roster, None).unwrap();
+    assert_eq!(w.head_seq, chain.len() as u64 - 1);
+
+    // And the session is still alive.
+    assert_eq!(
+        ch.call(&Request::HasBlob(Addr::of_ciphertext(b"nothing")))
+            .unwrap(),
+        Response::Bool(false)
+    );
 }

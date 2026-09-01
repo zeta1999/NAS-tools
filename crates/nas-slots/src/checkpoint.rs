@@ -582,6 +582,213 @@ pub fn verify_skip_chain(
     })
 }
 
+// ── Choosing a walk ────────────────────────────────────────────────────────
+
+/// How a client can reach the head from where its memory starts.
+///
+/// Separated from doing it, like `plan_sweep` and `decide` elsewhere: which
+/// walk is possible is arithmetic over sequence numbers and a list of rungs,
+/// and arithmetic is worth testing without a peer, a socket or a store.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WalkPlan {
+    /// Every record from `from` to the head is within budget. The strongest
+    /// walk, and the one to prefer whenever it is available — it proves
+    /// contiguity, which no ladder does.
+    Full { from: u64, records: u64 },
+    /// Climb the ladder to `top_seq`, then walk records from there.
+    ///
+    /// `skipped` records are taken on the writer's word. The caller is expected
+    /// to report that number, not to round it away.
+    Skip {
+        top_seq: u64,
+        skipped: u64,
+        records: u64,
+    },
+    /// Neither walk reaches: the span is longer than the client's budget and no
+    /// rung sits close enough to the head to bring the tail inside it.
+    ///
+    /// `best_rung` is the highest rung that exists at all, so the refusal can
+    /// say whether the ladder is missing or merely too short.
+    Unreachable { span: u64, best_rung: Option<u64> },
+}
+
+/// Pick the walk that reaches `head_seq` from `from`.
+///
+/// `rung_seqs` are the sequences of verified rungs, ascending. `budget` is how
+/// many records the client is willing to fetch and verify link by link — a
+/// policy, not a wire limit. A history longer than one response is *paged*, so
+/// what bounds the linear part is patience rather than framing.
+///
+/// The full walk wins ties on purpose. A ladder is cheaper and weaker, and
+/// choosing it when the strong walk was affordable would trade away contiguity
+/// for nothing.
+pub fn plan_walk(from: u64, head_seq: u64, rung_seqs: &[u64], budget: u64) -> WalkPlan {
+    let span = head_seq.saturating_sub(from);
+    // `span` is a gap; the walk carries the records at both ends.
+    if budget > 0 && span < budget {
+        return WalkPlan::Full {
+            from,
+            records: span + 1,
+        };
+    }
+    // The highest rung that leaves a walkable tail, is not below where the
+    // client already starts, and is not above the head.
+    //
+    // All three matter. A rung below `from` shortens nothing and would drop
+    // the client's own memory out of the walk. A rung *above* the head is a
+    // rung for records the peer is not serving — and `saturating_sub` clamps
+    // that gap to zero, so without the bound it looks like the closest rung of
+    // all. (Found by `skipped_plus_walked_covers_the_whole_span`, which is why
+    // the arithmetic is a function with tests rather than three lines inline.)
+    let usable = rung_seqs
+        .iter()
+        .copied()
+        .filter(|&r| r >= from && r <= head_seq && head_seq - r < budget)
+        .max();
+    match usable {
+        Some(top_seq) => WalkPlan::Skip {
+            top_seq,
+            skipped: top_seq - from,
+            records: head_seq - top_seq + 1,
+        },
+        None => WalkPlan::Unreachable {
+            span,
+            best_rung: rung_seqs.iter().copied().max(),
+        },
+    }
+}
+
+#[cfg(test)]
+mod plan_tests {
+    use super::*;
+
+    #[test]
+    fn a_short_span_is_walked_in_full() {
+        assert_eq!(
+            plan_walk(0, 9, &[0], 256),
+            WalkPlan::Full {
+                from: 0,
+                records: 10
+            }
+        );
+    }
+
+    #[test]
+    fn the_full_walk_wins_whenever_it_fits() {
+        // A ladder is cheaper and weaker. Taking it when the strong walk was
+        // affordable would trade contiguity away for nothing.
+        let rungs: Vec<u64> = (0..40).map(|i| i * 256).collect();
+        assert!(matches!(
+            plan_walk(0, 255, &rungs, 256),
+            WalkPlan::Full { .. }
+        ));
+        // One more record and it no longer fits.
+        assert!(matches!(
+            plan_walk(0, 256, &rungs, 256),
+            WalkPlan::Skip { .. }
+        ));
+    }
+
+    #[test]
+    fn a_long_span_climbs_to_the_highest_rung_with_a_walkable_tail() {
+        // The §5.5 case: 100 000 behind, rungs every 256.
+        let rungs: Vec<u64> = (0..=390).map(|i| i * 256).collect();
+        assert_eq!(
+            plan_walk(0, 100_000, &rungs, 256),
+            WalkPlan::Skip {
+                top_seq: 99_840,
+                skipped: 99_840,
+                records: 161,
+            }
+        );
+    }
+
+    #[test]
+    fn a_rung_below_where_the_client_starts_is_not_usable() {
+        // It shortens nothing, and walking from it would drop the client's own
+        // memory out of the span being checked.
+        assert_eq!(
+            plan_walk(500, 1000, &[0, 256], 256),
+            WalkPlan::Unreachable {
+                span: 500,
+                best_rung: Some(256)
+            }
+        );
+    }
+
+    #[test]
+    fn a_ladder_that_stops_too_far_below_the_head_does_not_reach() {
+        // The peer has rungs but stopped checkpointing; the refusal should be
+        // able to say which of the two it is.
+        assert_eq!(
+            plan_walk(0, 10_000, &[0, 256, 512], 256),
+            WalkPlan::Unreachable {
+                span: 10_000,
+                best_rung: Some(512)
+            }
+        );
+        assert_eq!(
+            plan_walk(0, 10_000, &[], 256),
+            WalkPlan::Unreachable {
+                span: 10_000,
+                best_rung: None
+            }
+        );
+    }
+
+    #[test]
+    fn a_rung_at_the_head_leaves_a_one_record_tail() {
+        assert_eq!(
+            plan_walk(0, 512, &[0, 256, 512], 256),
+            WalkPlan::Skip {
+                top_seq: 512,
+                skipped: 512,
+                records: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn a_client_already_at_the_head_walks_one_record() {
+        assert_eq!(
+            plan_walk(7, 7, &[], 256),
+            WalkPlan::Full {
+                from: 7,
+                records: 1
+            }
+        );
+    }
+
+    #[test]
+    fn the_arithmetic_does_not_underflow_on_a_head_below_the_start() {
+        // A peer serving a head below the client's memory is a rollback, and
+        // it is caught before this function is reached — but planning must not
+        // panic on the way there.
+        assert_eq!(
+            plan_walk(100, 5, &[], 256),
+            WalkPlan::Full {
+                from: 100,
+                records: 1
+            }
+        );
+    }
+
+    #[test]
+    fn skipped_plus_walked_covers_the_whole_span() {
+        // The property the honesty of the report rests on.
+        let rungs: Vec<u64> = (0..=40).map(|i| i * 256).collect();
+        for head in [300u64, 1000, 5000, 10_240] {
+            match plan_walk(0, head, &rungs, 256) {
+                WalkPlan::Full { records, .. } => assert_eq!(records, head + 1),
+                WalkPlan::Skip {
+                    skipped, records, ..
+                } => assert_eq!(skipped + records, head + 1),
+                other => panic!("{other:?}"),
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

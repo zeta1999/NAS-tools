@@ -263,9 +263,27 @@ ladder it merely verified as well as one it published — so a peer that drops
 or replaces the ladder is refused by a device that never wrote a rung.
 Demonstrated across processes in MANUAL-TESTING §14.
 
-The saving §5.5 exists for is not yet taken: sync verifies the ladder but
-still walks the full retained history for the head, because nothing in this
-repo yet produces the 1024+ records where climbing would beat walking.
+The saving is now taken. `plan_walk` is a pure function — the `plan_sweep` /
+`decide` shape — that picks the full walk whenever it is within budget and
+climbs otherwise; the full walk wins ties, because it proves contiguity and a
+ladder does not. `nas peer sync` pages the tail and reports both numbers: how
+many records it verified link by link, and how many it took on the writer's
+word. A memory falling in the skipped span is counted as **unchecked**, not
+quietly passed.
+
+Building it found two defects that the ladder itself had hidden:
+
+- **`MAX_RECORDS = 256` was unreachable.** A `SlotRecord` is ~3.5 KB, so 256
+  of them are three times `MAX_FRAME`. A peer asked for a long history built a
+  response it could not encode and **dropped the connection** — turning a
+  partial answer into what a client cannot distinguish from the peer dying,
+  which is the one thing the dispatch is written to avoid. List responses are
+  now bounded by bytes as well as by count, in one place for all four of them.
+- **Without paging the ladder was decorative.** The checkpoint interval is 256
+  and one response carries ~74 records, so no rung could ever leave a tail
+  short enough to walk. Whether 256 is the right interval is now an open
+  question in TODO with the measurement attached, rather than a spec number
+  nobody had checked against the frame size.
 
 **The deletion approval loop (§16.2) is built** (`crates/nas-delete`):
 `DeleteRequest` / `DeleteApproval` / `DeleteExecution`, quorum scaled by blast

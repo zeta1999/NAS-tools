@@ -11,8 +11,8 @@ pub mod witness;
 
 pub use chain::{verify_chain, verify_chain_with_handoffs, ChainError, Walk};
 pub use checkpoint::{
-    is_checkpoint_seq, verify_skip_chain, Checkpoint, CheckpointError, SkipError, SkipWalk,
-    CHECKPOINT_INTERVAL, RETAIN_N,
+    is_checkpoint_seq, plan_walk, verify_skip_chain, Checkpoint, CheckpointError, SkipError,
+    SkipWalk, WalkPlan, CHECKPOINT_INTERVAL, RETAIN_N,
 };
 pub use client::{Anchor, Pin, Reject, SlotClient, Verdict};
 pub use handoff::{HandoffError, SlotHandoff};

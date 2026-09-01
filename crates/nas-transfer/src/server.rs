@@ -6,9 +6,41 @@
 //! here, through the same `get_blob` an honest peer uses.
 
 use crate::session::{Channel, SessionError};
-use crate::wire::{Request, Response, MAX_RECORDS};
+use crate::wire::{record_cost, Request, Response, MAX_RECORDS, RECORD_BUDGET};
 use nas_peer::{Peer, PeerError};
 use nas_slots::{Checkpoint, SlotHandoff, SlotRecord, Witness};
+
+/// Collect encoded items into a list response, bounded by both count and
+/// bytes.
+///
+/// One place, because there are four list responses and the bound that was
+/// missing — bytes — was missing from all of them. A peer that builds a
+/// response it cannot send drops the connection instead of answering, and a
+/// dropped connection is exactly what a refusal must never look like.
+fn bounded<T, E: std::fmt::Display>(
+    items: impl IntoIterator<Item = T>,
+    encode: impl Fn(&T) -> Result<Vec<u8>, E>,
+) -> Response {
+    let mut out: Vec<Vec<u8>> = Vec::new();
+    let mut used = 0usize;
+    for item in items {
+        if out.len() == MAX_RECORDS {
+            break;
+        }
+        let bytes = match encode(&item) {
+            Ok(b) => b,
+            Err(e) => return Response::Error(e.to_string()),
+        };
+        // Stop *before* going over, so what is returned always encodes. A
+        // client that wanted more asks again from a higher `from`.
+        if used + record_cost(bytes.len()) > RECORD_BUDGET {
+            break;
+        }
+        used += record_cost(bytes.len());
+        out.push(bytes);
+    }
+    Response::Records(out)
+}
 
 /// Handle one request against `peer`.
 ///
@@ -40,20 +72,10 @@ pub fn handle(peer: &mut Peer, subject: &str, req: Request) -> Response {
         Request::SlotHead(slot) => {
             Response::Record(peer.slot_head(&slot).and_then(|r| r.encode().ok()))
         }
+        // Bounded by count and by bytes: a peer with a long history must
+        // not build a response it then cannot send.
         Request::SlotHistory { slot, from } => {
-            let mut out = Vec::new();
-            for r in peer.slot_history(&slot, from) {
-                // Bounded here as well as in the encoder: a peer with a long
-                // history must not build a response it then cannot send.
-                if out.len() == MAX_RECORDS {
-                    break;
-                }
-                match r.encode() {
-                    Ok(b) => out.push(b),
-                    Err(e) => return Response::Error(e.to_string()),
-                }
-            }
-            Response::Records(out)
+            bounded(peer.slot_history(&slot, from), |r| r.encode())
         }
         Request::PublishSlot(bytes) => match SlotRecord::decode(&bytes) {
             Ok(rec) => match peer.publish_slot(subject, rec) {
@@ -71,19 +93,7 @@ pub fn handle(peer: &mut Peer, subject: &str, req: Request) -> Response {
             },
             Err(e) => Response::Error(format!("{e}")),
         },
-        Request::Witnesses(slot) => {
-            let mut out = Vec::new();
-            for w in peer.witnesses(&slot) {
-                if out.len() == MAX_RECORDS {
-                    break;
-                }
-                match w.encode() {
-                    Ok(b) => out.push(b),
-                    Err(e) => return Response::Error(e.to_string()),
-                }
-            }
-            Response::Records(out)
-        }
+        Request::Witnesses(slot) => bounded(peer.witnesses(&slot), |w| w.encode()),
         // Ownership handoff (SPECS §5.1). The peer checks the signature and
         // stores it; whether a handoff is *relevant* is decided where a
         // writer actually changes -- in `publish_slot` here, and in the
@@ -97,19 +107,7 @@ pub fn handle(peer: &mut Peer, subject: &str, req: Request) -> Response {
             },
             Err(e) => Response::Error(format!("{e}")),
         },
-        Request::Handoffs(slot) => {
-            let mut out = Vec::new();
-            for h in peer.handoffs(&slot) {
-                if out.len() == MAX_RECORDS {
-                    break;
-                }
-                match h.encode() {
-                    Ok(b) => out.push(b),
-                    Err(e) => return Response::Error(e.to_string()),
-                }
-            }
-            Response::Records(out)
-        }
+        Request::Handoffs(slot) => bounded(peer.handoffs(&slot), |h| h.encode()),
         // The skip chain (SPECS §5.5). The peer stores rungs and serves them
         // in order; it does not link them, prune them or decide which of two
         // conflicting rungs is real. That is the client's walk, against the
@@ -121,21 +119,10 @@ pub fn handle(peer: &mut Peer, subject: &str, req: Request) -> Response {
             },
             Err(e) => Response::Error(format!("{e}")),
         },
+        // A client that hits either cap climbs from a higher `from`, which
+        // is the whole point of a ladder.
         Request::Checkpoints { slot, from } => {
-            let mut out = Vec::new();
-            for c in peer.checkpoints(&slot, from) {
-                // Bounded here as well as in the encoder, like the history
-                // walk: a client that hits the cap climbs from a higher
-                // `from`, which is the whole point of a ladder.
-                if out.len() == MAX_RECORDS {
-                    break;
-                }
-                match c.encode() {
-                    Ok(b) => out.push(b),
-                    Err(e) => return Response::Error(e.to_string()),
-                }
-            }
-            Response::Records(out)
+            bounded(peer.checkpoints(&slot, from), |c| c.encode())
         }
     }
 }

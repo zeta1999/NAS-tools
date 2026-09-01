@@ -42,8 +42,9 @@ use nas_core::{Addr, Mode};
 use nas_crypto::{Identity, Role};
 use nas_peer::{Acl, Hostility, Peer, Right};
 use nas_slots::{
-    is_checkpoint_seq, verify_chain_with_handoffs, verify_skip_chain, Checkpoint, Regime, Roster,
-    SlotHandoff, SlotId, SlotRecord, Witness, ROOT_NONCE_LEN,
+    is_checkpoint_seq, plan_walk, verify_chain_with_handoffs, verify_skip_chain, Checkpoint,
+    Regime, Roster, SlotHandoff, SlotId, SlotRecord, Walk, WalkPlan, Witness, RETAIN_N,
+    ROOT_NONCE_LEN,
 };
 use nas_store::{Addressing, BlobStore};
 use nas_transfer::{transport_identity, Channel, Request, Response};
@@ -984,51 +985,171 @@ pub fn sync(ns: &str, o: SyncOpts<'_>) -> i32 {
             .min()
             .unwrap_or(h.seq)
             .min(h.seq);
-        let history = match call(&mut ch, &Request::SlotHistory { slot, from }) {
-            Ok(Response::Records(rs)) => rs,
-            Ok(Response::Error(m)) => return refused(format!("history: {m}")),
-            Ok(other) => return err(format!("unexpected reply to SlotHistory: {other:?}")),
-            Err(e) => return err(e),
+
+        // Which walk can reach the head (SPECS §5.5).
+        //
+        // The full walk is preferred whenever it arrives: it proves the peer
+        // served a contiguous history, which no ladder does. Climbing is what
+        // a client too far behind for one response does instead of giving up
+        // — which is what it used to do here, refusing however good the
+        // ladder was.
+        //
+        // A history longer than one response is **paged**, not given up on.
+        // One response carries whatever fits in `MAX_FRAME` — about 74 records
+        // at ~3.5 KB each, well below the count ceiling of 256 — and the
+        // checkpoint interval is 256, so without paging no rung could ever
+        // leave a walkable tail and the ladder would be decorative.
+        //
+        // What bounds the linear part is therefore patience, not framing:
+        // `RETAIN_N` records, the peer's own retention window. Past that the
+        // client climbs.
+        let fetch = |ch: &mut Channel, from: u64, budget: usize| -> Result<Vec<SlotRecord>, i32> {
+            let mut out: Vec<SlotRecord> = Vec::new();
+            let mut next = from;
+            loop {
+                let raw = match call(ch, &Request::SlotHistory { slot, from: next }) {
+                    Ok(Response::Records(rs)) => rs,
+                    Ok(Response::Error(m)) => return Err(refused(format!("history: {m}"))),
+                    Ok(other) => {
+                        return Err(err(format!("unexpected reply to SlotHistory: {other:?}")))
+                    }
+                    Err(e) => return Err(err(e)),
+                };
+                if raw.is_empty() {
+                    break;
+                }
+                for bytes in &raw {
+                    match SlotRecord::decode(bytes) {
+                        Ok(r) => out.push(r),
+                        Err(e) => {
+                            return Err(refused(format!(
+                                "peer served an undecodable history record: {e}"
+                            )))
+                        }
+                    }
+                }
+                let last = out.last().map(|r| r.seq).unwrap_or(next);
+                // Stop on arrival, on budget, or on a peer that is not
+                // advancing — the last of which would otherwise be a loop
+                // driven by the party being distrusted.
+                if last >= h.seq || out.len() >= budget || last < next {
+                    break;
+                }
+                next = last + 1;
+            }
+            Ok(out)
         };
-        let mut chain = Vec::with_capacity(history.len());
-        for bytes in &history {
-            match SlotRecord::decode(bytes) {
-                Ok(r) => chain.push(r),
-                Err(e) => {
-                    return refused(format!("peer served an undecodable history record: {e}"))
+
+        let offered = match fetch(&mut ch, from, RETAIN_N) {
+            Ok(c) => c,
+            Err(code) => return code,
+        };
+        let arrived = offered.last().is_some_and(|r| r.seq == h.seq);
+        let rung_seqs: Vec<u64> = rungs.iter().map(|c| c.seq).collect();
+        let (walk_from, skipped, chain) = if arrived {
+            (from, 0u64, offered)
+        } else {
+            match plan_walk(from, h.seq, &rung_seqs, RETAIN_N as u64) {
+                WalkPlan::Full { .. } => {
+                    // The peer stopped short of the head inside its own
+                    // capacity: it is not serving the history it claims.
+                    return refused(format!(
+                        "peer serves seq {} but its history from seq {from} stops at seq {}",
+                        h.seq,
+                        offered.last().map(|r| r.seq).unwrap_or(from)
+                    ));
+                }
+                WalkPlan::Skip { top_seq, skipped, .. } => match fetch(&mut ch, top_seq, RETAIN_N) {
+                    Ok(c) => (top_seq, skipped, c),
+                    Err(code) => return code,
+                },
+                WalkPlan::Unreachable { span, best_rung } => {
+                    return refused(format!(
+                        "peer serves seq {}, {span} above the lowest sequence this device \
+                         remembers, and this client walks at most {} records linearly. {} \
+                         (SPECS §5.5)",
+                        h.seq,
+                        RETAIN_N,
+                        match best_rung {
+                            Some(r) => format!(
+                                "Its highest checkpoint is at seq {r}, too far below the head to climb to"
+                            ),
+                            None => "It serves no checkpoint to climb".to_string(),
+                        }
+                    ))
                 }
             }
-        }
-        // The first link is open unless the walk starts at genesis: a walk
-        // from a witnessed sequence has no memory of that record's
-        // predecessor. Contiguity and every later link are verified.
-        let expect_prev = chain.first().filter(|f| f.seq > 0).map(|f| f.prev);
-        let walk =
+        };
+
+        let walk = if skipped == 0 {
+            // The first link is open unless the walk starts at genesis: a walk
+            // from a witnessed sequence has no memory of that record's
+            // predecessor. Contiguity and every later link are verified.
+            let expect_prev = chain.first().filter(|f| f.seq > 0).map(|f| f.prev);
             match verify_chain_with_handoffs(&chain, slot, &roster, expect_prev, &authorisations) {
                 Ok(w) => w,
                 Err(e) => {
                     return refused(format!(
-                        "peer's history from seq {from} does not verify: {e}"
+                        "peer's history from seq {walk_from} does not verify: {e}"
                     ))
                 }
-            };
+            }
+        } else {
+            // Climbing: the ladder is re-verified together with the tail, so
+            // the record the top rung names has to be the one the tail starts
+            // with. The rungs above `walk_from` are not part of this walk.
+            let climbed: Vec<Checkpoint> = rungs
+                .iter()
+                .filter(|c| c.seq <= walk_from)
+                .cloned()
+                .collect();
+            match verify_skip_chain(&climbed, &chain, slot, &roster, cp_anchor, &authorisations) {
+                Ok(w) => Walk {
+                    slot_id: w.slot_id,
+                    regime: chain.first().map(|r| r.regime).unwrap_or(Regime::CasMerge),
+                    first_seq: w.from_seq,
+                    head_seq: w.head_seq,
+                    head_hash: w.head_hash,
+                },
+                Err(e) => {
+                    return refused(format!(
+                        "peer's ladder and history from seq {walk_from} do not verify: {e}"
+                    ))
+                }
+            }
+        };
         if walk.head_seq != h.seq || walk.head_hash != h.record_hash() {
             return refused(format!(
-                "peer serves seq {} but its retained history from seq {from} reaches seq {} (SPECS §5.5; the wire returns at most {} records)",
-                h.seq,
-                walk.head_seq,
-                nas_transfer::MAX_RECORDS
+                "peer serves seq {} but the history it offered from seq {walk_from} reaches seq {} (SPECS §5.5)",
+                h.seq, walk.head_seq,
             ));
         }
+
+        // Every memory this device has must lie on what was served. A memory
+        // the walk did not cover is NOT a pass: it is counted and reported,
+        // because "the pin lies on it" said of a sequence nobody looked at is
+        // exactly the overclaim SPECS §5.4 is about.
         let at = |seq: u64| chain.iter().find(|r| r.seq == seq);
+        let rung_at = |seq: u64| rungs.iter().find(|c| c.seq == seq);
+        let mut unchecked = 0usize;
         if let Some(p) = pinned {
-            if let (Some(want), Some(r)) = (p.record_hash, at(p.seq)) {
-                if r.record_hash() != want {
+            match (p.record_hash, at(p.seq), rung_at(p.seq)) {
+                (Some(want), Some(r), _) if r.record_hash() != want => {
                     return refused(format!(
                         "fork: the peer serves a different record at seq {} than the one seen here before (SPECS §5.3)",
                         p.seq
-                    ));
+                    ))
                 }
+                // Skipped, but a rung names that very record — the ladder
+                // carries a record hash, so the pin is still checkable there.
+                (Some(want), None, Some(c)) if c.record_hash != want => {
+                    return refused(format!(
+                        "fork: the peer's checkpoint at seq {} names a different record than the one seen here before (SPECS §5.3)",
+                        p.seq
+                    ))
+                }
+                (Some(_), None, None) => unchecked += 1,
+                _ => {}
             }
         }
         for w in witnessed {
@@ -1040,17 +1161,34 @@ pub fn sync(ns: &str, o: SyncOpts<'_>) -> i32 {
                     ))
                 }
                 Some(_) => {}
-                None => return err(format!("verified chain has no record at seq {}", w.seq)),
+                // A witness carries a signature hash and a rung carries a
+                // record hash, so a rung cannot stand in for one. A witness
+                // below the skipped span simply was not checked.
+                None => unchecked += 1,
             }
         }
-        println!(
-            "chain: walked seq {from}..{} from the peer's history; {} on it",
-            h.seq,
-            match (pinned, witnessed.len()) {
-                (Some(_), n) => format!("the pin and {n} witnesses lie"),
-                (None, n) => format!("{n} witnesses lie"),
+
+        let memories = usize::from(pinned.is_some()) + witnessed.len();
+        if skipped == 0 {
+            println!(
+                "chain: walked seq {walk_from}..{}; {} of {memories} memories checked, none contradicted",
+                h.seq,
+                memories - unchecked
+            );
+        } else {
+            println!(
+                "chain: climbed {} rungs over seq {from}..{walk_from} then walked {walk_from}..{}; \
+                 {skipped} records taken on the writer's word, {} of {memories} memories checked",
+                rungs.iter().filter(|c| c.seq <= walk_from).count(),
+                h.seq,
+                memories - unchecked
+            );
+            if unchecked > 0 {
+                println!(
+                    "  !! {unchecked} of them fall in the skipped span and were NOT checked (SPECS §5.4)"
+                );
             }
-        );
+        }
     }
     if let Some((_, _, addr, total, ours)) = &witness_node {
         println!(

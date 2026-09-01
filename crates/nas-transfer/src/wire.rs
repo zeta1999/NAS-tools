@@ -31,7 +31,29 @@ pub const MAX_FRAME: usize = (256 * 1024) + 4096;
 /// A peer answering a chain walk with ten million records is not helping. The
 /// client asks again from a higher `from` if it needs more, which also bounds
 /// the memory a walk costs regardless of how far behind it is.
+///
+/// **This is a ceiling, not a promise.** A `SlotRecord` is ~3.5 KB (the
+/// signature dominates), so 256 of them are three times [`MAX_FRAME`] and the
+/// real limit is whichever binds first — see [`RECORD_BUDGET`].
 pub const MAX_RECORDS: usize = 256;
+
+/// Bytes a list response may spend on records.
+///
+/// Counting records alone was not enough, and the gap was not theoretical: a
+/// peer asked for a 600-record history built a 256-record response, failed to
+/// encode it because it was three times [`MAX_FRAME`], and **dropped the
+/// connection** — turning "here is as much as I can send" into what a client
+/// cannot distinguish from the peer going away. The count bound and the byte
+/// bound are different questions and both are asked now.
+///
+/// The slack covers the tag field and one length prefix per record.
+pub const RECORD_BUDGET: usize = MAX_FRAME - 4096;
+
+/// Bytes one record costs in a list response: its own length plus the
+/// self-delimiting length prefix.
+pub const fn record_cost(encoded_len: usize) -> usize {
+    encoded_len + 4
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WireError {

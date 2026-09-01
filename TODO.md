@@ -159,12 +159,20 @@ settled and the work that follows from them.
       sync` publishes a rung every 256 records and pins the top one, so a peer
       serving a different ladder is refused the way a different record at a
       pinned sequence is. Drill: `uc13_skip_chain.sh`, MANUAL-TESTING §14.
-- [ ] Use the ladder to *shorten* a walk. Today `verify_skip_chain` exists and
-      the ladder is verified on every sync, but `nas peer sync` still walks
-      the full retained history for the head — the saving §5.5 is for only
-      shows up past 1024 records, which nothing in this repo yet produces.
-      Wiring it needs the client to choose between the two walks and say which
-      one it did.
+- [x] Use the ladder to *shorten* a walk — `plan_walk` (pure, in `nas-slots`)
+      chooses the full walk whenever it is within budget and climbs otherwise;
+      `nas peer sync` pages the tail and reports how many records it took on
+      the writer's word and how many memories it could not check. Two defects
+      found by building it: `MAX_RECORDS = 256` was unreachable (a 256-record
+      response is 3x `MAX_FRAME`, so the peer **dropped the connection**
+      instead of answering), and without paging no rung could ever leave a
+      walkable tail because the checkpoint interval (256) exceeds what one
+      response carries (~74).
+- [ ] **Reconcile `CHECKPOINT_INTERVAL` with what a response carries.** 256 is
+      what SPECS §5.5 says, but one response holds ~74 records, so a climb
+      always costs 2-4 pages of tail. Either lower the interval to fit a
+      response, raise `MAX_FRAME`, or record why paging the tail is fine. The
+      measurement is done; the decision is not.
 - [x] Single-writer ownership handoff (SPECS §5.1) — `SlotHandoff` in
       `nas-slots`, signed by the **outgoing** writer, binding slot, sequence
       and both writers. `verify_chain_with_handoffs` accepts an authorised
@@ -246,7 +254,7 @@ settled and the work that follows from them.
       carries seq + record hash, `sync` walks `SlotHistory` from the lowest
       witnessed/pinned seq (`tests/usecases/uc12_fork_drill.sh`,
       MANUAL-TESTING.md §13)
-- [ ] Skip-chain checkpoints (SPECS §5.5) — see the M1 entry
+- [x] Skip-chain checkpoints (SPECS §5.5) — see the M1 entry
 - [x] Witness publication and relay (`PublishWitness`/`Witnesses` in
       `nas_transfer::handle`, `nas-slots` `witness.rs`; relay is
       witness-only-capable via `peer serve --witness`)

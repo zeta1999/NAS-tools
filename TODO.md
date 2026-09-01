@@ -168,11 +168,16 @@ settled and the work that follows from them.
       instead of answering), and without paging no rung could ever leave a
       walkable tail because the checkpoint interval (256) exceeds what one
       response carries (~74).
-- [ ] **Reconcile `CHECKPOINT_INTERVAL` with what a response carries.** 256 is
-      what SPECS §5.5 says, but one response holds ~74 records, so a climb
-      always costs 2-4 pages of tail. Either lower the interval to fit a
-      response, raise `MAX_FRAME`, or record why paging the tail is fine. The
-      measurement is done; the decision is not.
+- [x] **`CHECKPOINT_INTERVAL` reconciled with what a response carries — keep
+      256, page both fetches.** Climbing costs `S/I + I` items, minimised at
+      `I = sqrt(S)`; for §5.5's own 100 000-behind example that is ~316, so 256
+      costs 646 against an optimum of 632. Shrinking it to one response (74)
+      would cost 1425 — more than double. The frame is a transport limit and
+      does not get to set a protocol constant, so the ladder fetch is paged
+      too. That was a live defect, not a hypothetical: asking once truncated
+      the ladder at the *bottom*, losing exactly the high rungs a far-behind
+      client climbs to. `the_interval_is_sized_against_the_span_not_against_a_frame`
+      keeps the arithmetic from drifting.
 - [x] Single-writer ownership handoff (SPECS §5.1) — `SlotHandoff` in
       `nas-slots`, signed by the **outgoing** writer, binding slot, sequence
       and both writers. `verify_chain_with_handoffs` accepts an authorised

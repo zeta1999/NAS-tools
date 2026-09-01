@@ -281,9 +281,17 @@ Building it found two defects that the ladder itself had hidden:
   now bounded by bytes as well as by count, in one place for all four of them.
 - **Without paging the ladder was decorative.** The checkpoint interval is 256
   and one response carries ~74 records, so no rung could ever leave a tail
-  short enough to walk. Whether 256 is the right interval is now an open
-  question in TODO with the measurement attached, rather than a spec number
-  nobody had checked against the frame size.
+  short enough to walk. The *ladder* fetch had the same defect and was worse:
+  asking once truncated it at the **bottom**, losing exactly the high rungs a
+  far-behind client climbs to, so a good ladder read as "unreachable" past
+  about 19 000 records.
+
+The interval itself was then checked rather than assumed, and **256 stands**.
+Climbing costs `S/I + I` items, minimised at `I = sqrt(S)`; for §5.5's own
+100 000-behind example that is ~316, so 256 costs 646 against an optimum of
+632. Shrinking it to fit one response would cost 1425 — more than double. A
+frame size is a transport limit and has no business setting a protocol
+constant, so both fetches page instead.
 
 **The deletion approval loop (§16.2) is built** (`crates/nas-delete`):
 `DeleteRequest` / `DeleteApproval` / `DeleteExecution`, quorum scaled by blast

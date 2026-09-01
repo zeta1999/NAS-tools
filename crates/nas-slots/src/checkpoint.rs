@@ -1133,6 +1133,28 @@ mod tests {
     }
 
     #[test]
+    fn the_interval_is_sized_against_the_span_not_against_a_frame() {
+        // Climbing costs one rung per `I` records plus a tail of at most `I`:
+        // S/I + I items to fetch and verify, minimised at I = sqrt(S). SPECS
+        // §5.5's own example is a client 100 000 behind, where the optimum is
+        // ~316 — so 256 is within a few percent and the number is not
+        // arbitrary.
+        //
+        // What it is *not* sized against is how much one response carries
+        // (~74 records, since a `SlotRecord` is ~3.5 KB and the frame is
+        // 256 KiB). Shrinking the interval to fit a response would more than
+        // double the work. That is why both the ladder fetch and the tail are
+        // paged instead — the frame is a transport limit and has no business
+        // deciding a protocol constant.
+        let cost = |i: u64, s: u64| s / i + i;
+        let s = 100_000u64;
+        assert_eq!(cost(CHECKPOINT_INTERVAL, s), 646);
+        assert_eq!(cost(316, s), 632, "the optimum, near sqrt(S)");
+        assert_eq!(cost(74, s), 1425, "sizing to one response costs twice");
+        assert!(cost(CHECKPOINT_INTERVAL, s) < cost(74, s));
+    }
+
+    #[test]
     fn the_default_interval_is_what_specs_says() {
         // SPECS §5.5: retain-N = 1024, a checkpoint every 256 records. A
         // client 100 000 behind walks ~400 rungs rather than 100 000 records.

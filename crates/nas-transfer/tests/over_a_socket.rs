@@ -891,3 +891,72 @@ fn a_response_too_large_to_send_is_shortened_not_dropped() {
         Response::Bool(false)
     );
 }
+
+#[test]
+fn a_ladder_longer_than_one_response_is_paged_from_the_bottom() {
+    // Same defect family as the history walk: one response carries what fits
+    // in `MAX_FRAME`, so a client asking once gets the ladder truncated at the
+    // BOTTOM — losing exactly the high rungs a far-behind client would climb
+    // to, and turning a good ladder into "unreachable".
+    const RUNGS: u64 = 100;
+    let mut cps: Vec<Checkpoint> = Vec::new();
+    for i in 0..RUNGS {
+        let c = Checkpoint::sign(
+            &writer(),
+            slot(),
+            i * 10,
+            [i as u8; 32],
+            cps.last().map(|p: &Checkpoint| p.seq).unwrap_or(0),
+            cps.last().map(|p| p.checkpoint_hash()).unwrap_or([0u8; 32]),
+        )
+        .unwrap();
+        cps.push(c);
+    }
+    let seeded = cps.clone();
+    let (_s, mut ch) = connected("ladder-paged", Hostility::HONEST, move |p| {
+        for c in seeded {
+            p.publish_checkpoint(c).unwrap();
+        }
+    });
+
+    let page = |ch: &mut Channel, from: u64| -> Vec<Checkpoint> {
+        match ch
+            .call(&Request::Checkpoints { slot: slot(), from })
+            .unwrap()
+        {
+            Response::Records(rs) => rs.iter().map(|b| Checkpoint::decode(b).unwrap()).collect(),
+            other => panic!("{other:?}"),
+        }
+    };
+
+    let first = page(&mut ch, 0);
+    assert!(
+        (first.len() as u64) < RUNGS,
+        "one response does not hold the ladder: {} of {RUNGS}",
+        first.len()
+    );
+
+    let mut got: Vec<Checkpoint> = Vec::new();
+    let mut next = 0u64;
+    loop {
+        let p = page(&mut ch, next);
+        if p.is_empty() {
+            break;
+        }
+        let last = p.last().unwrap().seq;
+        got.extend(p);
+        if last < next {
+            break;
+        }
+        next = last + 1;
+    }
+    assert_eq!(got.len() as u64, RUNGS, "paging reaches the top");
+    assert_eq!(got.last().unwrap().seq, (RUNGS - 1) * 10);
+
+    // And the paged ladder is still a chain: it verifies end to end.
+    let mut roster = Roster::new();
+    roster.add(writer().verifying_key()).unwrap();
+    let w = verify_skip_chain(&got, &[], slot(), &roster, None, &[]).unwrap();
+    assert_eq!(w.checkpoints as u64, RUNGS);
+    assert_eq!(w.head_seq, (RUNGS - 1) * 10);
+}

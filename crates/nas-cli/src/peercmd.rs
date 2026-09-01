@@ -40,7 +40,7 @@ use crate::exit;
 use crate::repo::{self, Repo};
 use nas_core::{Addr, Mode};
 use nas_crypto::{Identity, Role};
-use nas_peer::{Acl, Hostility, Peer, Right};
+use nas_peer::{Acl, Hostility, Peer, Right, MAX_CHECKPOINTS_PER_SLOT};
 use nas_slots::{
     is_checkpoint_seq, plan_walk, verify_chain_with_handoffs, verify_skip_chain, Checkpoint,
     Regime, Roster, SlotHandoff, SlotId, SlotRecord, Walk, WalkPlan, Witness, RETAIN_N,
@@ -899,23 +899,43 @@ pub fn sync(ns: &str, o: SyncOpts<'_>) -> i32 {
         Some((seq, hash)) => (seq, Some(hash)),
         None => (0, None),
     };
-    let rung_bytes = match call(
-        &mut ch,
-        &Request::Checkpoints {
-            slot,
-            from: cp_from,
-        },
-    ) {
-        Ok(Response::Records(rs)) => rs,
-        Ok(Response::Error(m)) => return refused(format!("checkpoints: {m}")),
-        Ok(other) => return err(format!("unexpected reply to Checkpoints: {other:?}")),
-        Err(e) => return err(e),
-    };
-    let mut rungs = Vec::with_capacity(rung_bytes.len());
-    for b in &rung_bytes {
-        match Checkpoint::decode(b) {
-            Ok(c) => rungs.push(c),
-            Err(e) => return refused(format!("peer served an undecodable checkpoint: {e}")),
+    // Paged, for the same reason the history walk is: one response carries
+    // what fits in `MAX_FRAME`, about 74 rungs, which at an interval of 256 is
+    // only 19 000 records of ladder. Asking once would truncate at the
+    // *bottom* — losing exactly the high rungs a far-behind client climbs to,
+    // and turning a good ladder into `Unreachable`.
+    //
+    // Bounded by `MAX_CHECKPOINTS_PER_SLOT`, which is what the peer will hold,
+    // so a peer that keeps answering cannot keep this loop going.
+    let mut rungs: Vec<Checkpoint> = Vec::new();
+    {
+        let mut next = cp_from;
+        loop {
+            let page = match call(&mut ch, &Request::Checkpoints { slot, from: next }) {
+                Ok(Response::Records(rs)) => rs,
+                Ok(Response::Error(m)) => return refused(format!("checkpoints: {m}")),
+                Ok(other) => return err(format!("unexpected reply to Checkpoints: {other:?}")),
+                Err(e) => return err(e),
+            };
+            if page.is_empty() {
+                break;
+            }
+            for b in &page {
+                match Checkpoint::decode(b) {
+                    Ok(c) => rungs.push(c),
+                    Err(e) => {
+                        return refused(format!("peer served an undecodable checkpoint: {e}"))
+                    }
+                }
+            }
+            let last = rungs.last().map(|c| c.seq).unwrap_or(next);
+            // A peer that stops advancing ends the loop rather than driving
+            // it: the party being distrusted does not get to decide how long
+            // this runs.
+            if rungs.len() >= MAX_CHECKPOINTS_PER_SLOT || last < next {
+                break;
+            }
+            next = last + 1;
         }
     }
     let top: Option<Checkpoint> = if rungs.is_empty() {

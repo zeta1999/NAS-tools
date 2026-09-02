@@ -12,7 +12,7 @@
 use crate::acl::{Acl, Decision, Right};
 use crate::hostile::Hostility;
 use nas_core::{Addr, Mode, Timestamp};
-use nas_lease::{plan_sweep, BlobInfo, GcPolicy, Holder, SweepPlan};
+use nas_lease::{plan_sweep, BlobInfo, GcPolicy, Holder, LeaseSet, SweepPlan};
 use nas_slots::{
     Checkpoint, CheckpointError, HandoffError, Regime, Roster, SlotHandoff, SlotId, SlotRecord,
     Witness, WitnessError,
@@ -51,10 +51,43 @@ pub const MAX_CHECKPOINTS_PER_SLOT: usize = 1024;
 /// the same key authorise the same change.
 type HandoffKey = (u64, [u8; 32], [u8; 32]);
 
+/// The id a quota is accounted against (SPECS §6.4).
+///
+/// Derived from the ACL **subject**, not from the transport key: the subject
+/// is already this peer's notion of who a party is, and it is what an operator
+/// granted rights to. Two devices sharing a subject therefore share a ceiling,
+/// which is what "the laptop may lease 10 GB" is normally taken to mean. Keying
+/// on the key instead would give each device its own ceiling and let a party
+/// multiply its quota by enrolling more keys under one name.
+///
+/// Domain-separated so a holder id can never equal a key id or an address that
+/// happens to share bytes.
+pub fn holder_id(subject: &str) -> [u8; 32] {
+    let mut h = blake3::Hasher::new();
+    h.update(b"nas-tools/holder/v1");
+    h.update(subject.as_bytes());
+    *h.finalize().as_bytes()
+}
+
+fn unhex32(s: &str) -> Option<[u8; 32]> {
+    if s.len() != 64 {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for (i, o) in out.iter_mut().enumerate() {
+        *o = u8::from_str_radix(s.get(2 * i..2 * i + 2)?, 16).ok()?;
+    }
+    Some(out)
+}
+
+fn hex32(b: &[u8; 32]) -> String {
+    b.iter().map(|x| format!("{x:02x}")).collect()
+}
+
 fn handoff_key(h: &SlotHandoff) -> HandoffKey {
     (h.at_seq, *h.from().as_bytes(), *h.to.as_bytes())
 }
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -110,6 +143,23 @@ pub enum PeerError {
     /// A witness-only node (SPECS §5.3): it relays witnesses and does nothing
     /// else, so it can hold no blobs and no capabilities to lose.
     WitnessOnly,
+    /// A lease that would put the holder over the §6.4 ceiling.
+    ///
+    /// The numbers are in the error because a quota refusal a client cannot
+    /// act on is a wall, not a control: it needs to know how far over it is.
+    QuotaExceeded {
+        holder: [u8; 32],
+        would_be: u64,
+        limit: u64,
+    },
+    /// A lease on a blob this peer does not hold.
+    ///
+    /// Refused rather than recorded: a lease over an absent address protects
+    /// nothing, and letting a holder accumulate them is a way to hold quota
+    /// against blobs it never uploaded.
+    NoSuchBlob {
+        addr: Addr,
+    },
     /// A checkpoint that does not verify against the key it carries.
     Checkpoint(CheckpointError),
     /// Too many checkpoints for one slot. See [`MAX_CHECKPOINTS_PER_SLOT`].
@@ -166,6 +216,18 @@ impl std::fmt::Display for PeerError {
                 f,
                 "witness-only node: relays witnesses and holds no blobs, slots or caps (SPECS §5.3)"
             ),
+            Self::QuotaExceeded {
+                holder,
+                would_be,
+                limit,
+            } => write!(
+                f,
+                "holder {} would hold {would_be} B of leases, over the {limit} B ceiling (SPECS §6.4)",
+                hex32(holder)
+            ),
+            Self::NoSuchBlob { addr } => {
+                write!(f, "no blob at {} to lease", addr.to_hex())
+            }
             Self::Checkpoint(e) => write!(f, "checkpoint rejected: {e}"),
             Self::CheckpointsFull { slot } => write!(
                 f,
@@ -254,6 +316,20 @@ pub struct Peer {
     /// restart came back holding fewer than had been accepted. Keying memory
     /// and disk the same way is what stops those two disagreeing.
     handoffs: BTreeMap<SlotId, BTreeMap<HandoffKey, SlotHandoff>>,
+    /// Leases held, `holder id -> (addresses, last seen)` (SPECS §6).
+    ///
+    /// The peer owns these because §6.4's per-holder quota is an **admission**
+    /// control and admission needs state. `plan_sweep` can report a breach
+    /// after the fact; only the party taking the lease can refuse it, and it
+    /// cannot refuse what it does not track.
+    leases: BTreeMap<[u8; 32], (BTreeSet<[u8; 32]>, Timestamp)>,
+    /// The GC policy this peer enforces (SPECS §6.2–§6.4).
+    ///
+    /// Peer state, not an argument to `sweep`, because the quota has to be the
+    /// same number at admission time and at sweep time. Two callers passing
+    /// two policies would let a lease be admitted under one ceiling and
+    /// reported against another.
+    pub gc_policy: GcPolicy,
     /// Skip-chain checkpoints, `slot -> (seq, checkpoint hash) -> rung`
     /// (SPECS §5.5).
     ///
@@ -295,6 +371,8 @@ impl Peer {
             witnesses: BTreeMap::new(),
             handoffs: BTreeMap::new(),
             checkpoints: BTreeMap::new(),
+            leases: BTreeMap::new(),
+            gc_policy: GcPolicy::default(),
             witness_only: false,
             hostility,
         };
@@ -382,6 +460,33 @@ impl Peer {
                         }
                     }
                 }
+            }
+        }
+        if let Ok(rd) = fs::read_dir(self.root.join("leases")) {
+            for e in rd.flatten() {
+                let Some(name) = e.file_name().to_str().map(str::to_owned) else {
+                    continue;
+                };
+                let Some(holder) = unhex32(&name) else {
+                    continue;
+                };
+                let Ok(bytes) = fs::read(e.path()) else {
+                    continue;
+                };
+                if bytes.len() < 8 {
+                    continue;
+                }
+                let (seen, rest) = bytes.split_at(8);
+                let seen = Timestamp(u64::from_le_bytes(
+                    seen.try_into().expect("split_at guarantees 8"),
+                ));
+                let mut set = BTreeSet::new();
+                for chunk in rest.chunks_exact(32) {
+                    let mut a = [0u8; 32];
+                    a.copy_from_slice(chunk);
+                    set.insert(a);
+                }
+                self.leases.insert(holder, (set, seen));
             }
         }
         if let Ok(bytes) = fs::read(self.root.join("retention")) {
@@ -506,6 +611,120 @@ impl Peer {
         fs::write(&tmp, &bytes)?;
         fs::rename(&tmp, dir.join(name))?;
         Ok(())
+    }
+
+    // ── Leases and the §6.4 quota ───────────────────────────────────────
+
+    fn persist_leases(&self) -> Result<(), PeerError> {
+        let dir = self.root.join("leases");
+        fs::create_dir_all(&dir)?;
+        for (holder, (set, seen)) in &self.leases {
+            let mut out = Vec::with_capacity(8 + set.len() * 32);
+            out.extend_from_slice(&seen.secs().to_le_bytes());
+            for a in set {
+                out.extend_from_slice(a);
+            }
+            let name = hex32(holder);
+            let tmp = dir.join(format!("{name}.tmp"));
+            fs::write(&tmp, &out)?;
+            fs::rename(&tmp, dir.join(name))?;
+        }
+        Ok(())
+    }
+
+    /// Take leases on `addrs` for `holder`, or refuse the whole request.
+    ///
+    /// **All or nothing.** A partial take would leave the holder believing it
+    /// protected a set it does not, which is the failure mode leases exist to
+    /// prevent — and it would let a griefer bisect its way to the ceiling one
+    /// accepted address at a time.
+    ///
+    /// The ceiling is checked against what the holder *would* hold, counting
+    /// the blobs it already leases, so taking the same lease twice is free and
+    /// taking a new one is not.
+    pub fn take_lease(
+        &mut self,
+        holder: [u8; 32],
+        addrs: &[Addr],
+        now: Timestamp,
+    ) -> Result<u64, PeerError> {
+        // A lease over a blob the peer does not hold protects nothing, and
+        // accumulating them is a way to hold quota against data never
+        // uploaded. Checked before the ceiling so the clearer error wins.
+        for a in addrs {
+            if !self.blobs.has(a) {
+                return Err(PeerError::NoSuchBlob { addr: *a });
+            }
+        }
+        let sizes = self.blob_sizes()?;
+        let mut would: BTreeSet<[u8; 32]> = self
+            .leases
+            .get(&holder)
+            .map(|(s, _)| s.clone())
+            .unwrap_or_default();
+        would.extend(addrs.iter().map(|a| *a.as_bytes()));
+        let bytes = would
+            .iter()
+            .filter_map(|a| sizes.get(a))
+            .fold(0u64, |acc, n| acc.saturating_add(*n));
+        if bytes > self.gc_policy.max_leased_bytes {
+            return Err(PeerError::QuotaExceeded {
+                holder,
+                would_be: bytes,
+                limit: self.gc_policy.max_leased_bytes,
+            });
+        }
+        self.leases.insert(holder, (would, now));
+        self.persist_leases()?;
+        Ok(bytes)
+    }
+
+    /// Drop leases on `addrs` for `holder`. Addresses not held are ignored:
+    /// releasing twice is not an error, and a client retrying after a dropped
+    /// connection must not be told it failed.
+    pub fn release_lease(
+        &mut self,
+        holder: [u8; 32],
+        addrs: &[Addr],
+        now: Timestamp,
+    ) -> Result<(), PeerError> {
+        if let Some((set, seen)) = self.leases.get_mut(&holder) {
+            for a in addrs {
+                set.remove(a.as_bytes());
+            }
+            *seen = now;
+        }
+        self.persist_leases()
+    }
+
+    /// What `holder` currently leases.
+    pub fn leases_of(&self, holder: &[u8; 32]) -> Vec<Addr> {
+        self.leases
+            .get(holder)
+            .map(|(s, _)| s.iter().map(|a| Addr::from_bytes(*a)).collect())
+            .unwrap_or_default()
+    }
+
+    /// Every holder, in the shape `plan_sweep` wants.
+    pub fn holders(&self) -> Vec<Holder> {
+        self.leases
+            .iter()
+            .map(|(id, (set, seen))| Holder {
+                id: *id,
+                set: LeaseSet::from_addrs(
+                    &set.iter().map(|a| Addr::from_bytes(*a)).collect::<Vec<_>>(),
+                ),
+                last_seen: *seen,
+            })
+            .collect()
+    }
+
+    fn blob_sizes(&self) -> Result<BTreeMap<[u8; 32], u64>, PeerError> {
+        Ok(self
+            .inventory()?
+            .into_iter()
+            .map(|b| (*b.addr.as_bytes(), b.size))
+            .collect())
     }
 
     // ── Skip-chain checkpoints (SPECS §5.5) ─────────────────────────────
@@ -2459,5 +2678,197 @@ mod checkpoint_tests {
         // dropped connection is not reported as a refusal.
         fill(&mut p, 1).unwrap();
         assert_eq!(p.checkpoints(&slot(), 0).len(), MAX_CHECKPOINTS_PER_SLOT);
+    }
+}
+
+#[cfg(test)]
+mod lease_tests {
+    //! SPECS §6.4: the quota is an admission control, so the peer has to own
+    //! the leases. `plan_sweep` can report a breach after the fact; only the
+    //! party taking the lease can refuse it.
+    use super::*;
+    use nas_lease::sweep::DAY;
+
+    struct Scratch(PathBuf);
+    impl Scratch {
+        fn new(tag: &str) -> Self {
+            let p = std::env::temp_dir().join(format!("nas-lease-{}-{tag}", std::process::id()));
+            let _ = fs::remove_dir_all(&p);
+            Self(p)
+        }
+    }
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    const BLOB: usize = 1024;
+
+    fn open(s: &Scratch, ceiling: u64) -> Peer {
+        let mut p = Peer::open(&s.0, Mode::E2ee, Addressing::Content, Hostility::HONEST).unwrap();
+        p.gc_policy.max_leased_bytes = ceiling;
+        p
+    }
+
+    fn seed(p: &mut Peer, n: u8) -> Vec<Addr> {
+        (0..n)
+            .map(|i| p.put_blob(&vec![i; BLOB]).unwrap())
+            .collect()
+    }
+
+    /// Anchored to the wall clock, not to an invented epoch.
+    ///
+    /// `inventory` reads real file mtimes, so a fixture clock in the past
+    /// makes `saturating_since` return 0 and classifies every blob as a young
+    /// one — a sweep test that then "passes" because nothing was ever swept.
+    /// That mistake has been made in this file before.
+    fn now() -> Timestamp {
+        Timestamp(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+        )
+    }
+
+    #[test]
+    fn a_holder_inside_its_ceiling_leases_freely() {
+        let s = Scratch::new("under");
+        let mut p = open(&s, 100 * BLOB as u64);
+        let a = seed(&mut p, 4);
+        p.take_lease([1u8; 32], &a, now()).unwrap();
+        assert_eq!(p.leases_of(&[1u8; 32]).len(), 4);
+    }
+
+    #[test]
+    fn a_lease_over_the_ceiling_is_refused_whole() {
+        // All or nothing. A peer that admitted the part that fits would let a
+        // griefer bisect its way to the ceiling one accepted address at a
+        // time, which is the attack the quota exists to stop.
+        let s = Scratch::new("over");
+        let mut p = open(&s, 3 * BLOB as u64);
+        let a = seed(&mut p, 6);
+        assert!(matches!(
+            p.take_lease([1u8; 32], &a, now()),
+            Err(PeerError::QuotaExceeded { .. })
+        ));
+        assert!(
+            p.leases_of(&[1u8; 32]).is_empty(),
+            "nothing partial was admitted"
+        );
+        // And the part that does fit is still available.
+        p.take_lease([1u8; 32], &a[..3], now()).unwrap();
+        assert_eq!(p.leases_of(&[1u8; 32]).len(), 3);
+    }
+
+    #[test]
+    fn the_ceiling_counts_what_the_holder_would_hold_not_what_it_asked_for() {
+        // Otherwise a holder at the ceiling could keep taking leases forever,
+        // one small request at a time.
+        let s = Scratch::new("cumulative");
+        let mut p = open(&s, 3 * BLOB as u64);
+        let a = seed(&mut p, 6);
+        p.take_lease([1u8; 32], &a[..3], now()).unwrap();
+        assert!(matches!(
+            p.take_lease([1u8; 32], &a[3..4], now()),
+            Err(PeerError::QuotaExceeded { .. })
+        ));
+        // Re-taking one it already holds costs nothing and is not refused.
+        p.take_lease([1u8; 32], &a[..1], now()).unwrap();
+        assert_eq!(p.leases_of(&[1u8; 32]).len(), 3);
+    }
+
+    #[test]
+    fn one_holders_ceiling_is_not_anothers() {
+        let s = Scratch::new("per-holder");
+        let mut p = open(&s, 3 * BLOB as u64);
+        let a = seed(&mut p, 6);
+        p.take_lease([1u8; 32], &a[..3], now()).unwrap();
+        p.take_lease([2u8; 32], &a[3..], now()).unwrap();
+        assert_eq!(p.leases_of(&[1u8; 32]).len(), 3);
+        assert_eq!(p.leases_of(&[2u8; 32]).len(), 3);
+    }
+
+    #[test]
+    fn a_lease_on_a_blob_the_peer_does_not_hold_is_refused() {
+        // It protects nothing, and accumulating them would hold quota against
+        // data that was never uploaded.
+        let s = Scratch::new("ghost");
+        let mut p = open(&s, u64::MAX);
+        assert!(matches!(
+            p.take_lease([1u8; 32], &[Addr::of_ciphertext(b"absent")], now()),
+            Err(PeerError::NoSuchBlob { .. })
+        ));
+    }
+
+    #[test]
+    fn releasing_is_idempotent_and_frees_the_ceiling() {
+        let s = Scratch::new("release");
+        let mut p = open(&s, 3 * BLOB as u64);
+        let a = seed(&mut p, 6);
+        p.take_lease([1u8; 32], &a[..3], now()).unwrap();
+        p.release_lease([1u8; 32], &a[..2], now()).unwrap();
+        // Twice: a client retrying after a dropped connection is not told it
+        // failed.
+        p.release_lease([1u8; 32], &a[..2], now()).unwrap();
+        assert_eq!(p.leases_of(&[1u8; 32]).len(), 1);
+        p.take_lease([1u8; 32], &a[3..5], now()).unwrap();
+        assert_eq!(p.leases_of(&[1u8; 32]).len(), 3);
+    }
+
+    #[test]
+    fn leases_survive_a_restart() {
+        // A ceiling that reset on restart would be no ceiling at all: a
+        // griefer would bounce the peer and start again.
+        let s = Scratch::new("persist");
+        let a = {
+            let mut p = open(&s, 3 * BLOB as u64);
+            let a = seed(&mut p, 6);
+            p.take_lease([1u8; 32], &a[..3], now()).unwrap();
+            a
+        };
+        let mut p = open(&s, 3 * BLOB as u64);
+        assert_eq!(p.leases_of(&[1u8; 32]).len(), 3);
+        assert!(matches!(
+            p.take_lease([1u8; 32], &a[3..4], now()),
+            Err(PeerError::QuotaExceeded { .. })
+        ));
+    }
+
+    #[test]
+    fn what_the_peer_holds_is_what_the_sweep_plans_against() {
+        // The two halves of §6 have to agree: a lease admitted here must be
+        // the same lease that protects a blob there.
+        let s = Scratch::new("sweep");
+        let mut p = open(&s, u64::MAX);
+        let a = seed(&mut p, 3);
+        p.take_lease([1u8; 32], &a[..2], now()).unwrap();
+
+        let holders = p.holders();
+        assert_eq!(holders.len(), 1);
+        assert_eq!(holders[0].id, [1u8; 32]);
+        assert!(holders[0].set.contains(&a[0]));
+        assert!(!holders[0].set.contains(&a[2]));
+
+        // Past the 24 h young-blob grace but well inside the 90-day lease
+        // expiry, so the holder is still active and its leases still protect.
+        // (At +200 days the holder would be expired and everything would be
+        // swept, which is §6.3 working, not this test's subject.)
+        let later = Timestamp(now().secs() + 2 * DAY);
+        let plan = p
+            .sweep(&holders, &GcPolicy::default(), later, false)
+            .unwrap();
+        assert!(plan.delete.contains(&a[2]), "the unleased blob is swept");
+        assert!(!plan.delete.contains(&a[0]), "the leased ones are not");
+    }
+
+    #[test]
+    fn the_holder_id_comes_from_the_subject_and_is_domain_separated() {
+        assert_ne!(holder_id("laptop"), holder_id("phone"));
+        assert_eq!(holder_id("laptop"), holder_id("laptop"));
+        // Not equal to a bare hash of the name: a holder id must never collide
+        // with a key id or an address that happens to share bytes.
+        assert_ne!(holder_id("laptop"), *blake3::hash(b"laptop").as_bytes());
     }
 }

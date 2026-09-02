@@ -142,6 +142,12 @@ pub enum Request {
         slot: SlotId,
         from: u64,
     },
+    /// Take leases on these addresses (SPECS §6). All or nothing: a partial
+    /// take would leave the holder believing it protected a set it does not.
+    TakeLease(Vec<Addr>),
+    ReleaseLease(Vec<Addr>),
+    /// What this connection's subject currently leases.
+    Leases,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -154,6 +160,10 @@ pub enum Response {
     Record(Option<Vec<u8>>),
     Records(Vec<Vec<u8>>),
     Ok,
+    /// A list of addresses. Distinct from [`Self::Records`] because these are
+    /// bare addresses, not encoded records, and a decoder that accepted either
+    /// under one tag would have to guess which it was holding.
+    Addrs(Vec<Addr>),
     /// A refusal or failure, as text. **Never trusted**: it is peer-supplied
     /// and only ever shown to a human or logged, never parsed for control flow.
     ///
@@ -174,6 +184,9 @@ const REQ_PUBLISH_HANDOFF: u8 = 9;
 const REQ_HANDOFFS: u8 = 10;
 const REQ_PUBLISH_CHECKPOINT: u8 = 11;
 const REQ_CHECKPOINTS: u8 = 12;
+const REQ_TAKE_LEASE: u8 = 13;
+const REQ_RELEASE_LEASE: u8 = 14;
+const REQ_LEASES: u8 = 15;
 
 const RSP_BLOB: u8 = 0;
 const RSP_BOOL: u8 = 1;
@@ -182,7 +195,8 @@ const RSP_PROOF: u8 = 3;
 const RSP_RECORD: u8 = 4;
 const RSP_RECORDS: u8 = 5;
 const RSP_OK: u8 = 6;
-const RSP_ERROR: u8 = 7;
+const RSP_ADDRS: u8 = 7;
+const RSP_ERROR: u8 = 8;
 
 fn fixed<const N: usize>(field: &'static str, b: &[u8]) -> Result<[u8; N], WireError> {
     b.try_into().map_err(|_| WireError::BadWidth {
@@ -212,6 +226,9 @@ impl Request {
             Self::Checkpoints { slot, from } => {
                 encode_fields(&[&[REQ_CHECKPOINTS], slot.as_bytes(), &from.to_le_bytes()])?
             }
+            Self::TakeLease(a) => encode_addrs(REQ_TAKE_LEASE, a)?,
+            Self::ReleaseLease(a) => encode_addrs(REQ_RELEASE_LEASE, a)?,
+            Self::Leases => encode_fields(&[&[REQ_LEASES]])?,
         };
         check_size(out)
     }
@@ -294,6 +311,12 @@ impl Request {
                     from: u64::from_le_bytes(fixed::<8>("from", f[2])?),
                 }
             }
+            REQ_TAKE_LEASE => Self::TakeLease(decode_addrs(&f)?),
+            REQ_RELEASE_LEASE => Self::ReleaseLease(decode_addrs(&f)?),
+            REQ_LEASES => {
+                want(1)?;
+                Self::Leases
+            }
             other => return Err(WireError::UnknownTag { tag: other }),
         })
     }
@@ -316,6 +339,7 @@ impl Response {
                 fields.extend(rs.iter().map(|r| r.as_slice()));
                 encode_fields(&fields)?
             }
+            Self::Addrs(a) => encode_addrs(RSP_ADDRS, a)?,
             Self::Ok => encode_fields(&[&[RSP_OK]])?,
             Self::Error(m) => encode_fields(&[&[RSP_ERROR], m.as_bytes()])?,
         };
@@ -381,6 +405,7 @@ impl Response {
                 }
                 Self::Records(f[1..].iter().map(|r| r.to_vec()).collect())
             }
+            RSP_ADDRS => Self::Addrs(decode_addrs(&f)?),
             RSP_OK => {
                 exact(&f, 1)?;
                 Self::Ok
@@ -400,6 +425,29 @@ impl Response {
             other => return Err(WireError::UnknownTag { tag: other }),
         })
     }
+}
+
+/// A tag followed by any number of addresses.
+///
+/// Bounded by [`MAX_RECORDS`] like every other list on this protocol: a peer —
+/// or a client — sending ten million addresses is not helping.
+fn encode_addrs(tag: u8, addrs: &[Addr]) -> Result<Vec<u8>, WireError> {
+    if addrs.len() > MAX_RECORDS {
+        return Err(WireError::TooManyRecords { got: addrs.len() });
+    }
+    let mut fields: Vec<&[u8]> = vec![std::slice::from_ref(&tag)];
+    fields.extend(addrs.iter().map(|a| a.as_bytes() as &[u8]));
+    encode_fields(&fields).map_err(WireError::from)
+}
+
+fn decode_addrs(f: &[&[u8]]) -> Result<Vec<Addr>, WireError> {
+    if f.len() - 1 > MAX_RECORDS {
+        return Err(WireError::TooManyRecords { got: f.len() - 1 });
+    }
+    f[1..]
+        .iter()
+        .map(|b| Ok(Addr::from_bytes(fixed::<ADDR_LEN>("addr", b)?)))
+        .collect()
 }
 
 fn tag_of(f: &[&[u8]]) -> Result<u8, WireError> {
@@ -468,6 +516,9 @@ mod tests {
                 slot: slot(),
                 from: 256,
             },
+            Request::TakeLease(vec![addr(5), addr(6)]),
+            Request::ReleaseLease(vec![addr(7)]),
+            Request::Leases,
         ]
     }
 
@@ -482,6 +533,7 @@ mod tests {
             Response::Record(Some(vec![6u8; 100])),
             Response::Records(vec![vec![1u8; 10], vec![2u8; 10]]),
             Response::Ok,
+            Response::Addrs(vec![addr(8), addr(9)]),
             Response::Error("refused".into()),
         ]
     }
@@ -503,6 +555,9 @@ mod tests {
             Request::Handoffs(_) => "Handoffs",
             Request::PublishCheckpoint(_) => "PublishCheckpoint",
             Request::Checkpoints { .. } => "Checkpoints",
+            Request::TakeLease(_) => "TakeLease",
+            Request::ReleaseLease(_) => "ReleaseLease",
+            Request::Leases => "Leases",
         }
     }
 
@@ -525,6 +580,9 @@ mod tests {
             "Handoffs",
             "PublishCheckpoint",
             "Checkpoints",
+            "TakeLease",
+            "ReleaseLease",
+            "Leases",
         ];
         let have: std::collections::BTreeSet<&str> = requests().iter().map(name).collect();
         for n in ALL {

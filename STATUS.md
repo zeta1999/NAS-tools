@@ -205,7 +205,7 @@ TLC is green with its three sanity checks still failing as required.
 ## Not built
 
 M2: the object verbs `put`/`rm` — which need the key→object mapping the S3
-face brings, so they are reclassified M3 (§7.1) rather than pending here. Nine
+face brings, so they are reclassified M3 (§7.1) rather than pending here. Seven
 assertions still fail at `NAS_MILESTONE=M2`.
 
 **The single-writer handoff (§5.1) is built.** `SlotHandoff` is signed by the
@@ -292,6 +292,31 @@ Climbing costs `S/I + I` items, minimised at `I = sqrt(S)`; for §5.5's own
 632. Shrinking it to fit one response would cost 1425 — more than double. A
 frame size is a transport limit and has no business setting a protocol
 constant, so both fetches page instead.
+
+**The §6.4 lease quota is enforced at admission.** The peer now owns the
+leases (`take_lease` / `release_lease` / `holders`, persisted) rather than
+being handed them by a caller, because a quota is an admission control and
+admission needs state: `plan_sweep` can report a breach after the fact, but
+only the party taking the lease can refuse it — and it cannot refuse what it
+does not track.
+
+Three properties make the refusal worth having. It is **all or nothing**, so a
+griefer cannot bisect its way to the ceiling one accepted address at a time.
+It counts what the holder *would* hold rather than what it asked for, so it
+cannot creep up in small requests. And a lease on a blob the peer does not
+hold is refused outright, since it protects nothing and would otherwise let a
+holder pin quota against data it never uploaded. Leases survive a restart, or
+a griefer would simply bounce the peer.
+
+The holder id is derived from the authenticated ACL subject, never taken as an
+argument — a quota accounted against a caller-supplied name is one anyone can
+reset by picking a new name, the same mistake an unbound ACL subject is. Two
+devices sharing a subject share a ceiling, which is what "the laptop may lease
+10 GB" is normally taken to mean.
+
+This closes UC09's last two failures (`lease-griefing`, and `all --cold-start`
+which contains it): **M2 acceptance moved 49/9 to 51/7**, and no UC09 drill is
+pending any more.
 
 **The deletion approval loop (§16.2) is built** (`crates/nas-delete`):
 `DeleteRequest` / `DeleteApproval` / `DeleteExecution`, quorum scaled by blast

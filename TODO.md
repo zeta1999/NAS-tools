@@ -284,9 +284,17 @@ settled and the work that follows from them.
       execution. Today `decide` is exercised by the CLI drills against
       in-memory records; the peer does not yet retain the audit trail §16.2
       calls append-only
-- [ ] Lease griefing bounded by per-holder quota — the quota is computed and
-      reported by `plan_sweep`; what is missing is admission control at publish
-      time, so the drill still exits 3
+- [x] Lease griefing bounded by per-holder quota (SPECS §6.4) — the peer now
+      **owns** the leases (`take_lease` / `release_lease` / `holders`,
+      persisted), because a quota is an admission control and admission needs
+      state: `plan_sweep` can report a breach after the fact, only the party
+      taking the lease can refuse it. All-or-nothing, so a griefer cannot
+      bisect its way to the ceiling; counted against what the holder *would*
+      hold, so it cannot creep up one small request at a time; and a lease on
+      a blob the peer does not hold is refused outright. `TakeLease` /
+      `ReleaseLease` / `Leases` on the wire, holder id derived from the
+      authenticated subject rather than taken as an argument. Drills:
+      `nas test attack lease-griefing` and `lease-on-nothing`.
 - [x] Cold-start test: `nas test attack all --cold-start` — six drills detected
       against a cap-only client; exits 3 only because lease griefing is pending
 

@@ -7,7 +7,8 @@
 
 use crate::session::{Channel, SessionError};
 use crate::wire::{record_cost, Request, Response, MAX_RECORDS, RECORD_BUDGET};
-use nas_peer::{Peer, PeerError};
+use nas_core::Clock;
+use nas_peer::{holder_id, Peer, PeerError};
 use nas_slots::{Checkpoint, SlotHandoff, SlotRecord, Witness};
 
 /// Collect encoded items into a list response, bounded by both count and
@@ -48,6 +49,17 @@ fn bounded<T, E: std::fmt::Display>(
 /// client must be able to tell "you may not do that" from "the peer went away",
 /// and dropping the socket makes every refusal look like a network fault.
 pub fn handle(peer: &mut Peer, subject: &str, req: Request) -> Response {
+    handle_at(peer, subject, req, &nas_core::SystemClock)
+}
+
+/// [`handle`], with the clock the peer reads for lease bookkeeping.
+///
+/// Injectable because a lease's `last_seen` is the one place the peer's own
+/// clock enters the protocol, and a test that had to wait ninety days to check
+/// expiry would not be a test. SPECS §16.2's warning applies: this is the
+/// peer reading *its own* clock, and nothing here is agreement between
+/// machines.
+pub fn handle_at(peer: &mut Peer, subject: &str, req: Request, now: &dyn Clock) -> Response {
     // A witness-only node (SPECS §5.3) answers the two relay requests and
     // refuses the rest HERE, before any store is touched. "Holds no blobs and
     // no caps" is a property of what it will accept, and this is the one
@@ -124,6 +136,21 @@ pub fn handle(peer: &mut Peer, subject: &str, req: Request) -> Response {
         Request::Checkpoints { slot, from } => {
             bounded(peer.checkpoints(&slot, from), |c| c.encode())
         }
+        // Leases (SPECS §6). The holder is derived from the authenticated
+        // subject, never taken as an argument — a quota accounted against a
+        // caller-supplied name would be a quota anyone could reset by picking
+        // a new one, which is the same mistake an unbound ACL subject is.
+        Request::TakeLease(addrs) => match peer.take_lease(holder_id(subject), &addrs, now.now()) {
+            Ok(_) => Response::Ok,
+            Err(e) => Response::Error(e.to_string()),
+        },
+        Request::ReleaseLease(addrs) => {
+            match peer.release_lease(holder_id(subject), &addrs, now.now()) {
+                Ok(()) => Response::Ok,
+                Err(e) => Response::Error(e.to_string()),
+            }
+        }
+        Request::Leases => Response::Addrs(peer.leases_of(&holder_id(subject))),
     }
 }
 

@@ -14,5 +14,6 @@ pub mod peer;
 pub use acl::{Acl, AclError, Decision, Right};
 pub use hostile::Hostility;
 pub use peer::{
-    Peer, PeerError, MAX_CHECKPOINTS_PER_SLOT, MAX_HANDOFFS_PER_SLOT, MAX_WITNESSES_PER_SLOT,
+    holder_id, Peer, PeerError, MAX_CHECKPOINTS_PER_SLOT, MAX_HANDOFFS_PER_SLOT,
+    MAX_WITNESSES_PER_SLOT,
 };

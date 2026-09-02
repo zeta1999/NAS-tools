@@ -48,7 +48,15 @@ enum Outcome {
     Detected(String),
     /// The attack went through unnoticed.
     Undetected(String),
-    /// Specified, unbuilt.
+    /// Specified, unbuilt. Reported as [`exit::UNIMPLEMENTED`], never as a
+    /// pass and never as a refusal.
+    ///
+    /// Nothing constructs this today — every UC09 drill is built — and it
+    /// stays anyway. The variant *is* the exit contract: deleting it the
+    /// moment nothing is pending would mean the next unbuilt drill has
+    /// nowhere to go but `Undetected`, which scores a missing control as a
+    /// security failure the peer committed rather than as work not done.
+    #[allow(dead_code)]
     Pending(&'static str),
 }
 
@@ -123,6 +131,21 @@ impl Lab {
             Response::Ok => Ok(()),
             Response::Error(e) => Err(e),
             other => Err(format!("publish witness: unexpected reply {other:?}")),
+        }
+    }
+
+    fn take_lease(&mut self, addrs: &[Addr]) -> Result<(), String> {
+        match self.call(Request::TakeLease(addrs.to_vec())) {
+            Response::Ok => Ok(()),
+            Response::Error(e) => Err(e),
+            other => Err(format!("take lease: unexpected reply {other:?}")),
+        }
+    }
+
+    fn leases(&mut self) -> Result<Vec<Addr>, String> {
+        match self.call(Request::Leases) {
+            Response::Addrs(a) => Ok(a),
+            other => Err(format!("leases: unexpected reply {other:?}")),
         }
     }
 
@@ -545,8 +568,81 @@ fn go_silent() -> Result<Outcome, String> {
     })
 }
 
-fn lease_griefing() -> Outcome {
-    Outcome::Pending("M2 (§16)")
+/// SPECS §6.4: a holder must not be able to pin unbounded storage by taking
+/// leases on it.
+///
+/// The griefing client is not doing anything malformed — every lease it takes
+/// is on a blob that exists, signed by a subject the peer admits. That is what
+/// makes a quota the control rather than a signature check: the attack is
+/// *volume*, and volume is only refusable by someone counting.
+///
+/// The honest run comes first, as every drill here does. A peer that refused
+/// all leases would otherwise score as "attack detected" while being useless.
+fn lease_griefing(writer: &Identity) -> Result<Outcome, String> {
+    const BLOB: usize = 4096;
+    const CEILING: u64 = 8 * BLOB as u64;
+
+    let mut lab = Lab::honest("lease-griefing", writer)?;
+    lab.peer.gc_policy.max_leased_bytes = CEILING;
+
+    // Twelve blobs, each padded to the same size so the arithmetic in this
+    // drill is about the quota and not about the chunker.
+    let mut addrs = Vec::new();
+    for i in 0..12u8 {
+        addrs.push(lab.put(&vec![i; BLOB])?);
+    }
+
+    // Honest first: a holder inside its ceiling leases freely.
+    lab.take_lease(&addrs[..8]).map_err(|e| {
+        format!("the honest run must succeed, but leasing 8 blobs was refused: {e}")
+    })?;
+    let held = lab.leases()?.len();
+    if held != 8 {
+        return Err(format!(
+            "the honest run leased 8 blobs but the peer reports {held}"
+        ));
+    }
+
+    // Now the grief: four more, which would put the holder over the ceiling.
+    let over = lab.take_lease(&addrs[8..]);
+
+    // And the property that makes the refusal worth having: it is *all or
+    // nothing*. A peer that admitted part of the request would let a griefer
+    // bisect its way to the ceiling one accepted address at a time.
+    let after = lab.leases()?.len();
+
+    Ok(match over {
+        Err(m) if after == 8 => Outcome::Detected(format!(
+            "leases over the {CEILING} B ceiling refused at admission, and nothing partial was \
+             admitted ({after} still held): {m}"
+        )),
+        Err(m) => Outcome::Undetected(format!(
+            "refused ({m}) but {after} leases are held, so part of the request was admitted — a \
+             griefer bisects to the ceiling from here"
+        )),
+        Ok(()) => Outcome::Undetected(format!(
+            "a holder took {after} leases against a {CEILING} B ceiling; nothing refused it"
+        )),
+    })
+}
+
+/// A lease over a blob the peer does not hold protects nothing, and letting a
+/// holder accumulate them is a way to hold quota against data it never
+/// uploaded — the same griefing attack for free.
+fn lease_on_nothing(writer: &Identity) -> Result<Outcome, String> {
+    let mut lab = Lab::honest("lease-on-nothing", writer)?;
+    let real = lab.put(b"a blob that exists")?;
+    lab.take_lease(&[real])
+        .map_err(|e| format!("the honest run must succeed: {e}"))?;
+
+    let ghost = Addr::of_ciphertext(b"never uploaded");
+    Ok(match lab.take_lease(&[ghost]) {
+        Err(m) => Outcome::Detected(format!("a lease on an absent blob is refused: {m}")),
+        Ok(()) => Outcome::Undetected(
+            "a holder leased an address the peer does not hold, spending nothing to hold quota"
+                .to_string(),
+        ),
+    })
 }
 
 // ── Entry point ────────────────────────────────────────────────────────────
@@ -558,6 +654,7 @@ const KINDS: &[&str] = &[
     "dedup-lie",
     "cas-non-enforcement",
     "lease-griefing",
+    "lease-on-nothing",
     "witness-withholding",
     "go-silent",
 ];
@@ -570,7 +667,8 @@ fn run(kind: &str, writer: &Identity, o: &AttackOpts) -> Result<Outcome, String>
         "dedup-lie" => dedup_lie(writer)?,
         "cas-non-enforcement" => cas_non_enforcement(writer, o.cold_start)?,
         "witness-withholding" => witness_withholding(writer, o.with_witness_node, o.cold_start)?,
-        "lease-griefing" => lease_griefing(),
+        "lease-griefing" => lease_griefing(writer)?,
+        "lease-on-nothing" => lease_on_nothing(writer)?,
         "go-silent" => go_silent()?,
         other => {
             return Err(format!(

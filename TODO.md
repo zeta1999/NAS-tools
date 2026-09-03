@@ -284,6 +284,13 @@ settled and the work that follows from them.
       execution. Today `decide` is exercised by the CLI drills against
       in-memory records; the peer does not yet retain the audit trail §16.2
       calls append-only
+- [x] UC07's roaming drills (SPECS §5.6, §6.3) — `nas test
+      witness-opportunistic`, `offline-30d`, `sweep-warning`, in
+      `crates/nas-cli/src/roaming.rs`. `Peer::sweep_warnings` gives a
+      returning client §6.3's warn-before-sweep list, served as
+      `SweepWarnings` on the wire. All three are **mutation-tested**: shrink
+      the expiry, silence the warnings, or add a staleness rule to the relay,
+      and each drill goes to exit 2 rather than passing.
 - [x] Lease griefing bounded by per-holder quota (SPECS §6.4) — the peer now
       **owns** the leases (`take_lease` / `release_lease` / `holders`,
       persisted), because a quota is an admission control and admission needs

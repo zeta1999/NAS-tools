@@ -151,6 +151,10 @@ pub fn handle_at(peer: &mut Peer, subject: &str, req: Request, now: &dyn Clock) 
             }
         }
         Request::Leases => Response::Addrs(peer.leases_of(&holder_id(subject))),
+        Request::SweepWarnings => match peer.sweep_warnings(&holder_id(subject), now.now()) {
+            Ok(a) => Response::Addrs(a),
+            Err(e) => Response::Error(e.to_string()),
+        },
     }
 }
 

@@ -727,6 +727,31 @@ impl Peer {
             .collect())
     }
 
+    /// What a returning holder would have lost (SPECS §6.3, warn-before-sweep).
+    ///
+    /// Planned against the peer's **own** holders and policy, not against a
+    /// set the caller supplies, so the answer is about the sweep that would
+    /// actually run. Nothing is deleted by asking: `plan_sweep` is pure and
+    /// this only reads the plan.
+    ///
+    /// "Silent loss is not the failure mode" is the whole of §6.3 here — a
+    /// client that comes back inside its expiry is entitled to know what was
+    /// at risk while it was away, and an empty answer means nothing was.
+    pub fn sweep_warnings(
+        &self,
+        holder: &[u8; 32],
+        now: Timestamp,
+    ) -> Result<Vec<Addr>, PeerError> {
+        let plan = plan_sweep(
+            &self.inventory()?,
+            &self.holders(),
+            &self.retention,
+            &self.gc_policy,
+            now,
+        );
+        Ok(plan.warnings.get(holder).cloned().unwrap_or_default())
+    }
+
     // ── Skip-chain checkpoints (SPECS §5.5) ─────────────────────────────
 
     /// Accept a signed checkpoint.
@@ -2861,6 +2886,65 @@ mod lease_tests {
             .unwrap();
         assert!(plan.delete.contains(&a[2]), "the unleased blob is swept");
         assert!(!plan.delete.contains(&a[0]), "the leased ones are not");
+    }
+
+    #[test]
+    fn a_returning_holder_is_told_what_was_at_risk_and_still_has_it() {
+        // SPECS §6.3: "silent loss is not the failure mode". Two things have
+        // to hold at once and they pull apart — the client must be *told*, and
+        // it must still *have* the data. A warning delivered by deleting first
+        // is not a warning.
+        let s = Scratch::new("warn");
+        let mut p = open(&s, u64::MAX);
+        let a = seed(&mut p, 3);
+        let h = holder_id("laptop");
+        p.take_lease(h, &a, now()).unwrap();
+
+        // Quiet while the holder is well inside its expiry: a warning that is
+        // always on is not a warning.
+        assert!(p
+            .sweep_warnings(&h, Timestamp(now().secs() + 2 * DAY))
+            .unwrap()
+            .is_empty());
+
+        let policy = p.gc_policy;
+        let returned = Timestamp(now().secs() + policy.lease_expiry + policy.grace + DAY);
+        let warned = p.sweep_warnings(&h, returned).unwrap();
+        assert_eq!(warned.len(), 3, "everything it leased was at risk");
+        assert!(
+            warned.iter().all(|x| p.has_blob(x)),
+            "and asking destroyed none of it"
+        );
+    }
+
+    #[test]
+    fn one_holders_warnings_are_not_anothers() {
+        let s = Scratch::new("warn-per-holder");
+        let mut p = open(&s, u64::MAX);
+        let a = seed(&mut p, 4);
+        let (laptop, phone) = (holder_id("laptop"), holder_id("phone"));
+        p.take_lease(laptop, &a[..2], now()).unwrap();
+        p.take_lease(phone, &a[2..], now()).unwrap();
+
+        let policy = p.gc_policy;
+        let late = Timestamp(now().secs() + policy.lease_expiry + policy.grace + DAY);
+        let l = p.sweep_warnings(&laptop, late).unwrap();
+        let f = p.sweep_warnings(&phone, late).unwrap();
+        assert_eq!(l.len(), 2);
+        assert_eq!(f.len(), 2);
+        assert!(l.iter().all(|x| !f.contains(x)), "the sets are disjoint");
+    }
+
+    #[test]
+    fn a_holder_with_no_leases_is_warned_about_nothing() {
+        let s = Scratch::new("warn-none");
+        let mut p = open(&s, u64::MAX);
+        seed(&mut p, 2);
+        let late = Timestamp(now().secs() + 400 * DAY);
+        assert!(p
+            .sweep_warnings(&holder_id("stranger"), late)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]

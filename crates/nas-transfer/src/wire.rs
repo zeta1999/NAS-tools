@@ -148,6 +148,9 @@ pub enum Request {
     ReleaseLease(Vec<Addr>),
     /// What this connection's subject currently leases.
     Leases,
+    /// What a returning holder would have lost (SPECS §6.3). Asking changes
+    /// nothing: the sweep plan is pure and this only reads it.
+    SweepWarnings,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -187,6 +190,7 @@ const REQ_CHECKPOINTS: u8 = 12;
 const REQ_TAKE_LEASE: u8 = 13;
 const REQ_RELEASE_LEASE: u8 = 14;
 const REQ_LEASES: u8 = 15;
+const REQ_SWEEP_WARNINGS: u8 = 16;
 
 const RSP_BLOB: u8 = 0;
 const RSP_BOOL: u8 = 1;
@@ -229,6 +233,7 @@ impl Request {
             Self::TakeLease(a) => encode_addrs(REQ_TAKE_LEASE, a)?,
             Self::ReleaseLease(a) => encode_addrs(REQ_RELEASE_LEASE, a)?,
             Self::Leases => encode_fields(&[&[REQ_LEASES]])?,
+            Self::SweepWarnings => encode_fields(&[&[REQ_SWEEP_WARNINGS]])?,
         };
         check_size(out)
     }
@@ -316,6 +321,10 @@ impl Request {
             REQ_LEASES => {
                 want(1)?;
                 Self::Leases
+            }
+            REQ_SWEEP_WARNINGS => {
+                want(1)?;
+                Self::SweepWarnings
             }
             other => return Err(WireError::UnknownTag { tag: other }),
         })
@@ -519,6 +528,7 @@ mod tests {
             Request::TakeLease(vec![addr(5), addr(6)]),
             Request::ReleaseLease(vec![addr(7)]),
             Request::Leases,
+            Request::SweepWarnings,
         ]
     }
 
@@ -558,6 +568,7 @@ mod tests {
             Request::TakeLease(_) => "TakeLease",
             Request::ReleaseLease(_) => "ReleaseLease",
             Request::Leases => "Leases",
+            Request::SweepWarnings => "SweepWarnings",
         }
     }
 
@@ -583,6 +594,7 @@ mod tests {
             "TakeLease",
             "ReleaseLease",
             "Leases",
+            "SweepWarnings",
         ];
         let have: std::collections::BTreeSet<&str> = requests().iter().map(name).collect();
         for n in ALL {

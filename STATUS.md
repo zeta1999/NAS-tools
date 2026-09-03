@@ -205,8 +205,8 @@ TLC is green with its three sanity checks still failing as required.
 ## Not built
 
 M2: the object verbs `put`/`rm` — which need the key→object mapping the S3
-face brings, so they are reclassified M3 (§7.1) rather than pending here. Seven
-assertions still fail at `NAS_MILESTONE=M2`.
+face brings, so they are reclassified M3 (§7.1) rather than pending here. Four
+assertions still fail at `NAS_MILESTONE=M2`, all of them UC04's.
 
 **The single-writer handoff (§5.1) is built.** `SlotHandoff` is signed by the
 *outgoing* writer and binds slot, sequence and both writers, so it authorises
@@ -292,6 +292,35 @@ Climbing costs `S/I + I` items, minimised at `I = sqrt(S)`; for §5.5's own
 632. Shrinking it to fit one response would cost 1425 — more than double. A
 frame size is a transport limit and has no business setting a protocol
 constant, so both fetches page instead.
+
+**UC07's roaming claims are checked (§5.6, §6.3).** A laptop that is offline
+for weeks and reconnects on no schedule is the design target, and three spec
+claims bear on it.
+
+These drills had the opposite trap from the hostile-peer ones. They assert that
+nothing *bad* happened, and a peer that never sweeps at all satisfies "a 30-day
+absence loses nothing" perfectly while proving nothing. So each one also makes
+the mechanism bite and refuses if it does not: `offline-30d` establishes three
+points on one timeline — away 30 days (protected), past expiry but inside grace
+(still protected, which is the §6.3 clause most likely to be coded as a bare
+`>` on expiry), and past `expiry + grace` (swept, 4 of 4). `sweep-warning`
+requires the returning client to be both *told* and still *holding*: a warning
+delivered by deleting the data first is not a warning.
+
+`witness-opportunistic` has to prove an absence — that no schedule exists. Its
+first draft checked that two signings of one observation were byte-identical,
+which would have passed for the wrong reason: signing here is deterministic, so
+a second-resolution timestamp in the body would produce identical bytes anyway.
+It now checks what can actually fail — an observation declaring the oldest
+possible logical time, arriving after newer ones, is still accepted — because a
+staleness rule is how a schedule creeps in, and a laptop out of a bag produces
+that case every time.
+
+All three are mutation-tested. Shrinking the expiry, silencing the warnings, or
+adding a staleness rule to the relay each drives the corresponding drill to
+exit 2. The third mutation also found a defect in the drill itself: a refused
+observation was reported as a broken harness (exit 1) instead of a failed
+property (exit 2).
 
 **The §6.4 lease quota is enforced at admission.** The peer now owns the
 leases (`take_lease` / `release_lease` / `holders`, persisted) rather than

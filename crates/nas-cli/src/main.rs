@@ -10,6 +10,7 @@ mod attack;
 mod exit;
 mod peercmd;
 mod repo;
+mod roaming;
 mod testcmds;
 mod worm;
 
@@ -582,6 +583,9 @@ fn test(args: &[String]) -> i32 {
             }
         },
         Some("fork-detect-via-witness") => attack::fork_detect_via_witness(),
+        Some("witness-opportunistic") => roaming::witness_opportunistic(),
+        Some("offline-30d") => one_ns(&pos, roaming::offline_30d),
+        Some("sweep-warning") => one_ns(&pos, roaming::sweep_warning),
         Some("retention-extend-only") => one_ns(&pos, worm::retention_extend_only),
         Some("retention-shrink") => match pos.get(1) {
             Some(ns) => worm::retention_shrink(ns, opt(args, "--key")),

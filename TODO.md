@@ -91,10 +91,12 @@ settled and the work that follows from them.
       fuzzed while still cheap to fix. Fourteen targets; the three added with
       M1's new formats are `handoff_decode` (§5.1), `checkpoint_decode` (§5.5)
       and `delete_decode` (§16.2).
-- [ ] Raise coverage on the thin targets. `wrap_decode` sits at cov 61 on four
-      million runs, which is the shape `delete_decode` had before it was given
-      framed input: the fuzzer is measuring how fast garbage is rejected rather
-      than exercising the decoder.
+- [x] Raise coverage on the thin targets — `wrap_decode` went 61 → 933 with
+      framed input, and immediately earned its keep: it found that
+      `WrapPolicy` bounded Argon2 parameters only from **below**, so a peer
+      (which holds the wrap record, §2.2.2) could demand `memory_kib =
+      u32::MAX` and a recovering client would attempt four terabytes.
+      `TooStrong` and a ceiling now close it.
 
 ## M0 — substrate, local only
 

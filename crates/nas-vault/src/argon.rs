@@ -36,6 +36,20 @@ pub enum ParamError {
         got: u32,
         min: u32,
     },
+    /// Above the ceiling the policy allows.
+    ///
+    /// The mirror of [`Self::TooWeak`], and it exists because the record these
+    /// parameters come from is stored **on the peer** (SPECS §2.2.2). A floor
+    /// stops a hostile peer weakening the KDF; without a ceiling the same peer
+    /// hands a recovering client `memory_kib = u32::MAX` and it tries to
+    /// allocate four terabytes. That is the four-byte denial of service the
+    /// wire decoder is careful about, one layer down — and it costs the
+    /// attacker one field of a record it already controls.
+    TooStrong {
+        field: &'static str,
+        got: u32,
+        max: u32,
+    },
     /// SPECS §2.2.2 fixes `p = 1`. A different lane count is a different KDF
     /// and would silently produce a different key from the same passphrase.
     WrongParallelism {
@@ -50,6 +64,13 @@ pub enum ParamError {
 impl std::fmt::Display for ParamError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::TooStrong { field, got, max } => {
+                write!(
+                    f,
+                    "stored {field} is {got}, above the {max} this device will attempt; a \
+                     peer-supplied record does not get to choose how much memory recovery uses"
+                )
+            }
             Self::TooWeak { field, got, min } => {
                 write!(
                     f,
@@ -118,6 +139,23 @@ impl Argon2Params {
                 min: policy.min_iterations,
             });
         }
+        // Both directions, and the ceiling is the one a hostile peer reaches
+        // for: it holds the record, and an unbounded `memory_kib` turns a
+        // recovery into an allocation the device cannot survive.
+        if self.memory_kib > policy.max_memory_kib {
+            return Err(ParamError::TooStrong {
+                field: "memory_kib",
+                got: self.memory_kib,
+                max: policy.max_memory_kib,
+            });
+        }
+        if self.iterations > policy.max_iterations {
+            return Err(ParamError::TooStrong {
+                field: "iterations",
+                got: self.iterations,
+                max: policy.max_iterations,
+            });
+        }
         Ok(())
     }
 
@@ -163,6 +201,23 @@ impl Argon2Params {
 pub struct WrapPolicy {
     pub min_memory_kib: u32,
     pub min_iterations: u32,
+    /// The most this device will attempt on a **peer-supplied** record.
+    ///
+    /// Not a statement about what is cryptographically enough — that is the
+    /// floor's job — but about what a party we distrust may make us spend. A
+    /// deployment that genuinely wants more must say so, which is a visible
+    /// line in a diff.
+    ///
+    /// **It bounds the attack, it does not remove it.** The default ceiling is
+    /// 4 GiB, chosen to leave room above the floor for a deployment that has
+    /// hardened its own parameters — and a device with less memory than that
+    /// can still be pushed into an out-of-memory kill by a peer-supplied
+    /// record. This library cannot know how much memory the device has, so a
+    /// constrained one should lower this rather than assume the default is
+    /// safe for it. (The fuzz target hit exactly that: honouring the shipped
+    /// ceiling under a 2 GiB limit produced an OOM.)
+    pub max_memory_kib: u32,
+    pub max_iterations: u32,
 }
 
 impl WrapPolicy {
@@ -170,11 +225,19 @@ impl WrapPolicy {
     pub const SPEC: Self = Self {
         min_memory_kib: 256 * MIB,
         min_iterations: 3,
+        // Sixteen times the floor, and twenty-one times it. Generous against
+        // any real configuration and still bounded: the point is that a
+        // hostile record cannot cost orders of magnitude more than an honest
+        // one, not that these are the largest sensible parameters.
+        max_memory_kib: 4096 * MIB,
+        max_iterations: 64,
     };
     /// For tests. Using this in production is a visible line in a diff.
     pub const FAST: Self = Self {
         min_memory_kib: 8 * MIB,
         min_iterations: 1,
+        max_memory_kib: 4096 * MIB,
+        max_iterations: 64,
     };
 }
 
@@ -191,6 +254,81 @@ mod tests {
         assert_eq!(Argon2Params::SPEC.iterations, 3);
         assert_eq!(Argon2Params::SPEC.parallelism, 1);
         Argon2Params::SPEC.check(&WrapPolicy::SPEC).unwrap();
+    }
+
+    #[test]
+    fn absurdly_strong_stored_parameters_are_refused_too() {
+        // The wrap record is stored ON THE PEER (SPECS §2.2.2), so the peer
+        // chooses these numbers. A floor alone stops it weakening the KDF and
+        // does nothing about the other direction: `memory_kib = u32::MAX` is
+        // four terabytes, and a recovering client that honoured it would be
+        // denied service by one field of a record the adversary already holds.
+        let bomb = Argon2Params {
+            memory_kib: u32::MAX,
+            iterations: 3,
+            parallelism: 1,
+        };
+        assert!(matches!(
+            bomb.check(&WrapPolicy::SPEC),
+            Err(ParamError::TooStrong {
+                field: "memory_kib",
+                ..
+            })
+        ));
+
+        // Time is linear in `t`, so an unbounded iteration count is the same
+        // attack with a different field.
+        let slow = Argon2Params {
+            memory_kib: 256 * MIB,
+            iterations: u32::MAX,
+            parallelism: 1,
+        };
+        assert!(matches!(
+            slow.check(&WrapPolicy::SPEC),
+            Err(ParamError::TooStrong {
+                field: "iterations",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn the_ceiling_leaves_room_above_the_floor() {
+        // A bound that refused anything stronger than the spec default would
+        // stop a deployment hardening its own parameters, which is a worse
+        // failure than the one it prevents.
+        let hardened = Argon2Params {
+            memory_kib: 1024 * MIB,
+            iterations: 10,
+            parallelism: 1,
+        };
+        hardened.check(&WrapPolicy::SPEC).unwrap();
+        // And the boundary itself is inclusive on both sides.
+        let at_ceiling = Argon2Params {
+            memory_kib: WrapPolicy::SPEC.max_memory_kib,
+            iterations: WrapPolicy::SPEC.max_iterations,
+            parallelism: 1,
+        };
+        at_ceiling.check(&WrapPolicy::SPEC).unwrap();
+        let at_floor = Argon2Params {
+            memory_kib: WrapPolicy::SPEC.min_memory_kib,
+            iterations: WrapPolicy::SPEC.min_iterations,
+            parallelism: 1,
+        };
+        at_floor.check(&WrapPolicy::SPEC).unwrap();
+    }
+
+    #[test]
+    fn every_policy_here_has_a_ceiling() {
+        // A policy constructed without one would fail open, and `FAST` exists
+        // to be permissive — which is exactly where an unbounded ceiling would
+        // be least noticed.
+        for p in [WrapPolicy::SPEC, WrapPolicy::FAST] {
+            assert!(p.max_memory_kib > p.min_memory_kib);
+            assert!(p.max_iterations >= p.min_iterations);
+            assert!(p.max_memory_kib < u32::MAX);
+            assert!(p.max_iterations < u32::MAX);
+        }
     }
 
     #[test]

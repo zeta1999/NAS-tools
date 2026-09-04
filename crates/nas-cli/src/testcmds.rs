@@ -363,9 +363,13 @@ pub fn argon2_params(ns: &str, min_mem: &str, min_time: u32) -> i32 {
         Ok(w) => w,
         Err(e) => return err(e),
     };
+    // The floor is what this check is about; the ceiling comes from the spec
+    // policy either way, because a caller asking about the floor should not
+    // thereby switch off the bound on what a peer-supplied record may demand.
     let policy = WrapPolicy {
         min_memory_kib: min_kib,
         min_iterations: min_time,
+        ..WrapPolicy::SPEC
     };
     match w.params.check(&policy) {
         Ok(()) => {

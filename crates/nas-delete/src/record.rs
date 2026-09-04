@@ -5,8 +5,19 @@ use nas_crypto::{
     key_id, verify, Identity, SigContext, SignError, SIGNATURE_LEN, VERIFYING_KEY_LEN,
 };
 
+/// Approvals one execution may carry.
+///
+/// A quorum is single digits (SPECS §16.2's largest default is 3), so this is
+/// far above anything legitimate and exists only to bound a decoder that is
+/// reachable from the network.
+pub const MAX_APPROVALS: usize = 64;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DeleteError {
+    /// More approvals than [`MAX_APPROVALS`].
+    TooManyApprovals {
+        got: usize,
+    },
     Decode(DecodeError),
     Sign(SignError),
     BadWidth {
@@ -42,6 +53,9 @@ pub enum DeleteError {
 impl std::fmt::Display for DeleteError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::TooManyApprovals { got } => {
+                write!(f, "{got} approvals exceeds the {MAX_APPROVALS} limit")
+            }
             Self::Decode(e) => write!(f, "{e:?}"),
             Self::Sign(e) => write!(f, "{e}"),
             Self::BadWidth { field, want, got } => {
@@ -367,6 +381,65 @@ impl DeleteExecution {
         })
     }
 
+    /// `[request_hash, executed_by, sig, approval…]`.
+    ///
+    /// The approvals are carried as their own encoded records, nested one
+    /// field deep, so an execution round-trips whole. Without this the third
+    /// record of §16.2's loop could not be written down at all — which is a
+    /// problem for a design whose first line is "all of it append-only, so the
+    /// audit trail cannot be edited either".
+    pub fn encode(&self) -> Result<Vec<u8>, DeleteError> {
+        if self.approvals.len() > MAX_APPROVALS {
+            return Err(DeleteError::TooManyApprovals {
+                got: self.approvals.len(),
+            });
+        }
+        let approvals: Vec<Vec<u8>> = self
+            .approvals
+            .iter()
+            .map(|a| a.encode())
+            .collect::<Result<_, _>>()?;
+        let mut fields: Vec<&[u8]> = vec![&self.request_hash, &self.executed_by, &self.sig];
+        fields.extend(approvals.iter().map(|a| a.as_slice()));
+        Ok(encode_fields(&fields)?)
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, DeleteError> {
+        let f = decode_fields(bytes)?;
+        if f.len() < 3 {
+            return Err(DeleteError::FieldCount {
+                want: 3,
+                got: f.len(),
+            });
+        }
+        if f.len() - 3 > MAX_APPROVALS {
+            return Err(DeleteError::TooManyApprovals { got: f.len() - 3 });
+        }
+        if f[1].len() != VERIFYING_KEY_LEN {
+            return Err(DeleteError::BadWidth {
+                field: "executed_by",
+                want: VERIFYING_KEY_LEN,
+                got: f[1].len(),
+            });
+        }
+        if f[2].len() != SIGNATURE_LEN {
+            return Err(DeleteError::BadWidth {
+                field: "sig",
+                want: SIGNATURE_LEN,
+                got: f[2].len(),
+            });
+        }
+        Ok(Self {
+            request_hash: fixed32("request_hash", f[0])?,
+            executed_by: f[1].to_vec(),
+            sig: f[2].to_vec(),
+            approvals: f[3..]
+                .iter()
+                .map(|b| DeleteApproval::decode(b))
+                .collect::<Result<_, _>>()?,
+        })
+    }
+
     /// Every approval verifies, binds this request, and the execution itself is
     /// signed. Says nothing about *quorum* — that is [`crate::decide`], which
     /// needs the policy and the recent history.
@@ -430,5 +503,65 @@ impl Approver {
             return Ok(None);
         }
         DeleteApproval::sign(identity, request.request_hash()).map(Some)
+    }
+}
+
+#[cfg(test)]
+mod execution_encoding_tests {
+    //! §16.2 opens with "all of it append-only, so the audit trail cannot be
+    //! edited either" — which requires that all of it can be written down.
+    //! The execution record could not be serialised at all until this.
+    use super::*;
+    use nas_crypto::Role;
+
+    fn key(seed: u8) -> Identity {
+        Identity::derive(&[seed; 32], Role::Lease).unwrap()
+    }
+
+    fn execution(n: u8) -> DeleteExecution {
+        let r = DeleteRequest::sign(&key(1), Scope::Namespace, "drill", [3u8; 32]).unwrap();
+        let approvals: Vec<DeleteApproval> = (0..n)
+            .map(|i| DeleteApproval::sign(&key(10 + i), r.request_hash()).unwrap())
+            .collect();
+        DeleteExecution::sign(&key(1), &r, &approvals).unwrap()
+    }
+
+    #[test]
+    fn an_execution_round_trips_with_its_approvals() {
+        for n in [0u8, 1, 3] {
+            let e = execution(n);
+            let bytes = e.encode().unwrap();
+            let back = DeleteExecution::decode(&bytes).unwrap();
+            assert_eq!(back, e, "{n} approvals");
+            // Canonical: what decode accepts must re-encode identically.
+            assert_eq!(back.encode().unwrap(), bytes);
+            // And it still verifies after the round trip. A trail of records
+            // that no longer check is a log, not evidence.
+            back.verify().unwrap();
+        }
+    }
+
+    #[test]
+    fn a_truncated_execution_is_an_error_not_a_panic() {
+        let bytes = execution(2).encode().unwrap();
+        for n in 0..bytes.len() {
+            let _ = DeleteExecution::decode(&bytes[..n]);
+        }
+    }
+
+    #[test]
+    fn too_many_approvals_are_refused_rather_than_allocated() {
+        let r = DeleteRequest::sign(&key(1), Scope::Namespace, "drill", [3u8; 32]).unwrap();
+        let one = DeleteApproval::sign(&key(2), r.request_hash()).unwrap();
+        let e = DeleteExecution {
+            request_hash: r.request_hash(),
+            approvals: vec![one; MAX_APPROVALS + 1],
+            executed_by: key(1).verifying_key().to_vec(),
+            sig: vec![0u8; SIGNATURE_LEN],
+        };
+        assert!(matches!(
+            e.encode(),
+            Err(DeleteError::TooManyApprovals { .. })
+        ));
     }
 }

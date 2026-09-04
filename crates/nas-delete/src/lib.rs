@@ -44,4 +44,6 @@ pub mod policy;
 pub mod record;
 
 pub use policy::{decide, Authority, Decision, Executed, QuorumPolicy, Refusal, RollingPolicy};
-pub use record::{Approver, DeleteApproval, DeleteError, DeleteExecution, DeleteRequest, Scope};
+pub use record::{
+    Approver, DeleteApproval, DeleteError, DeleteExecution, DeleteRequest, Scope, MAX_APPROVALS,
+};

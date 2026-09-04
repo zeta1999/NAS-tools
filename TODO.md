@@ -288,11 +288,24 @@ settled and the work that follows from them.
       judges — an approval from outside it is refused rather than ignored, and
       an empty authority approves nothing. Drill:
       `nas test invented-approvers`.
-- [ ] Wire the loop to a peer that stores requests/approvals and drops leases on
-      execution. `decide` is exercised by the CLI drills against in-memory
-      records; the peer does not yet retain the audit trail §16.2 calls
-      append-only, nor the executed history the rolling window counts — so
-      today decomposition is only resisted within a single process.
+- [x] **The peer retains the §16.2 audit trail.** `publish_delete_request` /
+      `publish_delete_approval` / `execute_delete`, append-only and persisted,
+      with the executed history behind it — so the rolling window survives a
+      restart instead of being a `Vec` a compromised client passes as empty.
+      Building it found that `DeleteExecution` had no `encode`/`decode` at all:
+      the third record of a loop whose first line is "all of it append-only"
+      could not be written down. It has one now, with its approvals nested and
+      bounded.
+- [ ] Serve the delete trail over the wire. The peer holds it and judges it,
+      but `nas-transfer` has no request for it, so only an in-process caller
+      can publish one — the same gap the handoff had.
+- [ ] **Execution does not delete data, and cannot yet.** In an encrypted
+      namespace the peer cannot resolve `Scope::Object("2024/scan.pdf")` to an
+      address (SPECS §2.2): it holds ciphertext under content addresses and no
+      mapping. So the peer records the authorisation and the client — which
+      holds the mapping — must release the leases and let the sweep run. That
+      client half is unbuilt, and needs the key→object mapping the S3 face
+      brings (§7.1), same as `put`/`rm`.
 - [x] **Object Lock establishes the append-only posture** (SPECS §16), decided
       with the user: `ns create --object-lock … --device <subject>` seeds that
       subject **append and nothing else**. §16's whole ransomware defence is

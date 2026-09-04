@@ -292,6 +292,34 @@ Climbing costs `S/I + I` items, minimised at `I = sqrt(S)`; for §5.5's own
 frame size is a transport limit and has no business setting a protocol
 constant, so both fetches page instead.
 
+**The peer retains the §16.2 audit trail.** `publish_delete_request` /
+`publish_delete_approval` / `execute_delete`, append-only and persisted: a
+record is never replaced or removed, one holder's second approval is still one
+holder, and an approval naming a request the peer has no record of is refused
+rather than stored against nothing.
+
+The executed history is what this is really for. `decide` is pure and a client
+can run it, but the rolling window that makes decomposition expensive only
+means something if somebody remembers the previous ten deletions — in process
+it is a `Vec` a compromised client passes as empty, and a peer that forgot it
+across a restart could be reset by bouncing it. A test bounces the peer between
+the tenth deletion and the eleventh and requires the escalation to still fire.
+
+Building it surfaced a gap in `nas-delete`: `DeleteExecution` had no `encode`
+or `decode` at all. The third record of a loop whose first line is "all of it
+append-only, so the audit trail cannot be edited either" could not be written
+down. It has both now, with its approvals nested and bounded, and a round-trip
+test that re-verifies the record afterwards — a trail of records that no longer
+check is a log, not evidence.
+
+**What executing does not do: delete data.** In an encrypted namespace the peer
+cannot resolve `Scope::Object("2024/scan.pdf")` to an address at all (§2.2) —
+it holds ciphertext under content addresses and no mapping. So it records the
+authorisation, and the client that holds the mapping must release the leases
+and let the sweep run. That client half is unbuilt and needs the same key→object
+mapping `put`/`rm` do. Recording a deletion the peer never performed would put
+something in the trail that did not happen, so it is stated rather than implied.
+
 **The deletion quorum checks authority, not just distinctness (§16.1).** Found
 while starting the peer-side wiring, and it was the more serious gap: `decide`
 counted *distinct* approvers and stopped there. That is a headcount, not a

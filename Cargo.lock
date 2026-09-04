@@ -621,6 +621,7 @@ dependencies = [
  "blake3",
  "nas-core",
  "nas-crypto",
+ "nas-delete",
  "nas-lease",
  "nas-slots",
  "nas-store",

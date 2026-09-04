@@ -12,6 +12,10 @@
 use crate::acl::{Acl, Decision, Right};
 use crate::hostile::Hostility;
 use nas_core::{Addr, Mode, Timestamp};
+use nas_delete::{
+    decide, Authority, Decision as DeleteDecision, DeleteApproval, DeleteError, DeleteExecution,
+    DeleteRequest, Executed, QuorumPolicy,
+};
 use nas_lease::{plan_sweep, BlobInfo, GcPolicy, Holder, LeaseSet, SweepPlan};
 use nas_slots::{
     Checkpoint, CheckpointError, HandoffError, Regime, Roster, SlotHandoff, SlotId, SlotRecord,
@@ -45,6 +49,14 @@ pub const MAX_HANDOFFS_PER_SLOT: usize = 1024;
 /// from the network, and an append-only store with no bound is a way to fill a
 /// peer's disk.
 pub const MAX_CHECKPOINTS_PER_SLOT: usize = 1024;
+
+/// Deletion requests retained (SPECS §16.2).
+///
+/// The audit trail is append-only by design, and an append-only store reachable
+/// from the network needs a ceiling for the reason every other one here does.
+/// A hundred times what §16.2 itself treats as a lot: its rolling window
+/// counts ten deletions in thirty days as the point where quorum escalates.
+pub const MAX_DELETE_REQUESTS: usize = 1024;
 
 /// What identifies one authorisation: the sequence it applies at, and the two
 /// writers. Every component is one the signed body binds, so two handoffs with
@@ -143,6 +155,31 @@ pub enum PeerError {
     /// A witness-only node (SPECS §5.3): it relays witnesses and does nothing
     /// else, so it can hold no blobs and no capabilities to lose.
     WitnessOnly,
+    /// A deletion record that does not verify.
+    Delete(DeleteError),
+    /// An approval or execution naming a request this peer has no record of.
+    ///
+    /// Refused rather than stored against nothing: the trail is meant to be
+    /// readable as a sequence, and an approval floating free of its request is
+    /// not evidence of anything.
+    UnknownRequest {
+        request: [u8; 32],
+    },
+    /// Too many deletion requests. See [`MAX_DELETE_REQUESTS`].
+    DeleteTrailFull,
+    /// An approval from a key outside the deletion authority (SPECS §16.1).
+    NotAnApprover {
+        id: [u8; 32],
+    },
+    /// A request hash that is already recorded with different bytes.
+    ///
+    /// Cannot happen for a well-formed record — the hash covers the signature
+    /// — so it means someone found a collision or the store is corrupt. Either
+    /// way the first record stands: append-only means the trail does not get
+    /// rewritten by whoever asks last.
+    TrailImmutable {
+        request: [u8; 32],
+    },
     /// A lease that would put the holder over the §6.4 ceiling.
     ///
     /// The numbers are in the error because a quota refusal a client cannot
@@ -215,6 +252,27 @@ impl std::fmt::Display for PeerError {
             Self::WitnessOnly => write!(
                 f,
                 "witness-only node: relays witnesses and holds no blobs, slots or caps (SPECS §5.3)"
+            ),
+            Self::Delete(e) => write!(f, "deletion record rejected: {e}"),
+            Self::UnknownRequest { request } => write!(
+                f,
+                "no deletion request {} is recorded here",
+                hex32(request)
+            ),
+            Self::DeleteTrailFull => write!(
+                f,
+                "the deletion trail already holds {MAX_DELETE_REQUESTS} requests"
+            ),
+            Self::NotAnApprover { id } => write!(
+                f,
+                "approval from {} is not in this peer's deletion authority (SPECS §16.1)",
+                hex32(id)
+            ),
+            Self::TrailImmutable { request } => write!(
+                f,
+                "deletion request {} is already recorded with different bytes; the trail is \
+                 append-only",
+                hex32(request)
             ),
             Self::QuotaExceeded {
                 holder,
@@ -316,6 +374,21 @@ pub struct Peer {
     /// restart came back holding fewer than had been accepted. Keying memory
     /// and disk the same way is what stops those two disagreeing.
     handoffs: BTreeMap<SlotId, BTreeMap<HandoffKey, SlotHandoff>>,
+    /// The §16.2 audit trail, `request hash -> record`. **Append-only**: a
+    /// record here is never replaced or removed, because a trail that could be
+    /// edited is not one.
+    delete_requests: BTreeMap<[u8; 32], DeleteRequest>,
+    /// `request hash -> approver id -> approval`. Keyed by approver so two
+    /// approvals from one holder stay one holder, which is the same rule
+    /// `decide` counts by.
+    delete_approvals: BTreeMap<[u8; 32], BTreeMap<[u8; 32], DeleteApproval>>,
+    /// `request hash -> (execution, when this peer recorded it)`.
+    delete_executions: BTreeMap<[u8; 32], (DeleteExecution, Timestamp)>,
+    /// Whose approvals count (SPECS §16.1). Peer state, set by the operator —
+    /// a set taken from the records would be a quorum the requester chose.
+    pub delete_authority: Authority,
+    /// The quorum this peer requires (SPECS §16.2).
+    pub quorum: QuorumPolicy,
     /// Leases held, `holder id -> (addresses, last seen)` (SPECS §6).
     ///
     /// The peer owns these because §6.4's per-holder quota is an **admission**
@@ -373,6 +446,11 @@ impl Peer {
             checkpoints: BTreeMap::new(),
             leases: BTreeMap::new(),
             gc_policy: GcPolicy::default(),
+            delete_requests: BTreeMap::new(),
+            delete_approvals: BTreeMap::new(),
+            delete_executions: BTreeMap::new(),
+            delete_authority: Authority::new(),
+            quorum: QuorumPolicy::default(),
             witness_only: false,
             hostility,
         };
@@ -458,6 +536,55 @@ impl Peer {
                                 .or_default()
                                 .insert((c.seq, c.checkpoint_hash()), c);
                         }
+                    }
+                }
+            }
+        }
+        // The §16.2 trail. The executions matter most: the rolling window
+        // that makes decomposition expensive is only a control if the count
+        // survives a restart, and a peer that forgot it would let an attacker
+        // reset the escalation by bouncing it.
+        if let Ok(rd) = fs::read_dir(self.root.join("delete").join("requests")) {
+            for e in rd.flatten() {
+                let Ok(bytes) = fs::read(e.path()) else {
+                    continue;
+                };
+                if let Ok(r) = DeleteRequest::decode(&bytes) {
+                    if r.verify().is_ok() {
+                        self.delete_requests.insert(r.request_hash(), r);
+                    }
+                }
+            }
+        }
+        if let Ok(rd) = fs::read_dir(self.root.join("delete").join("approvals")) {
+            for e in rd.flatten() {
+                let Ok(bytes) = fs::read(e.path()) else {
+                    continue;
+                };
+                if let Ok(a) = DeleteApproval::decode(&bytes) {
+                    if a.verify().is_ok() {
+                        self.delete_approvals
+                            .entry(a.request_hash)
+                            .or_default()
+                            .insert(a.approver_id(), a);
+                    }
+                }
+            }
+        }
+        if let Ok(rd) = fs::read_dir(self.root.join("delete").join("executions")) {
+            for e in rd.flatten() {
+                let Ok(bytes) = fs::read(e.path()) else {
+                    continue;
+                };
+                if bytes.len() < 8 {
+                    continue;
+                }
+                let at = Timestamp(u64::from_le_bytes(
+                    bytes[..8].try_into().expect("checked length"),
+                ));
+                if let Ok(e) = DeleteExecution::decode(&bytes[8..]) {
+                    if e.verify().is_ok() {
+                        self.delete_executions.insert(e.request_hash, (e, at));
                     }
                 }
             }
@@ -611,6 +738,162 @@ impl Peer {
         fs::write(&tmp, &bytes)?;
         fs::rename(&tmp, dir.join(name))?;
         Ok(())
+    }
+
+    // ── The deletion audit trail (SPECS §16.2) ──────────────────────────
+
+    fn persist_delete(&self, kind: &str, name: &str, bytes: &[u8]) -> Result<(), PeerError> {
+        let dir = self.root.join("delete").join(kind);
+        fs::create_dir_all(&dir)?;
+        let tmp = dir.join(format!("{name}.tmp"));
+        fs::write(&tmp, bytes)?;
+        fs::rename(&tmp, dir.join(name))?;
+        Ok(())
+    }
+
+    /// Record a signed deletion request. Deletes nothing (SPECS §16.2 step 1).
+    ///
+    /// Append-only: a hash already recorded is idempotent, and never replaced.
+    pub fn publish_delete_request(&mut self, r: DeleteRequest) -> Result<[u8; 32], PeerError> {
+        r.verify().map_err(PeerError::Delete)?;
+        let h = r.request_hash();
+        if let Some(held) = self.delete_requests.get(&h) {
+            // The hash covers the signature, so equal hashes should mean equal
+            // records. If they do not, the first one stands.
+            return if *held == r {
+                Ok(h)
+            } else {
+                Err(PeerError::TrailImmutable { request: h })
+            };
+        }
+        if self.delete_requests.len() >= MAX_DELETE_REQUESTS {
+            return Err(PeerError::DeleteTrailFull);
+        }
+        let bytes = r.encode().map_err(PeerError::Delete)?;
+        self.persist_delete("requests", &hex32(&h), &bytes)?;
+        self.delete_requests.insert(h, r);
+        Ok(h)
+    }
+
+    /// Record an approval (SPECS §16.2 step 3).
+    ///
+    /// Two constraints, and both are about what a store may be made to hold.
+    /// The request must already be recorded, so the trail reads as a sequence
+    /// rather than as approvals floating free of anything. And the approver
+    /// must be in this peer's authority — the peer's trail is a record of the
+    /// loop, not an intrusion log, and an append-only store that accepted
+    /// signatures from anyone would be a way to fill a disk. The refusal is
+    /// itself the evidence, returned to the caller rather than swallowed.
+    pub fn publish_delete_approval(&mut self, a: DeleteApproval) -> Result<(), PeerError> {
+        a.verify().map_err(PeerError::Delete)?;
+        if !self.delete_requests.contains_key(&a.request_hash) {
+            return Err(PeerError::UnknownRequest {
+                request: a.request_hash,
+            });
+        }
+        let id = a.approver_id();
+        if !self.delete_authority.contains(&id) {
+            return Err(PeerError::NotAnApprover { id });
+        }
+        // One holder is one holder, whatever it sends twice. Checked before
+        // the entry is created, so a duplicate does not leave an empty map
+        // behind and the borrow ends before the write.
+        if self
+            .delete_approvals
+            .get(&a.request_hash)
+            .is_some_and(|m| m.contains_key(&id))
+        {
+            return Ok(());
+        }
+        let bytes = a.encode().map_err(PeerError::Delete)?;
+        self.persist_delete(
+            "approvals",
+            &format!("{}-{}", hex32(&a.request_hash), hex32(&id)),
+            &bytes,
+        )?;
+        self.delete_approvals
+            .entry(a.request_hash)
+            .or_default()
+            .insert(id, a);
+        Ok(())
+    }
+
+    /// Every approval this peer has recorded for a request.
+    pub fn delete_approvals_for(&self, request: &[u8; 32]) -> Vec<DeleteApproval> {
+        self.delete_approvals
+            .get(request)
+            .map(|m| m.values().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    pub fn delete_request(&self, request: &[u8; 32]) -> Option<&DeleteRequest> {
+        self.delete_requests.get(request)
+    }
+
+    /// Judge an execution against this peer's authority, policy and **its own
+    /// recorded history** (SPECS §16.2 step 4).
+    ///
+    /// The recorded history is the point of doing this on the peer at all.
+    /// `decide` is pure and a client can run it, but the rolling window that
+    /// makes decomposition expensive only means anything if somebody remembers
+    /// the previous ten deletions across restarts. In-process that window is a
+    /// `Vec` a compromised client simply passes as empty.
+    ///
+    /// # What executing does not do here
+    ///
+    /// It does not delete data. In an encrypted namespace the peer cannot
+    /// resolve `Scope::Object("2024/scan.pdf")` to an address at all (SPECS
+    /// §2.2) — it holds ciphertext under content addresses and no mapping. So
+    /// the peer records the authorisation and the client, which holds the
+    /// mapping, releases the leases and lets the sweep run. Claiming otherwise
+    /// would put a deletion in the trail that never happened.
+    pub fn execute_delete(
+        &mut self,
+        e: DeleteExecution,
+        now: Timestamp,
+    ) -> Result<DeleteDecision, PeerError> {
+        e.verify().map_err(PeerError::Delete)?;
+        let Some(request) = self.delete_requests.get(&e.request_hash).cloned() else {
+            return Err(PeerError::UnknownRequest {
+                request: e.request_hash,
+            });
+        };
+        let recent: Vec<Executed> = self
+            .delete_executions
+            .values()
+            .map(|(_, at)| Executed { at: *at })
+            .collect();
+        let decision = decide(
+            &request,
+            &e,
+            &recent,
+            &self.quorum,
+            &self.delete_authority,
+            now,
+        );
+        if let DeleteDecision::Execute { .. } = decision {
+            // Recorded before it is reported, like every other acknowledgement
+            // here: a client told its deletion was authorised must find it in
+            // the trail afterwards, and the rolling window must have counted
+            // it even if the peer dies on the next line.
+            if !self.delete_executions.contains_key(&e.request_hash) {
+                // Timestamp then the whole record, so the trail keeps the
+                // execution itself and not merely the fact that one happened.
+                let mut bytes = now.secs().to_le_bytes().to_vec();
+                bytes.extend_from_slice(&e.encode().map_err(PeerError::Delete)?);
+                self.persist_delete("executions", &hex32(&e.request_hash), &bytes)?;
+                self.delete_executions.insert(e.request_hash, (e, now));
+            }
+        }
+        Ok(decision)
+    }
+
+    /// Executions this peer has recorded, for the rolling window.
+    pub fn executed(&self) -> Vec<Executed> {
+        self.delete_executions
+            .values()
+            .map(|(_, at)| Executed { at: *at })
+            .collect()
     }
 
     // ── Leases and the §6.4 quota ───────────────────────────────────────
@@ -2954,5 +3237,254 @@ mod lease_tests {
         // Not equal to a bare hash of the name: a holder id must never collide
         // with a key id or an address that happens to share bytes.
         assert_ne!(holder_id("laptop"), *blake3::hash(b"laptop").as_bytes());
+    }
+}
+
+#[cfg(test)]
+mod delete_trail_tests {
+    //! SPECS §16.2: "All of it append-only, so the audit trail cannot be
+    //! edited either." The peer holds the trail; `decide` judges it.
+    use super::*;
+    use nas_crypto::{Identity, Role};
+    use nas_delete::{DeleteApproval, DeleteExecution, DeleteRequest, Scope};
+
+    struct Scratch(PathBuf);
+    impl Scratch {
+        fn new(tag: &str) -> Self {
+            let p = std::env::temp_dir().join(format!("nas-del-{}-{tag}", std::process::id()));
+            let _ = fs::remove_dir_all(&p);
+            Self(p)
+        }
+    }
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn key(seed: u8) -> Identity {
+        Identity::derive(&[seed; 32], Role::Lease).unwrap()
+    }
+
+    /// Seed 1 is the everyday laptop; 2..=4 are the offline authority.
+    fn open(s: &Scratch) -> Peer {
+        let mut p = Peer::open(&s.0, Mode::E2ee, Addressing::Content, Hostility::HONEST).unwrap();
+        for i in 2..=4u8 {
+            p.delete_authority.add(key(i).verifying_key());
+        }
+        p
+    }
+
+    fn request(nonce: u8, scope: Scope) -> DeleteRequest {
+        DeleteRequest::sign(&key(1), scope, "drill", [nonce; 32]).unwrap()
+    }
+
+    fn approve(r: &DeleteRequest, seeds: &[u8]) -> Vec<DeleteApproval> {
+        seeds
+            .iter()
+            .map(|s| DeleteApproval::sign(&key(*s), r.request_hash()).unwrap())
+            .collect()
+    }
+
+    fn now() -> Timestamp {
+        Timestamp(1_800_000_000)
+    }
+
+    #[test]
+    fn the_loop_runs_end_to_end() {
+        let s = Scratch::new("loop");
+        let mut p = open(&s);
+        let r = request(1, Scope::Namespace);
+        let h = p.publish_delete_request(r.clone()).unwrap();
+        assert_eq!(h, r.request_hash());
+        for a in approve(&r, &[2, 3, 4]) {
+            p.publish_delete_approval(a).unwrap();
+        }
+        assert_eq!(p.delete_approvals_for(&h).len(), 3);
+
+        let e = DeleteExecution::sign(&key(1), &r, &approve(&r, &[2, 3, 4])).unwrap();
+        assert!(matches!(
+            p.execute_delete(e, now()).unwrap(),
+            DeleteDecision::Execute { .. }
+        ));
+        assert_eq!(p.executed().len(), 1);
+    }
+
+    #[test]
+    fn an_approval_from_outside_the_authority_is_not_stored() {
+        // The trail is a record of the loop, not an intrusion log. An
+        // append-only store that took signatures from anyone would be a way
+        // to fill a disk, and the refusal is itself the evidence.
+        let s = Scratch::new("stranger");
+        let mut p = open(&s);
+        let r = request(1, Scope::Object("a.pdf".into()));
+        let h = p.publish_delete_request(r.clone()).unwrap();
+        let stranger = DeleteApproval::sign(&key(200), r.request_hash()).unwrap();
+        assert!(matches!(
+            p.publish_delete_approval(stranger),
+            Err(PeerError::NotAnApprover { .. })
+        ));
+        assert!(p.delete_approvals_for(&h).is_empty());
+    }
+
+    #[test]
+    fn an_approval_for_an_unrecorded_request_is_refused() {
+        let s = Scratch::new("orphan");
+        let mut p = open(&s);
+        let r = request(1, Scope::Object("a.pdf".into()));
+        let a = DeleteApproval::sign(&key(2), r.request_hash()).unwrap();
+        assert!(matches!(
+            p.publish_delete_approval(a),
+            Err(PeerError::UnknownRequest { .. })
+        ));
+    }
+
+    #[test]
+    fn two_approvals_from_one_holder_stay_one_holder() {
+        let s = Scratch::new("dup");
+        let mut p = open(&s);
+        let r = request(1, Scope::Namespace);
+        let h = p.publish_delete_request(r.clone()).unwrap();
+        let a = approve(&r, &[2]).remove(0);
+        p.publish_delete_approval(a.clone()).unwrap();
+        p.publish_delete_approval(a).unwrap();
+        assert_eq!(p.delete_approvals_for(&h).len(), 1);
+    }
+
+    #[test]
+    fn an_execution_short_of_quorum_is_not_recorded() {
+        // Nothing enters the executed history unless it was authorised —
+        // otherwise a refused attempt would still push the rolling window
+        // along and eventually escalate every honest deletion.
+        let s = Scratch::new("short");
+        let mut p = open(&s);
+        let r = request(1, Scope::Namespace);
+        p.publish_delete_request(r.clone()).unwrap();
+        let e = DeleteExecution::sign(&key(1), &r, &approve(&r, &[2])).unwrap();
+        assert!(matches!(
+            p.execute_delete(e, now()).unwrap(),
+            DeleteDecision::Refused(_)
+        ));
+        assert!(p.executed().is_empty());
+    }
+
+    #[test]
+    fn the_rolling_window_survives_a_restart() {
+        // This is what putting the trail on the peer is FOR. `decide` is pure
+        // and a client can run it, but the window that makes decomposition
+        // expensive only means something if somebody remembers the previous
+        // deletions -- in process it is a `Vec` a compromised client passes
+        // as empty, and a peer that forgot it could be reset by bouncing it.
+        let s = Scratch::new("window");
+        let policy = QuorumPolicy::default();
+        {
+            let mut p = open(&s);
+            // Ten single-object deletions, each satisfied by one approver.
+            for i in 0..policy.rolling.objects {
+                let r = request(i as u8, Scope::Object(format!("scan-{i}.pdf")));
+                p.publish_delete_request(r.clone()).unwrap();
+                let e = DeleteExecution::sign(&key(1), &r, &approve(&r, &[2])).unwrap();
+                assert!(
+                    matches!(
+                        p.execute_delete(e, now()).unwrap(),
+                        DeleteDecision::Execute { .. }
+                    ),
+                    "delete {i} should go through below the threshold"
+                );
+            }
+            assert_eq!(p.executed().len(), policy.rolling.objects);
+        }
+
+        // Bounce the peer, then try the eleventh with the same single
+        // approval that worked ten times.
+        let mut p = open(&s);
+        assert_eq!(
+            p.executed().len(),
+            policy.rolling.objects,
+            "the executed history came back"
+        );
+        let r = request(0xFF, Scope::Object("scan-final.pdf".into()));
+        p.publish_delete_request(r.clone()).unwrap();
+        let e = DeleteExecution::sign(&key(1), &r, &approve(&r, &[2])).unwrap();
+        match p.execute_delete(e, now()).unwrap() {
+            DeleteDecision::Refused(nas_delete::Refusal::ShortOfQuorum {
+                escalated: true,
+                required,
+                ..
+            }) => assert_eq!(required, policy.rolling.escalate_to),
+            other => panic!("restarting the peer reset the rolling window: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_trail_survives_a_restart_whole() {
+        // Including the execution record itself, not merely the fact that one
+        // happened -- §16.2 calls the trail append-only, which is a claim
+        // about what it holds and not only about what it counts.
+        let s = Scratch::new("persist");
+        let r = request(1, Scope::Namespace);
+        {
+            let mut p = open(&s);
+            p.publish_delete_request(r.clone()).unwrap();
+            for a in approve(&r, &[2, 3, 4]) {
+                p.publish_delete_approval(a).unwrap();
+            }
+            let e = DeleteExecution::sign(&key(1), &r, &approve(&r, &[2, 3, 4])).unwrap();
+            p.execute_delete(e, now()).unwrap();
+        }
+        let p = open(&s);
+        let h = r.request_hash();
+        assert_eq!(p.delete_request(&h), Some(&r));
+        assert_eq!(p.delete_approvals_for(&h).len(), 3);
+        assert_eq!(p.executed().len(), 1);
+    }
+
+    #[test]
+    fn a_request_that_does_not_verify_is_not_recorded() {
+        let s = Scratch::new("forged");
+        let mut p = open(&s);
+        let mut r = request(1, Scope::Namespace);
+        r.reason = "something else".into();
+        assert!(matches!(
+            p.publish_delete_request(r.clone()),
+            Err(PeerError::Delete(_))
+        ));
+        assert!(p.delete_request(&r.request_hash()).is_none());
+    }
+
+    #[test]
+    fn recording_the_same_request_twice_is_idempotent() {
+        let s = Scratch::new("idem");
+        let mut p = open(&s);
+        let r = request(1, Scope::Namespace);
+        let a = p.publish_delete_request(r.clone()).unwrap();
+        let b = p.publish_delete_request(r).unwrap();
+        assert_eq!(a, b);
+        assert_eq!(p.delete_requests.len(), 1);
+    }
+
+    #[test]
+    fn the_trail_is_bounded() {
+        let s = Scratch::new("bounded");
+        let mut p = open(&s);
+        // Cheap: the bound counts requests, and one signature per request is
+        // what a flood costs the attacker too.
+        for i in 0..MAX_DELETE_REQUESTS {
+            let r =
+                DeleteRequest::sign(&key(1), Scope::Object(format!("f-{i}")), "flood", [0u8; 32])
+                    .unwrap();
+            p.publish_delete_request(r).unwrap();
+        }
+        let over = DeleteRequest::sign(
+            &key(1),
+            Scope::Object("one-more".into()),
+            "flood",
+            [0u8; 32],
+        )
+        .unwrap();
+        assert!(matches!(
+            p.publish_delete_request(over),
+            Err(PeerError::DeleteTrailFull)
+        ));
     }
 }

@@ -86,9 +86,15 @@ settled and the work that follows from them.
       of panics. Found three canonicalisation defects in 45 seconds that the
       adversarial human review of the same function missed, one of them a
       capability-scoping break (MANUAL-TESTING.md §8a).
-- [ ] Add a fuzz target per peer-facing record format as M1 defines them — the
-      five plaintext peer records are format-breaking to change once written
-      (SPECS §20), so they must be fuzzed *while* they are still cheap to fix.
+- [x] A fuzz target per peer-facing record format — the plaintext peer records
+      are format-breaking to change once written (SPECS §20), so they are
+      fuzzed while still cheap to fix. Fourteen targets; the three added with
+      M1's new formats are `handoff_decode` (§5.1), `checkpoint_decode` (§5.5)
+      and `delete_decode` (§16.2).
+- [ ] Raise coverage on the thin targets. `wrap_decode` sits at cov 61 on four
+      million runs, which is the shape `delete_decode` had before it was given
+      framed input: the fuzzer is measuring how fast garbage is rejected rather
+      than exercising the decoder.
 
 ## M0 — substrate, local only
 

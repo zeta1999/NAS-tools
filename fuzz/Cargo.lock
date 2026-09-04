@@ -549,12 +549,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "nas-delete"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "nas-core",
+ "nas-crypto",
+]
+
+[[package]]
 name = "nas-fuzz"
 version = "0.0.0"
 dependencies = [
  "libfuzzer-sys",
  "nas-core",
  "nas-crypto",
+ "nas-delete",
  "nas-lease",
  "nas-slots",
  "nas-store",
@@ -578,6 +588,7 @@ dependencies = [
  "blake3",
  "nas-core",
  "nas-crypto",
+ "nas-delete",
  "nas-lease",
  "nas-slots",
  "nas-store",
@@ -609,9 +620,11 @@ dependencies = [
  "blake3",
  "nas-core",
  "nas-crypto",
+ "nas-delete",
  "nas-peer",
  "nas-slots",
  "nas-store",
+ "serde_json",
  "simple_network",
 ]
 

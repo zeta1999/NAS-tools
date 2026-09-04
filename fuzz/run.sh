@@ -14,7 +14,8 @@ SECS="${SECS:-60}"
 TARGETS=("$@")
 if [ ${#TARGETS[@]} -eq 0 ]; then
   TARGETS=(decode_fields addr_from_hex unpad manifest_decode dir_manifest_decode aead_open
-           slot_record_decode witness_decode lease_decode wrap_decode wire_decode)
+           slot_record_decode witness_decode lease_decode wrap_decode wire_decode
+           handoff_decode checkpoint_decode delete_decode)
 fi
 
 fail=0

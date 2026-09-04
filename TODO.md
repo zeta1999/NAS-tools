@@ -296,9 +296,14 @@ settled and the work that follows from them.
       the third record of a loop whose first line is "all of it append-only"
       could not be written down. It has one now, with its approvals nested and
       bounded.
-- [ ] Serve the delete trail over the wire. The peer holds it and judges it,
-      but `nas-transfer` has no request for it, so only an in-process caller
-      can publish one — the same gap the handoff had.
+- [x] Serve the delete trail over the wire — `PublishDeleteRequest` /
+      `PublishDeleteApproval` / `ExecuteDelete`, plus `DeleteRequestRecord` and
+      `DeleteApprovals` so a second device can collect a quorum it did not
+      gather itself. Only opening a request is ACL-gated
+      (`Right::DeleteRequest`): approvals are signed on the offline device
+      §16.1 describes and relayed by whatever machine has a connection, so
+      gating the relay would make the air gap unusable — what bounds them is
+      authority membership, which is cryptographic.
 - [ ] **Execution does not delete data, and cannot yet.** In an encrypted
       namespace the peer cannot resolve `Scope::Object("2024/scan.pdf")` to an
       address (SPECS §2.2): it holds ciphertext under content addresses and no

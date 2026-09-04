@@ -8,6 +8,7 @@
 
 use nas_core::{Addr, Mode};
 use nas_crypto::{Identity as NasIdentity, Role};
+use nas_delete::{DeleteApproval, DeleteExecution, DeleteRequest, Scope};
 use nas_peer::{Hostility, Peer, Right};
 use nas_slots::{
     plan_walk, verify_chain, verify_skip_chain, Checkpoint, Regime, Roster, SlotHandoff, SlotId,
@@ -959,4 +960,182 @@ fn a_ladder_longer_than_one_response_is_paged_from_the_bottom() {
     let w = verify_skip_chain(&got, &[], slot(), &roster, None, &[]).unwrap();
     assert_eq!(w.checkpoints as u64, RUNGS);
     assert_eq!(w.head_seq, (RUNGS - 1) * 10);
+}
+
+// ── The deletion loop over the wire (SPECS §16.2) ──────────────────────────
+
+fn del_key(seed: u8) -> NasIdentity {
+    NasIdentity::derive(&[seed; 32], Role::Lease).unwrap()
+}
+
+/// A peer whose deletion authority is keys 2..=4, with the client allowed to
+/// open requests. Key 1 is the everyday laptop and is deliberately not in it.
+fn delete_peer(tag: &str) -> (Scratch, Channel) {
+    connected(tag, Hostility::HONEST, |p| {
+        for i in 2..=4u8 {
+            p.delete_authority.add(del_key(i).verifying_key());
+        }
+        p.acl.grant("laptop", &[Right::DeleteRequest]);
+    })
+}
+
+fn del_request(nonce: u8, scope: Scope) -> DeleteRequest {
+    DeleteRequest::sign(&del_key(1), scope, "over the wire", [nonce; 32]).unwrap()
+}
+
+fn del_approvals(r: &DeleteRequest, seeds: &[u8]) -> Vec<DeleteApproval> {
+    seeds
+        .iter()
+        .map(|s| DeleteApproval::sign(&del_key(*s), r.request_hash()).unwrap())
+        .collect()
+}
+
+#[test]
+fn the_deletion_loop_crosses_the_wire() {
+    let (_s, mut ch) = delete_peer("delete-loop");
+    let r = del_request(1, Scope::Namespace);
+
+    let h = match ch
+        .call(&Request::PublishDeleteRequest(r.encode().unwrap()))
+        .unwrap()
+    {
+        Response::Proof(h) => h,
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(h, r.request_hash());
+
+    for a in del_approvals(&r, &[2, 3, 4]) {
+        assert_eq!(
+            ch.call(&Request::PublishDeleteApproval(a.encode().unwrap()))
+                .unwrap(),
+            Response::Ok
+        );
+    }
+
+    // A second device can read the trail back and collect a quorum it did not
+    // gather itself -- which is the reason these are served at all.
+    match ch.call(&Request::DeleteApprovals(h)).unwrap() {
+        Response::Records(rs) => assert_eq!(rs.len(), 3),
+        other => panic!("{other:?}"),
+    }
+    match ch.call(&Request::DeleteRequestRecord(h)).unwrap() {
+        Response::Record(Some(b)) => assert_eq!(DeleteRequest::decode(&b).unwrap(), r),
+        other => panic!("{other:?}"),
+    }
+
+    let e = DeleteExecution::sign(&del_key(1), &r, &del_approvals(&r, &[2, 3, 4])).unwrap();
+    assert_eq!(
+        ch.call(&Request::ExecuteDelete(e.encode().unwrap()))
+            .unwrap(),
+        Response::Ok
+    );
+}
+
+#[test]
+fn a_quorum_short_of_the_threshold_is_refused_over_the_wire() {
+    let (_s, mut ch) = delete_peer("delete-short");
+    let r = del_request(2, Scope::Namespace);
+    ch.call(&Request::PublishDeleteRequest(r.encode().unwrap()))
+        .unwrap();
+    let e = DeleteExecution::sign(&del_key(1), &r, &del_approvals(&r, &[2])).unwrap();
+    match ch
+        .call(&Request::ExecuteDelete(e.encode().unwrap()))
+        .unwrap()
+    {
+        // A refusal by policy, arriving as a refusal rather than as the
+        // connection going away.
+        Response::Error(m) => assert!(m.contains("required"), "{m}"),
+        other => panic!("a namespace delete executed on one approval: {other:?}"),
+    }
+    // And the session is still usable.
+    assert_eq!(
+        ch.call(&Request::DeleteApprovals(r.request_hash()))
+            .unwrap(),
+        Response::Records(vec![])
+    );
+}
+
+#[test]
+fn keys_minted_on_the_client_do_not_make_a_quorum_over_the_wire() {
+    // §16.1's adversary, at the far end of a socket: ransomware on the laptop
+    // finds no approving key, so it mints three.
+    let (_s, mut ch) = delete_peer("delete-minted");
+    let r = del_request(3, Scope::Namespace);
+    ch.call(&Request::PublishDeleteRequest(r.encode().unwrap()))
+        .unwrap();
+
+    let minted = del_approvals(&r, &[200, 201, 202]);
+    // The peer will not even record them.
+    for a in &minted {
+        match ch
+            .call(&Request::PublishDeleteApproval(a.encode().unwrap()))
+            .unwrap()
+        {
+            Response::Error(m) => assert!(m.contains("authority"), "{m}"),
+            other => panic!("{other:?}"),
+        }
+    }
+    // Nor honour an execution carrying them.
+    let e = DeleteExecution::sign(&del_key(1), &r, &minted).unwrap();
+    match ch
+        .call(&Request::ExecuteDelete(e.encode().unwrap()))
+        .unwrap()
+    {
+        Response::Error(_) => {}
+        other => panic!("minted keys executed a namespace delete: {other:?}"),
+    }
+}
+
+#[test]
+fn opening_a_request_needs_the_right_but_relaying_an_approval_does_not() {
+    // The asymmetry is deliberate. Opening a request is the one step whose
+    // only gate is this peer, so the ACL decides it. Approvals are signed on
+    // an offline device (§16.1) and relayed by whatever machine has a
+    // connection — gating the relay would make the air gap unusable, and the
+    // authority check is what actually bounds them.
+    let (_s, mut ch) = connected("delete-acl", Hostility::HONEST, |p| {
+        for i in 2..=4u8 {
+            p.delete_authority.add(del_key(i).verifying_key());
+        }
+        // Note: no `DeleteRequest` right.
+        p.acl.grant("laptop", &[Right::Write]);
+    });
+    let r = del_request(4, Scope::Object("a.pdf".into()));
+    match ch
+        .call(&Request::PublishDeleteRequest(r.encode().unwrap()))
+        .unwrap()
+    {
+        Response::Error(_) => {}
+        other => panic!("a subject without delete-request opened one: {other:?}"),
+    }
+
+    // The relay path is open, and still refuses an approval for a request the
+    // peer has no record of — so it is not a hole, just a different gate.
+    let a = del_approvals(&r, &[2]).remove(0);
+    match ch
+        .call(&Request::PublishDeleteApproval(a.encode().unwrap()))
+        .unwrap()
+    {
+        Response::Error(m) => assert!(m.contains("no deletion request"), "{m}"),
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn undecodable_deletion_records_are_refusals_not_disconnects() {
+    let (_s, mut ch) = delete_peer("delete-junk");
+    for req in [
+        Request::PublishDeleteRequest(vec![0xFF; 40]),
+        Request::PublishDeleteApproval(vec![0xFF; 40]),
+        Request::ExecuteDelete(vec![0xFF; 40]),
+    ] {
+        match ch.call(&req).unwrap() {
+            Response::Error(_) => {}
+            other => panic!("{req:?} -> {other:?}"),
+        }
+    }
+    assert_eq!(
+        ch.call(&Request::DeleteRequestRecord([0u8; 32])).unwrap(),
+        Response::Record(None)
+    );
 }

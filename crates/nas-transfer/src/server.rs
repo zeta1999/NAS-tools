@@ -8,7 +8,8 @@
 use crate::session::{Channel, SessionError};
 use crate::wire::{record_cost, Request, Response, MAX_RECORDS, RECORD_BUDGET};
 use nas_core::Clock;
-use nas_peer::{holder_id, Peer, PeerError};
+use nas_delete::{Decision as DeleteDecision, DeleteApproval, DeleteExecution, DeleteRequest};
+use nas_peer::{holder_id, Peer, PeerError, Right};
 use nas_slots::{Checkpoint, SlotHandoff, SlotRecord, Witness};
 
 /// Collect encoded items into a list response, bounded by both count and
@@ -155,6 +156,58 @@ pub fn handle_at(peer: &mut Peer, subject: &str, req: Request, now: &dyn Clock) 
             Ok(a) => Response::Addrs(a),
             Err(e) => Response::Error(e.to_string()),
         },
+
+        // The §16.2 loop.
+        //
+        // Only the first step is gated by the ACL, and the asymmetry is the
+        // point. Opening a request is the one step whose only gate is this
+        // peer — anyone can sign a request with any key — so `Right::
+        // DeleteRequest` is what decides who may put one in the trail.
+        //
+        // Approvals are NOT gated on the connection, deliberately. §16.1 puts
+        // the approving key on an offline device, so approvals are signed
+        // there and relayed by whatever machine happens to have a connection;
+        // requiring the relay to hold `DeleteApprove` would make the air-gap
+        // impossible to use. What bounds them is cryptographic — the peer
+        // stores an approval only from a key in its deletion authority.
+        //
+        // Execution likewise: the control is quorum against that authority,
+        // which no ACL entry can substitute for.
+        Request::PublishDeleteRequest(bytes) => {
+            let d = peer.acl.check(subject, Right::DeleteRequest, peer.mode);
+            if !d.permits() {
+                return Response::Error(PeerError::Refused { decision: d }.to_string());
+            }
+            match DeleteRequest::decode(&bytes) {
+                Ok(r) => match peer.publish_delete_request(r) {
+                    Ok(h) => Response::Proof(h),
+                    Err(e) => Response::Error(e.to_string()),
+                },
+                Err(e) => Response::Error(format!("{e}")),
+            }
+        }
+        Request::PublishDeleteApproval(bytes) => match DeleteApproval::decode(&bytes) {
+            Ok(a) => match peer.publish_delete_approval(a) {
+                Ok(()) => Response::Ok,
+                Err(e) => Response::Error(e.to_string()),
+            },
+            Err(e) => Response::Error(format!("{e}")),
+        },
+        Request::ExecuteDelete(bytes) => match DeleteExecution::decode(&bytes) {
+            Ok(e) => match peer.execute_delete(e, now.now()) {
+                // A refusal by policy arrives as a refusal, not as a dropped
+                // connection or a silent success -- the same contract every
+                // other check on this dispatch keeps.
+                Ok(DeleteDecision::Execute { .. }) => Response::Ok,
+                Ok(DeleteDecision::Refused(why)) => Response::Error(why.to_string()),
+                Err(e) => Response::Error(e.to_string()),
+            },
+            Err(e) => Response::Error(format!("{e}")),
+        },
+        Request::DeleteRequestRecord(h) => {
+            Response::Record(peer.delete_request(&h).and_then(|r| r.encode().ok()))
+        }
+        Request::DeleteApprovals(h) => bounded(peer.delete_approvals_for(&h), |a| a.encode()),
     }
 }
 

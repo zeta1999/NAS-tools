@@ -22,6 +22,9 @@ nas — NAS-tools command line
 
   nas ns create <name> [--mode e2ee|passphrase|transit-only]
                        [--padding none|classes|fixed]
+                       [--object-lock governance|compliance|legal-hold --retention 7y]
+                       [--device <subject>]   under object-lock, the everyday
+                                              device, granted APPEND ONLY
   nas ns list
   nas ns export-pub <ns> <out-dir>       keys a peer operator needs to admit <ns>
   nas acl grant|revoke|check <ns> --subject <s> --right <r>
@@ -252,7 +255,10 @@ fn ns(args: &[String]) -> i32 {
     match pos.first().copied() {
         Some("create") => {
             let Some(name) = pos.get(1) else {
-                eprintln!("usage: nas ns create <name> [--mode …] [--padding …]");
+                eprintln!(
+                    "usage: nas ns create <name> [--mode …] [--padding …] \
+                     [--object-lock … --retention …] [--device <subject>]"
+                );
                 return exit::ERROR;
             };
             let mode = match opt(args, "--mode") {
@@ -314,6 +320,11 @@ fn ns(args: &[String]) -> i32 {
                 eprintln!("namespace {name} already exists");
                 return exit::ERROR;
             }
+            // Which subject is this namespace's everyday device. Named
+            // rather than assumed: an ACL entry is only meaningful against a
+            // subject the operator actually binds a key to, and inventing one
+            // would make the grant decorative.
+            let everyday = opt(args, "--device").unwrap_or("default");
             let passphrase = repo::passphrase_from(opt(args, "--passphrase"));
             if mode == Mode::Passphrase && passphrase.is_none() {
                 eprintln!("passphrase mode needs --passphrase or $NAS_PASSPHRASE");
@@ -330,6 +341,28 @@ fn ns(args: &[String]) -> i32 {
                     );
                     if let Some((l, secs)) = lock {
                         println!("  object-lock {}, retention {secs}s", l.as_str());
+                        // The whole of §16's ransomware defence is that the
+                        // everyday device may add files and never overwrite or
+                        // delete one. Leaving that to be configured by hand
+                        // means a WORM namespace whose laptop quietly holds
+                        // full write access -- the exact failure this mode
+                        // exists to prevent -- so asking for object-lock
+                        // establishes the posture rather than merely recording
+                        // an intent to have it.
+                        //
+                        // Append ONLY. Not `write`, which subsumes overwrite
+                        // and delete; not any `delete-*`, which are the
+                        // offline authority's. Broader rights stay a
+                        // deliberate `nas acl grant`.
+                        if let Err(e) = aclcmd::seed_append_only(name, everyday) {
+                            eprintln!("error: object-lock acl: {e}");
+                            return exit::ERROR;
+                        }
+                        println!(
+                            "  {everyday} granted APPEND ONLY — it may add objects and may not \
+                             overwrite or delete one. Anything broader is a deliberate \
+                             `nas acl grant` (SPECS §16)."
+                        );
                         // Say which half exists. §16.3's extend-only rule is
                         // enforced by the peer today; the rest is not, and a
                         // namespace that implied otherwise would be claiming a

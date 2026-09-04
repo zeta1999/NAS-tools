@@ -1,8 +1,68 @@
 //! Quorum, and the rolling window that survives decomposition (SPECS §16.2).
+//!
+//! # Counting is not the control
+//!
+//! An earlier version of [`decide`] counted *distinct* approvers and stopped
+//! there. That is not a quorum, it is a headcount: whoever held the requesting
+//! laptop could generate three keypairs, sign three approvals with them, and
+//! satisfy the namespace threshold of 3. It made §16.1's central claim —
+//! "ransomware on the laptop cannot delete, because the authority is not there
+//! to steal" — false as implemented, because nothing established what the
+//! authority *was*.
+//!
+//! [`Authority`] is that missing set: the public keys of the offline deletion
+//! authority, which by §16.1 are deliberately not on the everyday device. An
+//! approval from outside it does not count, and is refused rather than
+//! silently ignored — an unrecognised approval is evidence, and a report of
+//! "1 of 3 distinct" that quietly dropped two is a worse answer than a
+//! refusal that names what happened.
 
 use crate::record::{DeleteExecution, DeleteRequest, Scope};
 use nas_core::Timestamp;
+use nas_crypto::key_id;
 use std::collections::BTreeSet;
+
+/// The offline deletion authority: whose approvals may count (SPECS §16.1).
+///
+/// Held by the verifier, never carried in the records it judges — a set the
+/// records themselves supplied would be a quorum the requester chose.
+///
+/// An **empty** authority approves nothing. That is deliberate and is the safe
+/// direction: a deployment that has not yet named its authority cannot delete,
+/// rather than being able to delete with any keys at all.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Authority {
+    ids: BTreeSet<[u8; 32]>,
+}
+
+impl Authority {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Admit an approver by its full verifying key, returning its id.
+    pub fn add(&mut self, verifying_key: &[u8]) -> [u8; 32] {
+        let id = key_id(verifying_key);
+        self.ids.insert(id);
+        id
+    }
+
+    pub fn contains(&self, id: &[u8; 32]) -> bool {
+        self.ids.contains(id)
+    }
+
+    pub fn len(&self) -> usize {
+        self.ids.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.ids.is_empty()
+    }
+
+    pub fn ids(&self) -> impl Iterator<Item = &[u8; 32]> {
+        self.ids.iter()
+    }
+}
 
 /// Approvals owed, by blast radius. SPECS §16.2's defaults.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -84,6 +144,18 @@ pub enum Refusal {
     BadRequest(String),
     /// The execution record does not verify.
     BadExecution(String),
+    /// An approval signed by a key that is not in the deletion authority.
+    ///
+    /// Refused rather than ignored: this is what an attacker who has the
+    /// laptop and can make keypairs produces, and dropping it from the count
+    /// would report a confusing shortfall instead of naming the attempt.
+    NotAnApprover { id: [u8; 32] },
+    /// The verifier holds no deletion authority, so no approval can count.
+    ///
+    /// A distinct refusal from [`Self::ShortOfQuorum`] because the fix is
+    /// different: this is a deployment that has never named its authority, not
+    /// one that is short of signatures.
+    NoAuthority,
     /// The requester approved its own request.
     ///
     /// Not a spec rule, and deliberately so: it is here because the whole point
@@ -109,6 +181,15 @@ impl std::fmt::Display for Refusal {
                     ""
                 }
             ),
+            Self::NotAnApprover { id } => write!(
+                f,
+                "approval from {} is not in the deletion authority; §16.1 puts that key \
+                 deliberately off the everyday device",
+                id.iter().map(|b| format!("{b:02x}")).collect::<String>()
+            ),
+            Self::NoAuthority => f.write_str(
+                "no deletion authority is configured, so nothing can be approved (SPECS §16.1)",
+            ),
             Self::BadApproval(m) => write!(f, "approval rejected: {m}"),
             Self::BadRequest(m) => write!(f, "request rejected: {m}"),
             Self::BadExecution(m) => write!(f, "execution rejected: {m}"),
@@ -126,6 +207,10 @@ impl std::fmt::Display for Refusal {
 /// reason: the only data-destroying operations in the system should be
 /// inspectable before they run.
 ///
+/// `authority` is whose approvals may count (SPECS §16.1). It is a parameter
+/// rather than something read out of the records because a set the records
+/// supplied would be a quorum the requester chose.
+///
 /// `recent` is every deletion already executed for this namespace, and is what
 /// makes decomposition expensive: the count inside the window escalates the
 /// requirement regardless of how small each individual request looks.
@@ -134,6 +219,7 @@ pub fn decide(
     execution: &DeleteExecution,
     recent: &[Executed],
     policy: &QuorumPolicy,
+    authority: &Authority,
     now: Timestamp,
 ) -> Decision {
     if let Err(e) = request.verify() {
@@ -148,8 +234,16 @@ pub fn decide(
         ));
     }
 
-    // Distinct approvers, by key id. Two approvals from one holder are one
-    // holder: "× m, from distinct holders" (SPECS §16.2).
+    // No authority, no approvals. Checked before the loop so a deployment
+    // that never named one gets the accurate answer rather than a shortfall.
+    if authority.is_empty() {
+        return Decision::Refused(Refusal::NoAuthority);
+    }
+
+    // Distinct approvers **from the authority**, by key id. Two approvals from
+    // one holder are one holder ("× m, from distinct holders", §16.2), and an
+    // approval from outside the authority is not a holder at all — without
+    // that second half this counts keypairs, which anyone can make.
     let mut ids = BTreeSet::new();
     for a in &execution.approvals {
         if let Err(e) = a.verify() {
@@ -157,6 +251,11 @@ pub fn decide(
         }
         if a.approver_id() == request.requester_id() {
             return Decision::Refused(Refusal::SelfApproved);
+        }
+        if !authority.contains(&a.approver_id()) {
+            return Decision::Refused(Refusal::NotAnApprover {
+                id: a.approver_id(),
+            });
         }
         ids.insert(a.approver_id());
     }
@@ -213,12 +312,22 @@ mod tests {
         Timestamp(100_000_000)
     }
 
+    /// The offline deletion authority these tests judge against: seeds 2..=5.
+    /// Seed 1 is the requesting laptop and is deliberately not in it.
+    fn authority() -> Authority {
+        let mut a = Authority::new();
+        for s in 2..=5u8 {
+            a.add(id(s).verifying_key());
+        }
+        a
+    }
+
     #[test]
     fn one_approver_deletes_one_object() {
         let r = request(Scope::Object("a.pdf".into()));
         let e = execution(&r, &[2]);
         assert_eq!(
-            decide(&r, &e, &[], &QuorumPolicy::default(), now()),
+            decide(&r, &e, &[], &QuorumPolicy::default(), &authority(), now()),
             Decision::Execute {
                 required: 1,
                 distinct: 1
@@ -230,7 +339,7 @@ mod tests {
     fn one_approver_cannot_delete_a_namespace() {
         let r = request(Scope::Namespace);
         let e = execution(&r, &[2]);
-        match decide(&r, &e, &[], &QuorumPolicy::default(), now()) {
+        match decide(&r, &e, &[], &QuorumPolicy::default(), &authority(), now()) {
             Decision::Refused(Refusal::ShortOfQuorum {
                 required, distinct, ..
             }) => assert_eq!((required, distinct), (3, 1)),
@@ -245,7 +354,7 @@ mod tests {
         let r = request(Scope::Prefix("2024/".into()));
         let a = DeleteApproval::sign(&id(2), r.request_hash()).unwrap();
         let e = DeleteExecution::sign(&id(1), &r, &[a.clone(), a]).unwrap();
-        match decide(&r, &e, &[], &QuorumPolicy::default(), now()) {
+        match decide(&r, &e, &[], &QuorumPolicy::default(), &authority(), now()) {
             Decision::Refused(Refusal::ShortOfQuorum {
                 required, distinct, ..
             }) => assert_eq!((required, distinct), (2, 1)),
@@ -270,7 +379,14 @@ mod tests {
         // And a hand-built execution carrying it is refused.
         let mut forged = execution(&second, &[2]);
         forged.approvals = vec![stolen];
-        match decide(&second, &forged, &[], &QuorumPolicy::default(), now()) {
+        match decide(
+            &second,
+            &forged,
+            &[],
+            &QuorumPolicy::default(),
+            &authority(),
+            now(),
+        ) {
             Decision::Refused(Refusal::BadExecution(_)) => {}
             other => panic!("a replayed approval was accepted: {other:?}"),
         }
@@ -281,9 +397,128 @@ mod tests {
         let r = request(Scope::Object("a.pdf".into()));
         let e = execution(&r, &[1]);
         assert_eq!(
-            decide(&r, &e, &[], &QuorumPolicy::default(), now()),
+            decide(&r, &e, &[], &QuorumPolicy::default(), &authority(), now()),
             Decision::Refused(Refusal::SelfApproved)
         );
+    }
+
+    #[test]
+    fn keys_invented_on_the_laptop_do_not_make_a_quorum() {
+        // The defect this parameter exists to close. Counting distinct
+        // approvers and stopping there is a headcount, not a quorum: whoever
+        // held the requesting laptop could generate three keypairs, sign three
+        // approvals, and satisfy the namespace threshold of 3 — making §16.1's
+        // claim ("ransomware on the laptop cannot delete, because the
+        // authority is not there to steal") false as implemented.
+        let r = request(Scope::Namespace);
+        // Three keys nobody admitted, distinct and validly signed.
+        let approvals: Vec<DeleteApproval> = [200u8, 201, 202]
+            .iter()
+            .map(|s| DeleteApproval::sign(&id(*s), r.request_hash()).unwrap())
+            .collect();
+        let e = DeleteExecution::sign(&id(1), &r, &approvals).unwrap();
+
+        // Every signature verifies and all three holders are distinct, so the
+        // old headcount said yes.
+        assert_eq!(
+            approvals
+                .iter()
+                .map(|a| a.approver_id())
+                .collect::<BTreeSet<_>>()
+                .len(),
+            3
+        );
+        match decide(&r, &e, &[], &QuorumPolicy::default(), &authority(), now()) {
+            Decision::Refused(Refusal::NotAnApprover { .. }) => {}
+            other => panic!("invented keys satisfied the quorum: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn one_stranger_spoils_an_otherwise_sufficient_quorum() {
+        // Refused, not silently ignored. Dropping the stranger from the count
+        // would report "2 of 3 distinct" and hide the fact that someone
+        // presented an approval from a key nobody admitted.
+        let r = request(Scope::Namespace);
+        let mut approvals: Vec<DeleteApproval> = [2u8, 3, 4]
+            .iter()
+            .map(|s| DeleteApproval::sign(&id(*s), r.request_hash()).unwrap())
+            .collect();
+        // Sanity: these three are enough on their own.
+        let good = DeleteExecution::sign(&id(1), &r, &approvals).unwrap();
+        assert!(matches!(
+            decide(
+                &r,
+                &good,
+                &[],
+                &QuorumPolicy::default(),
+                &authority(),
+                now()
+            ),
+            Decision::Execute { .. }
+        ));
+
+        approvals.push(DeleteApproval::sign(&id(200), r.request_hash()).unwrap());
+        let e = DeleteExecution::sign(&id(1), &r, &approvals).unwrap();
+        match decide(&r, &e, &[], &QuorumPolicy::default(), &authority(), now()) {
+            Decision::Refused(Refusal::NotAnApprover { .. }) => {}
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_empty_authority_approves_nothing() {
+        // The safe direction, and it must be explicit: a deployment that has
+        // not named its authority cannot delete, rather than being able to
+        // delete with any keys at all. An empty set that meant "no constraint"
+        // is how this kind of check usually fails open.
+        let r = request(Scope::Object("a.pdf".into()));
+        let e = execution(&r, &[2]);
+        assert_eq!(
+            decide(
+                &r,
+                &e,
+                &[],
+                &QuorumPolicy::default(),
+                &Authority::new(),
+                now()
+            ),
+            Decision::Refused(Refusal::NoAuthority)
+        );
+    }
+
+    #[test]
+    fn the_authority_is_the_verifiers_not_the_records() {
+        // A set read out of the execution would be a quorum the requester
+        // chose. `decide` takes it as a parameter for exactly that reason, so
+        // the same records get opposite answers under different authorities.
+        let r = request(Scope::Object("a.pdf".into()));
+        let e = execution(&r, &[2]);
+
+        let mut theirs = Authority::new();
+        theirs.add(id(2).verifying_key());
+        assert!(matches!(
+            decide(&r, &e, &[], &QuorumPolicy::default(), &theirs, now()),
+            Decision::Execute { .. }
+        ));
+
+        let mut other = Authority::new();
+        other.add(id(9).verifying_key());
+        assert!(matches!(
+            decide(&r, &e, &[], &QuorumPolicy::default(), &other, now()),
+            Decision::Refused(Refusal::NotAnApprover { .. })
+        ));
+    }
+
+    #[test]
+    fn membership_is_by_key_not_by_name() {
+        // `add` keys on the verifying key's id, so re-admitting the same key
+        // does not inflate the authority and cannot inflate a quorum.
+        let mut a = Authority::new();
+        let first = a.add(id(2).verifying_key());
+        let again = a.add(id(2).verifying_key());
+        assert_eq!(first, again);
+        assert_eq!(a.len(), 1);
     }
 
     #[test]
@@ -297,13 +532,13 @@ mod tests {
         // Under the threshold: one approver is enough, as designed.
         let nine = vec![Executed { at: now() }; 9];
         assert!(matches!(
-            decide(&r, &e, &nine, &p, now()),
+            decide(&r, &e, &nine, &p, &authority(), now()),
             Decision::Execute { required: 1, .. }
         ));
 
         // At it: the same single-object request now owes the namespace quorum.
         let ten = vec![Executed { at: now() }; 10];
-        match decide(&r, &e, &ten, &p, now()) {
+        match decide(&r, &e, &ten, &p, &authority(), now()) {
             Decision::Refused(Refusal::ShortOfQuorum {
                 required,
                 distinct,
@@ -317,7 +552,14 @@ mod tests {
         // Three distinct approvers still get through — escalation raises the
         // price, it does not deadlock the namespace.
         assert!(matches!(
-            decide(&r, &execution(&r, &[2, 3, 4]), &ten, &p, now()),
+            decide(
+                &r,
+                &execution(&r, &[2, 3, 4]),
+                &ten,
+                &p,
+                &authority(),
+                now()
+            ),
             Decision::Execute { required: 3, .. }
         ));
     }
@@ -336,7 +578,7 @@ mod tests {
             10
         ];
         assert!(matches!(
-            decide(&r, &e, &old, &p, now()),
+            decide(&r, &e, &old, &p, &authority(), now()),
             Decision::Execute { required: 1, .. }
         ));
     }
@@ -378,7 +620,7 @@ mod tests {
         r.scope = Scope::Namespace;
         assert!(r.verify().is_err());
         let e = execution(&request(Scope::Object("a.pdf".into())), &[2]);
-        match decide(&r, &e, &[], &QuorumPolicy::default(), now()) {
+        match decide(&r, &e, &[], &QuorumPolicy::default(), &authority(), now()) {
             Decision::Refused(Refusal::BadRequest(_)) => {}
             other => panic!("{other:?}"),
         }

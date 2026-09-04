@@ -21,7 +21,16 @@
 //! deliberately a client-side decision rather than a check the peer performs.
 //!
 //! What the peer *can* check is arithmetic over signatures: m distinct
-//! approvers, each binding the request hash. That is [`decide`].
+//! approvers **from the deletion authority**, each binding the request hash.
+//! That is [`decide`].
+//!
+//! Both halves are load-bearing, and the second was missing at first. Counting
+//! distinct approvers alone is a headcount, not a quorum: whoever holds the
+//! requesting laptop can mint three keypairs and sign three valid, distinct
+//! approvals with them. [`Authority`] is the set §16.1 describes — keys
+//! deliberately not on the everyday device — and without it §16.1's claim that
+//! "ransomware on the laptop cannot delete, because the authority is not there
+//! to steal" is false, because nothing says what the authority is.
 //!
 //! # Decomposition is the attack that per-request quorum misses
 //!
@@ -34,5 +43,5 @@
 pub mod policy;
 pub mod record;
 
-pub use policy::{decide, Decision, Executed, QuorumPolicy, Refusal, RollingPolicy};
+pub use policy::{decide, Authority, Decision, Executed, QuorumPolicy, Refusal, RollingPolicy};
 pub use record::{Approver, DeleteApproval, DeleteError, DeleteExecution, DeleteRequest, Scope};

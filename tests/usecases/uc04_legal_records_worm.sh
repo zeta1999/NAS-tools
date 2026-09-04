@@ -28,6 +28,10 @@ check_refuses "quorum cannot be reached with one approver"       $NAS test delet
 check_refuses "cooling-off cannot be short-circuited"            $NAS test cooling-off-bypass records
 # Review finding C9: N object-scope deletes must not add up to a namespace delete.
 check_refuses "quorum survives decomposition into N object deletes" $NAS test quorum-decomposition-attack records
+# §16.1's actual adversary: ransomware on the laptop finds no approving key, so
+# it mints its own. Every signature verifies and every holder is distinct, so a
+# quorum that counted distinctness alone would say yes.
+check_refuses "keys minted on the laptop do not make a quorum"      $NAS test invented-approvers records
 # Review finding: the cheapest attack on WORM is silence, not deletion (§16.3).
 check         "retention set is extend-only under the everyday key"     $NAS test retention-extend-only records
 check_refuses "the everyday key cannot shrink the retention set"        $NAS test retention-shrink records --key everyday

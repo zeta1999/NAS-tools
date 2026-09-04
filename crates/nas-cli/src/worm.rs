@@ -383,8 +383,8 @@ pub fn go_silent() -> Result<Result<String, String>, String> {
 // ── The deletion approval loop (SPECS §16.2) ───────────────────────────────
 
 use nas_delete::{
-    decide, Approver, Decision, DeleteApproval, DeleteExecution, DeleteRequest, Executed,
-    QuorumPolicy, Refusal, Scope,
+    decide, Approver, Authority, Decision, DeleteApproval, DeleteExecution, DeleteRequest,
+    Executed, QuorumPolicy, Refusal, Scope,
 };
 
 /// Approver identities standing in for the offline holders.
@@ -395,6 +395,19 @@ use nas_delete::{
 /// it and make the drill prove the opposite of what it claims.
 fn approver(seed: u8) -> Result<Identity, String> {
     Identity::derive(&[0xD0 + seed; 32], Role::Lease).map_err(|e| format!("approver: {e}"))
+}
+
+/// The offline deletion authority these drills judge against (SPECS §16.1).
+///
+/// The keys are deliberately *not* the requester's: §16.1's whole mechanism is
+/// that the deleting authority is not on the everyday device, and a drill whose
+/// authority contained the laptop would be testing nothing.
+fn authority(n: usize) -> Result<Authority, String> {
+    let mut a = Authority::new();
+    for i in 0..n {
+        a.add(approver(i as u8 + 1)?.verifying_key());
+    }
+    Ok(a)
 }
 
 /// The everyday laptop key that opens requests. Also not an approver.
@@ -427,6 +440,85 @@ fn parse_scope(s: &str) -> Option<Scope> {
     }
 }
 
+/// `nas test invented-approvers <ns>` — SPECS §16.1.
+///
+/// The attack §16.1 names, run for real: ransomware holds the everyday laptop
+/// and, finding no approving key there, simply generates three keypairs and
+/// signs three approvals with them. Every signature verifies. All three
+/// holders are distinct. A quorum that counted distinctness would say yes to
+/// a whole-namespace deletion.
+///
+/// It is the authority set that says no — "a separate ML-DSA key that is
+/// deliberately not on that laptop". Without it, §16.1's claim that
+/// "ransomware on the laptop cannot delete, because the authority is not there
+/// to steal" is false, because nothing establishes what the authority is.
+pub fn invented_approvers(ns: &str) -> i32 {
+    if let Err(e) = mode_of(ns) {
+        return err(e);
+    }
+    let policy = QuorumPolicy::default();
+    let scope = Scope::Namespace;
+    let required = policy.base(&scope);
+    let auth = match authority(required) {
+        Ok(a) => a,
+        Err(e) => return err(e),
+    };
+
+    // Honest first: the real authority's approvals do execute it. Without this
+    // the refusal below would be satisfied by a quorum that refuses everyone.
+    let honest = match request_for(scope.clone(), 0x10)
+        .and_then(|r| execution_with(&r, required).map(|e| (r, e)))
+    {
+        Ok((r, e)) => decide(&r, &e, &[], &policy, &auth, Timestamp(real_now())),
+        Err(e) => return err(e),
+    };
+    if !matches!(honest, Decision::Execute { .. }) {
+        return err(format!(
+            "{required} genuine approvers should satisfy the namespace scope, got {honest:?}"
+        ));
+    }
+
+    // The attack. Keys minted on the compromised device, one per required
+    // approval, so nothing is short of the threshold.
+    let r = match request_for(scope, 0x11) {
+        Ok(r) => r,
+        Err(e) => return err(e),
+    };
+    let mut approvals = Vec::new();
+    for i in 0..required {
+        let minted = match Identity::derive(&[0xF0 + i as u8; 32], Role::Lease) {
+            Ok(k) => k,
+            Err(e) => return err(format!("mint: {e}")),
+        };
+        match DeleteApproval::sign(&minted, r.request_hash()) {
+            Ok(a) => approvals.push(a),
+            Err(e) => return err(format!("approve: {e}")),
+        }
+    }
+    let e = match DeleteExecution::sign(&requester().unwrap(), &r, &approvals) {
+        Ok(e) => e,
+        Err(e) => return err(format!("execution: {e}")),
+    };
+
+    // Every one of them verifies and they are all distinct — which is exactly
+    // why counting distinctness was not enough.
+    let distinct: BTreeSet<[u8; 32]> = approvals.iter().map(|a| a.approver_id()).collect();
+    if distinct.len() != required || approvals.iter().any(|a| a.verify().is_err()) {
+        return err("the drill failed to mint the attack it is supposed to run");
+    }
+
+    match decide(&r, &e, &[], &policy, &auth, Timestamp(real_now())) {
+        Decision::Refused(why) => refuse(format!(
+            "invented-approvers: {required} freshly minted keys, all valid and all distinct, \
+             do not make a quorum in {ns}: {why} (SPECS §16.1)"
+        )),
+        Decision::Execute { distinct, .. } => refuse(format!(
+            "{distinct} keys minted on the requesting device satisfied the namespace quorum; \
+             §16.1's claim that the authority is not there to steal does not hold"
+        )),
+    }
+}
+
 /// `nas test delete-quorum <ns> --approvers <n> --scope <object|prefix|namespace>`
 ///
 /// Refused (exit 2) when `n` is short of what the scope owes. Proves it is not
@@ -449,7 +541,10 @@ pub fn delete_quorum(ns: &str, approvers: usize, scope: &str) -> i32 {
     let sanity = match request_for(scope.clone(), 1)
         .and_then(|r| execution_with(&r, required).map(|e| (r, e)))
     {
-        Ok((r, e)) => decide(&r, &e, &[], &policy, Timestamp(real_now())),
+        Ok((r, e)) => match authority(required) {
+            Ok(auth) => decide(&r, &e, &[], &policy, &auth, Timestamp(real_now())),
+            Err(e) => return err(e),
+        },
         Err(e) => return err(e),
     };
     if !matches!(sanity, Decision::Execute { .. }) {
@@ -466,7 +561,11 @@ pub fn delete_quorum(ns: &str, approvers: usize, scope: &str) -> i32 {
         Ok(x) => x,
         Err(e) => return err(e),
     };
-    match decide(&r, &e, &[], &policy, Timestamp(real_now())) {
+    let auth = match authority(approvers.max(required)) {
+        Ok(a) => a,
+        Err(e) => return err(e),
+    };
+    match decide(&r, &e, &[], &policy, &auth, Timestamp(real_now())) {
         Decision::Execute { distinct, .. } => {
             println!(
                 "delete-quorum: {distinct} approver(s) executed {} (required {required})",
@@ -536,6 +635,12 @@ pub fn quorum_decomposition_attack(ns: &str) -> i32 {
     let policy = QuorumPolicy::default();
     let now = Timestamp(real_now());
     let one_stolen_approval = 1;
+    // The authority is wide enough that the attack never fails merely for
+    // want of an admitted key: what must stop it is the rolling window.
+    let auth = match authority(policy.rolling.escalate_to) {
+        Ok(a) => a,
+        Err(e) => return err(e),
+    };
 
     // Under the rolling threshold each single-object delete goes through on
     // one approval — that is the design, and the attack rides on it.
@@ -547,7 +652,7 @@ pub fn quorum_decomposition_attack(ns: &str) -> i32 {
             Ok(x) => x,
             Err(e) => return err(e),
         };
-        match decide(&r, &e, &history, &policy, now) {
+        match decide(&r, &e, &history, &policy, &auth, now) {
             Decision::Execute { .. } => history.push(Executed { at: now }),
             Decision::Refused(why) => {
                 return err(format!(
@@ -566,7 +671,7 @@ pub fn quorum_decomposition_attack(ns: &str) -> i32 {
         Ok(x) => x,
         Err(e) => return err(e),
     };
-    match decide(&r, &e, &history, &policy, now) {
+    match decide(&r, &e, &history, &policy, &auth, now) {
         Decision::Refused(Refusal::ShortOfQuorum {
             required,
             distinct,
@@ -634,11 +739,18 @@ pub fn approval_replay(ns: &str) -> i32 {
         Err(e) => return err(e),
     };
     forged.approvals = vec![stolen];
+    // A wide authority on purpose: the replayed approval must be refused for
+    // being bound to another request, not for coming from an unadmitted key.
+    let auth = match authority(3) {
+        Ok(a) => a,
+        Err(e) => return err(e),
+    };
     match decide(
         &second,
         &forged,
         &[],
         &QuorumPolicy::default(),
+        &auth,
         Timestamp(real_now()),
     ) {
         Decision::Refused(why) => ok(format!(
@@ -676,7 +788,11 @@ pub fn delete_request_execute(target: &str) -> i32 {
         Ok(x) => x,
         Err(e) => return err(e),
     };
-    match decide(&r, &e, &[], &policy, Timestamp(real_now())) {
+    let auth = match authority(required) {
+        Ok(a) => a,
+        Err(e) => return err(e),
+    };
+    match decide(&r, &e, &[], &policy, &auth, Timestamp(real_now())) {
         Decision::Refused(why) => refuse(format!(
             "delete {} in {ns}: {why}. The approving keys are deliberately not on this \
              machine (SPECS §16.1); collect {required} approval(s) from the offline \

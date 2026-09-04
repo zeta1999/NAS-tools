@@ -280,10 +280,19 @@ settled and the work that follows from them.
       rolling window against decomposition, and approvals bound to a request
       hash. Drills: `nas test delete-quorum|cooling-off-bypass|
       quorum-decomposition-attack|approval-replay`, `nas delete-request execute`
+- [x] **`decide` checks the deletion authority, not just distinctness**
+      (SPECS §16.1). Found while starting the peer wiring: counting distinct
+      approvers is a headcount, and whoever held the requesting laptop could
+      mint three keypairs and satisfy the namespace quorum of 3. `Authority` is
+      now a parameter — held by the verifier, never read out of the records it
+      judges — an approval from outside it is refused rather than ignored, and
+      an empty authority approves nothing. Drill:
+      `nas test invented-approvers`.
 - [ ] Wire the loop to a peer that stores requests/approvals and drops leases on
-      execution. Today `decide` is exercised by the CLI drills against
-      in-memory records; the peer does not yet retain the audit trail §16.2
-      calls append-only
+      execution. `decide` is exercised by the CLI drills against in-memory
+      records; the peer does not yet retain the audit trail §16.2 calls
+      append-only, nor the executed history the rolling window counts — so
+      today decomposition is only resisted within a single process.
 - [x] **Object Lock establishes the append-only posture** (SPECS §16), decided
       with the user: `ns create --object-lock … --device <subject>` seeds that
       subject **append and nothing else**. §16's whole ransomware defence is

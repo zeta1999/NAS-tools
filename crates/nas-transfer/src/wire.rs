@@ -151,6 +151,19 @@ pub enum Request {
     /// What a returning holder would have lost (SPECS §6.3). Asking changes
     /// nothing: the sweep plan is pure and this only reads it.
     SweepWarnings,
+    /// The §16.2 loop. All three records are left encoded on the wire, like a
+    /// slot record, so the peer parses them with the decoder a client would.
+    PublishDeleteRequest(Vec<u8>),
+    PublishDeleteApproval(Vec<u8>),
+    /// Judged against the peer's authority, policy and its own recorded
+    /// history — the last of which is why executing happens here rather than
+    /// in a client that could pass an empty window.
+    ExecuteDelete(Vec<u8>),
+    /// Read one recorded request back, by its hash.
+    DeleteRequestRecord([u8; 32]),
+    /// Every approval the peer has recorded for a request, so a device can
+    /// collect a quorum it did not gather itself.
+    DeleteApprovals([u8; 32]),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -191,6 +204,11 @@ const REQ_TAKE_LEASE: u8 = 13;
 const REQ_RELEASE_LEASE: u8 = 14;
 const REQ_LEASES: u8 = 15;
 const REQ_SWEEP_WARNINGS: u8 = 16;
+const REQ_PUBLISH_DELETE_REQUEST: u8 = 17;
+const REQ_PUBLISH_DELETE_APPROVAL: u8 = 18;
+const REQ_EXECUTE_DELETE: u8 = 19;
+const REQ_DELETE_REQUEST_RECORD: u8 = 20;
+const REQ_DELETE_APPROVALS: u8 = 21;
 
 const RSP_BLOB: u8 = 0;
 const RSP_BOOL: u8 = 1;
@@ -234,6 +252,11 @@ impl Request {
             Self::ReleaseLease(a) => encode_addrs(REQ_RELEASE_LEASE, a)?,
             Self::Leases => encode_fields(&[&[REQ_LEASES]])?,
             Self::SweepWarnings => encode_fields(&[&[REQ_SWEEP_WARNINGS]])?,
+            Self::PublishDeleteRequest(r) => encode_fields(&[&[REQ_PUBLISH_DELETE_REQUEST], r])?,
+            Self::PublishDeleteApproval(a) => encode_fields(&[&[REQ_PUBLISH_DELETE_APPROVAL], a])?,
+            Self::ExecuteDelete(e) => encode_fields(&[&[REQ_EXECUTE_DELETE], e])?,
+            Self::DeleteRequestRecord(h) => encode_fields(&[&[REQ_DELETE_REQUEST_RECORD], h])?,
+            Self::DeleteApprovals(h) => encode_fields(&[&[REQ_DELETE_APPROVALS], h])?,
         };
         check_size(out)
     }
@@ -325,6 +348,26 @@ impl Request {
             REQ_SWEEP_WARNINGS => {
                 want(1)?;
                 Self::SweepWarnings
+            }
+            REQ_PUBLISH_DELETE_REQUEST => {
+                want(2)?;
+                Self::PublishDeleteRequest(f[1].to_vec())
+            }
+            REQ_PUBLISH_DELETE_APPROVAL => {
+                want(2)?;
+                Self::PublishDeleteApproval(f[1].to_vec())
+            }
+            REQ_EXECUTE_DELETE => {
+                want(2)?;
+                Self::ExecuteDelete(f[1].to_vec())
+            }
+            REQ_DELETE_REQUEST_RECORD => {
+                want(2)?;
+                Self::DeleteRequestRecord(fixed::<32>("request", f[1])?)
+            }
+            REQ_DELETE_APPROVALS => {
+                want(2)?;
+                Self::DeleteApprovals(fixed::<32>("request", f[1])?)
             }
             other => return Err(WireError::UnknownTag { tag: other }),
         })
@@ -529,6 +572,11 @@ mod tests {
             Request::ReleaseLease(vec![addr(7)]),
             Request::Leases,
             Request::SweepWarnings,
+            Request::PublishDeleteRequest(vec![5u8; 200]),
+            Request::PublishDeleteApproval(vec![6u8; 200]),
+            Request::ExecuteDelete(vec![7u8; 200]),
+            Request::DeleteRequestRecord([8u8; 32]),
+            Request::DeleteApprovals([9u8; 32]),
         ]
     }
 
@@ -569,6 +617,11 @@ mod tests {
             Request::ReleaseLease(_) => "ReleaseLease",
             Request::Leases => "Leases",
             Request::SweepWarnings => "SweepWarnings",
+            Request::PublishDeleteRequest(_) => "PublishDeleteRequest",
+            Request::PublishDeleteApproval(_) => "PublishDeleteApproval",
+            Request::ExecuteDelete(_) => "ExecuteDelete",
+            Request::DeleteRequestRecord(_) => "DeleteRequestRecord",
+            Request::DeleteApprovals(_) => "DeleteApprovals",
         }
     }
 
@@ -595,6 +648,11 @@ mod tests {
             "ReleaseLease",
             "Leases",
             "SweepWarnings",
+            "PublishDeleteRequest",
+            "PublishDeleteApproval",
+            "ExecuteDelete",
+            "DeleteRequestRecord",
+            "DeleteApprovals",
         ];
         let have: std::collections::BTreeSet<&str> = requests().iter().map(name).collect();
         for n in ALL {

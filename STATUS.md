@@ -312,6 +312,21 @@ down. It has both now, with its approvals nested and bounded, and a round-trip
 test that re-verifies the record afterwards — a trail of records that no longer
 check is a log, not evidence.
 
+It is on the wire: `PublishDeleteRequest` / `PublishDeleteApproval` /
+`ExecuteDelete`, with `DeleteRequestRecord` and `DeleteApprovals` so a second
+device can collect a quorum it did not gather itself. A quorum short of the
+threshold arrives as a refusal, not as a dropped connection — the contract
+every other check on that dispatch keeps.
+
+Only the *first* step is ACL-gated, and the asymmetry is deliberate. Opening a
+request is the one step whose only gate is the peer, since anyone can sign a
+request with any key, so `Right::DeleteRequest` decides who may put one in the
+trail. Approvals are **not** gated on the connection: §16.1 puts the approving
+key on an offline device, so approvals are signed there and relayed by whatever
+machine happens to have a connection, and requiring the relay to hold
+`DeleteApprove` would make the air gap impossible to use. What bounds approvals
+is cryptographic — the peer stores one only from a key in its authority.
+
 **What executing does not do: delete data.** In an encrypted namespace the peer
 cannot resolve `Scope::Object("2024/scan.pdf")` to an address at all (§2.2) —
 it holds ciphertext under content addresses and no mapping. So it records the

@@ -292,6 +292,24 @@ Climbing costs `S/I + I` items, minimised at `I = sqrt(S)`; for §5.5's own
 frame size is a transport limit and has no business setting a protocol
 constant, so both fetches page instead.
 
+**A missing ceiling on stored Argon2 parameters (§2.2.2), found by fuzzing.**
+`WrapPolicy` bounded the KDF only from below — `min_memory_kib`,
+`min_iterations` — which stops a hostile peer *weakening* the derivation and
+does nothing about the other direction. The wrap record is stored on the peer,
+so the peer chooses those numbers: `memory_kib = u32::MAX` is four terabytes,
+and a recovering client would have honoured it. That is the four-byte denial of
+service the wire decoder is careful about, one layer down, and it costs the
+attacker one field of a record it already holds. Demonstrated with a probe
+(`check` returned `Ok(())`) before being fixed.
+
+`ParamError::TooStrong` and a ceiling close it, with room left above the floor
+so a deployment can still harden its own parameters. The ceiling **bounds the
+attack rather than removing it**, and says so: the 4 GiB default can still
+OOM a smaller device, this library cannot know how much memory the device has,
+and a constrained one should lower it. The fuzz target proved that concretely —
+honouring the shipped ceiling under a 2 GiB limit produced an out-of-memory,
+which was the target's bug and the documentation's warrant.
+
 **The peer retains the §16.2 audit trail.** `publish_delete_request` /
 `publish_delete_approval` / `execute_delete`, append-only and persisted: a
 record is never replaced or removed, one holder's second approval is still one

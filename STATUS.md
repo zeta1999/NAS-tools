@@ -292,6 +292,26 @@ Climbing costs `S/I + I` items, minimised at `I = sqrt(S)`; for §5.5's own
 frame size is a transport limit and has no business setting a protocol
 constant, so both fetches page instead.
 
+**The deletion quorum checks authority, not just distinctness (§16.1).** Found
+while starting the peer-side wiring, and it was the more serious gap: `decide`
+counted *distinct* approvers and stopped there. That is a headcount, not a
+quorum — whoever held the requesting laptop could mint three keypairs, sign
+three valid and genuinely distinct approvals, and satisfy the namespace
+threshold of 3. It made §16.1's central claim ("ransomware on the laptop cannot
+delete, because the authority is not there to steal") false as implemented,
+because nothing established what the authority *was*. It was demonstrated with
+a probe before being fixed, not assumed.
+
+`Authority` is now a parameter of `decide`, held by the verifier and never read
+out of the records it judges — a set the execution supplied would be a quorum
+the requester chose. An approval from outside it is **refused, not ignored**:
+dropping it from the count would report a confusing shortfall instead of naming
+the attempt. An empty authority approves nothing, which is the direction this
+kind of check usually fails open in.
+
+`nas test invented-approvers` runs the attack for real — three freshly minted
+keys, all valid, all distinct — and UC04 now asserts it is refused.
+
 **Object Lock now establishes the append-only posture (§16).** This was a
 product decision, taken with the user rather than guessed at. `ns create
 --object-lock … --device <subject>` seeds that subject with **append and

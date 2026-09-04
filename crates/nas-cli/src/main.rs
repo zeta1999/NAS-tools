@@ -647,6 +647,7 @@ fn test(args: &[String]) -> i32 {
             }
         },
         Some("cooling-off-bypass") => one_ns(&pos, worm::cooling_off_bypass),
+        Some("invented-approvers") => one_ns(&pos, worm::invented_approvers),
         Some("quorum-decomposition-attack") => one_ns(&pos, worm::quorum_decomposition_attack),
         Some("approval-replay") => one_ns(&pos, worm::approval_replay),
         Some("witness-node-holds-nothing") => attack::witness_node_holds_nothing(),

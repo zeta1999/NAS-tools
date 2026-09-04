@@ -51,6 +51,19 @@ fn err(msg: impl std::fmt::Display) -> i32 {
     exit::ERROR
 }
 
+/// Give `subject` append-only rights, for a namespace created under Object
+/// Lock (SPECS §16).
+///
+/// Separate from [`grant`] because it returns a `Result` rather than an exit
+/// code — it runs inside `ns create`, where a failure has to abort the whole
+/// command rather than print and continue — and because it states the posture
+/// in one place: **append and nothing else**.
+pub fn seed_append_only(ns: &str, subject: &str) -> Result<(), String> {
+    let mut acl = load(ns)?;
+    acl.grant(subject, &[Right::Append]);
+    store(ns, &acl)
+}
+
 pub fn grant(ns: &str, subject: &str, right: Right) -> i32 {
     if !Repo::exists(ns) {
         return err(format!("no namespace {ns}"));
@@ -145,5 +158,44 @@ pub fn check(ns: &str, subject: &str, right: Right) -> i32 {
             eprintln!("error: {d}");
             exit::ERROR
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The posture `--object-lock` establishes, asserted against the rights
+    /// vocabulary rather than against a list written out by hand — so a right
+    /// added to `Right::ALL` later cannot quietly join the seeded set.
+    #[test]
+    fn object_lock_seeds_append_and_nothing_else() {
+        let mut acl = Acl::new();
+        acl.grant("laptop", &[Right::Append]);
+        for r in Right::ALL {
+            let held = acl.rights_of("laptop").is_some_and(|rs| rs.contains(&r));
+            assert_eq!(
+                held,
+                r == Right::Append,
+                "object-lock must seed append and only append, but {} is {}",
+                r.as_str(),
+                if held { "held" } else { "missing" }
+            );
+        }
+    }
+
+    /// `write` subsumes overwrite and delete (see `Right::Write`), so a device
+    /// holding it would make "append only" decorative. This is the assertion
+    /// the whole §16 defence rests on.
+    #[test]
+    fn append_is_not_write() {
+        assert_ne!(Right::Append, Right::Write);
+        let mut acl = Acl::new();
+        acl.grant("laptop", &[Right::Append]);
+        let rights = acl.rights_of("laptop").expect("subject exists");
+        assert!(!rights.contains(&Right::Write));
+        assert!(!rights.contains(&Right::DeleteRequest));
+        assert!(!rights.contains(&Right::DeleteApprove));
+        assert!(!rights.contains(&Right::Admin));
     }
 }

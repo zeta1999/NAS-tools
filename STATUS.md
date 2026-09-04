@@ -205,8 +205,7 @@ TLC is green with its three sanity checks still failing as required.
 ## Not built
 
 M2: the object verbs `put`/`rm` — which need the key→object mapping the S3
-face brings, so they are reclassified M3 (§7.1) rather than pending here. Four
-assertions still fail at `NAS_MILESTONE=M2`, all of them UC04's.
+face brings, so they are reclassified M3 (§7.1) rather than pending here. **No assertion fails at `NAS_MILESTONE=M2`:** 57 pass, 0 fail, 33 pending.
 
 **The single-writer handoff (§5.1) is built.** `SlotHandoff` is signed by the
 *outgoing* writer and binds slot, sequence and both writers, so it authorises
@@ -292,6 +291,32 @@ Climbing costs `S/I + I` items, minimised at `I = sqrt(S)`; for §5.5's own
 632. Shrinking it to fit one response would cost 1425 — more than double. A
 frame size is a transport limit and has no business setting a protocol
 constant, so both fetches page instead.
+
+**Object Lock now establishes the append-only posture (§16).** This was a
+product decision, taken with the user rather than guessed at. `ns create
+--object-lock … --device <subject>` seeds that subject with **append and
+nothing else** — not `write`, which subsumes overwrite and delete; not any
+`delete-*`, which belong to the offline authority. Anything broader stays a
+deliberate `nas acl grant`.
+
+The reasoning: §16's entire ransomware defence is "the everyday device may add
+files and never overwrite or delete one." Leaving that to be configured by hand
+means a WORM namespace whose laptop quietly holds full write access — the exact
+failure the mode exists to prevent. So asking for object-lock establishes the
+posture instead of merely recording an intent to have it.
+
+The device is **named**, not assumed. An ACL entry is only meaningful against a
+subject an operator actually binds a key to, and seeding an invented name would
+have made the grant decorative — which is why the alternative (hardcoding the
+name the use-case script happened to use) was refused. Without `--object-lock`
+the ACL stays empty and default-deny is untouched.
+
+UC04 gained the other half of "append only" as two new assertions — the laptop
+does **not** hold `write`, nor any delete authority — since the first line is
+decorative without them. Its three object-verb assertions are now gated M3:
+`nas put` / `nas rm` need the key→object mapping the S3 face brings (§7.1) and
+already exit 3, so scoring them as refusals was wrong. PENDING is still not
+success.
 
 **UC07's roaming claims are checked (§5.6, §6.3).** A laptop that is offline
 for weeks and reconnects on no schedule is the design target, and three spec

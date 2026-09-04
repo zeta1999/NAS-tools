@@ -284,6 +284,14 @@ settled and the work that follows from them.
       execution. Today `decide` is exercised by the CLI drills against
       in-memory records; the peer does not yet retain the audit trail §16.2
       calls append-only
+- [x] **Object Lock establishes the append-only posture** (SPECS §16), decided
+      with the user: `ns create --object-lock … --device <subject>` seeds that
+      subject **append and nothing else**. §16's whole ransomware defence is
+      "add, never overwrite or delete", and a posture nobody remembers to
+      configure is not a defence. The device is *named* rather than assumed —
+      an ACL entry is only meaningful against a subject an operator binds a key
+      to. Without `--object-lock` the ACL stays empty, so default-deny is
+      untouched.
 - [x] UC07's roaming drills (SPECS §5.6, §6.3) — `nas test
       witness-opportunistic`, `offline-30d`, `sweep-warning`, in
       `crates/nas-cli/src/roaming.rs`. `Peer::sweep_warnings` gives a

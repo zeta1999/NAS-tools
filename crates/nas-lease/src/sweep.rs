@@ -26,19 +26,31 @@ pub const DAY: u64 = 86_400;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GcPolicy {
     /// Blobs younger than this are immune regardless of leases (§6.2).
+    ///
+    /// An upload-race window, not an absence one: it has nothing to do with
+    /// how long a holder has been away. That is `notice`.
     pub grace: u64,
-    /// How long a holder may be absent before its leases stop protecting (§6.3).
+    /// How long a holder may be absent before its leases lapse (§6.3).
     pub lease_expiry: u64,
+    /// How long a lapsed lease keeps protecting (§6.3): the peer must not
+    /// sweep a holder's set until `lease_expiry + notice`, and a holder that
+    /// returns inside this window is warned while it can still renew.
+    ///
+    /// A separate field from `grace` on purpose. The two were one, which made
+    /// the warn-before-sweep window 24 hours wide after a 90-day absence —
+    /// not much of a warning.
+    pub notice: u64,
     /// Per-holder ceiling on leased bytes (§6.4).
     pub max_leased_bytes: u64,
 }
 
 impl Default for GcPolicy {
-    /// SPECS defaults: 24 h grace, 90 day expiry.
+    /// SPECS defaults: 24 h grace, 90 day expiry, 30 day notice.
     fn default() -> Self {
         Self {
             grace: DAY,
             lease_expiry: 90 * DAY,
+            notice: 30 * DAY,
             max_leased_bytes: u64::MAX,
         }
     }
@@ -62,12 +74,12 @@ pub struct Holder {
 }
 
 impl Holder {
-    /// Active, expiring (past expiry but inside the grace window), or expired.
+    /// Active, expiring (past expiry but inside the notice window), or expired.
     pub fn status(&self, now: Timestamp, p: &GcPolicy) -> HolderStatus {
         let idle = now.saturating_since(self.last_seen);
         if idle <= p.lease_expiry {
             HolderStatus::Active
-        } else if idle <= p.lease_expiry.saturating_add(p.grace) {
+        } else if idle <= p.lease_expiry.saturating_add(p.notice) {
             HolderStatus::Expiring
         } else {
             HolderStatus::Expired
@@ -87,7 +99,8 @@ impl Holder {
 pub enum HolderStatus {
     Active,
     /// Past expiry but still protected: the peer must not sweep until
-    /// `expiry + grace` (§6.3), and this is that window.
+    /// `expiry + notice` (§6.3), and this is that window. A holder seen here
+    /// is warned, because this is the only time a warning is worth having.
     Expiring,
     Expired,
 }
@@ -105,7 +118,9 @@ pub enum Keep {
     YoungBlob,
     /// Leased by a holder that is still active.
     Leased,
-    /// Leased only by holders inside the post-expiry grace window.
+    /// Leased only by holders inside the post-expiry notice window. Kept, and
+    /// every one of those holders is warned: this is what the sweep takes
+    /// when the window closes.
     LeasedByExpiring,
 }
 
@@ -116,10 +131,14 @@ pub struct SweepPlan {
     pub delete: Vec<Addr>,
     /// Blobs kept, with the reason.
     pub keep: Vec<(Addr, Keep)>,
-    /// Per holder, the blobs it leases that are in `delete`.
+    /// Per holder, the blobs it leases whose only protection is a lapsed
+    /// lease: those kept as `LeasedByExpiring`, and those in `delete`.
     ///
-    /// SPECS §6.3's warn-before-sweep: a returning client is told what *would*
-    /// have gone, so silent loss is not the failure mode.
+    /// SPECS §6.3's warn-before-sweep. Inside the notice window this is the
+    /// list a returning client can act on — what *would* go, while renewing
+    /// still saves it. After the window it is what went. The same list either
+    /// way, so what a client is warned about is exactly what a sweep after
+    /// the window would take, and silent loss is not the failure mode.
     pub warnings: BTreeMap<[u8; 32], Vec<Addr>>,
     /// Holders over `max_leased_bytes` (§6.4). Reported, never enforced by
     /// deleting: a quota breach is a pairing problem, and resolving it by
@@ -182,16 +201,23 @@ pub fn plan_sweep(
 
         if active {
             plan.keep.push((b.addr, Keep::Leased));
-        } else if expiring {
+            continue;
+        }
+        if expiring {
             plan.keep.push((b.addr, Keep::LeasedByExpiring));
         } else {
             plan.delete.push(b.addr);
-            // Tell every holder that leased it, whatever its status: the point
-            // is that a client learns what it lost, and the holder whose lease
-            // lapsed is exactly the one that needs telling.
-            for h in holders.iter().filter(|h| h.set.contains(&b.addr)) {
-                plan.warnings.entry(h.id).or_default().push(b.addr);
-            }
+        }
+        // Warned either way, and the "either" is the point. A warning that
+        // only fires once the blob is in `delete` reaches the client after
+        // the deletion — an obituary, not a warning. Inside the notice window
+        // the blob is kept and the client can still renew; that is the only
+        // time the list is worth having. Every holder that leased it is told,
+        // whatever its status: none of them is active, or the blob would be
+        // `Leased`, and the one whose lease lapsed is exactly the one that
+        // needs telling.
+        for h in holders.iter().filter(|h| h.set.contains(&b.addr)) {
+            plan.warnings.entry(h.id).or_default().push(b.addr);
         }
     }
 
@@ -281,8 +307,10 @@ mod tests {
     }
 
     #[test]
-    fn the_post_expiry_grace_window_still_protects() {
-        // SPECS §6.3: the peer must not sweep until expiry + grace.
+    fn the_post_expiry_notice_window_still_protects_and_warns() {
+        // SPECS §6.3: the peer must not sweep until expiry + notice, and a
+        // holder seen inside that window is told what is at risk while
+        // renewing can still save it.
         let p = GcPolicy::default();
         let h = holder(1, &[1], NOW - (90 * DAY + DAY / 2));
         assert_eq!(h.status(now(), &p), HolderStatus::Expiring);
@@ -295,12 +323,44 @@ mod tests {
         );
         assert!(plan.delete.is_empty());
         assert_eq!(plan.keep, vec![(addr(1), Keep::LeasedByExpiring)]);
+        assert_eq!(
+            plan.warnings[&[1u8; 32]],
+            vec![addr(1)],
+            "kept for now, and the holder is told so while it can still renew"
+        );
     }
 
     #[test]
-    fn past_expiry_plus_grace_the_lease_stops_protecting() {
+    fn the_notice_window_is_not_the_young_blob_grace() {
+        // The two were one field, which made the warn-before-sweep window 24
+        // hours wide after a 90-day absence. A holder past `expiry + grace`
+        // is still well inside `notice`, and an implementation that conflates
+        // them sweeps here.
         let p = GcPolicy::default();
-        let h = holder(1, &[1], NOW - (91 * DAY + 1));
+        assert!(
+            p.notice > p.grace,
+            "the split is only worth having if it is wider"
+        );
+        let h = holder(1, &[1], NOW - (p.lease_expiry + p.grace + 3600));
+        assert_eq!(h.status(now(), &p), HolderStatus::Expiring);
+        let plan = plan_sweep(
+            &[blob(1, NOW - 200 * DAY)],
+            &[h],
+            &BTreeSet::new(),
+            &p,
+            now(),
+        );
+        assert!(
+            plan.delete.is_empty(),
+            "swept an hour past the young-blob grace"
+        );
+        assert_eq!(plan.warnings[&[1u8; 32]], vec![addr(1)]);
+    }
+
+    #[test]
+    fn past_expiry_plus_notice_the_lease_stops_protecting() {
+        let p = GcPolicy::default();
+        let h = holder(1, &[1], NOW - (p.lease_expiry + p.notice + 1));
         assert_eq!(h.status(now(), &p), HolderStatus::Expired);
         let plan = plan_sweep(
             &[blob(1, NOW - 200 * DAY)],
@@ -310,6 +370,46 @@ mod tests {
             now(),
         );
         assert_eq!(plan.delete, vec![addr(1)]);
+        assert_eq!(plan.warnings[&[1u8; 32]], vec![addr(1)]);
+    }
+
+    #[test]
+    fn the_warning_inside_the_window_names_what_the_sweep_takes_after_it() {
+        // What §6.3 promises: the list a returning client sees inside the
+        // window is exactly what a sweep once the window closes would delete.
+        // A warning about one set and a sweep of another is worse than none.
+        let p = GcPolicy::default();
+        let blobs: Vec<BlobInfo> = (1..=3).map(|n| blob(n, NOW - 300 * DAY)).collect();
+        let h = holder(1, &[1, 2, 3], NOW - 100 * DAY);
+        let floor = BTreeSet::new();
+        let inside = plan_sweep(&blobs, std::slice::from_ref(&h), &floor, &p, now());
+        let after = plan_sweep(
+            &blobs,
+            std::slice::from_ref(&h),
+            &floor,
+            &p,
+            Timestamp(NOW + p.notice),
+        );
+        assert!(inside.delete.is_empty());
+        assert_eq!(after.delete.len(), 3);
+        assert_eq!(inside.warnings[&[1u8; 32]], after.delete);
+    }
+
+    #[test]
+    fn a_blob_an_active_holder_also_leases_is_at_risk_for_nobody() {
+        // The warning names what the sweep would take. A blob some other
+        // holder keeps alive is not at risk, so the lapsed holder is not told
+        // about it: a list padded with safe blobs is a list nobody reads.
+        let p = GcPolicy::default();
+        let holders = vec![
+            holder(1, &[1, 2], NOW - 100 * DAY),
+            holder(2, &[1], NOW - DAY),
+        ];
+        let blobs = vec![blob(1, NOW - 300 * DAY), blob(2, NOW - 300 * DAY)];
+        let plan = plan_sweep(&blobs, &holders, &BTreeSet::new(), &p, now());
+        assert!(plan.delete.is_empty());
+        assert_eq!(plan.warnings[&[1u8; 32]], vec![addr(2)]);
+        assert!(!plan.warnings.contains_key(&[2u8; 32]));
     }
 
     #[test]

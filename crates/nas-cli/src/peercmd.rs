@@ -622,6 +622,36 @@ pub fn sync(ns: &str, o: SyncOpts<'_>) -> i32 {
         Err(code) => return code,
     };
 
+    // ── Warn before sweep (SPECS §6.3) ──
+    //
+    // Asked first, before anything this sync does could change the answer.
+    // The peer names the blobs this device leases whose lease has lapsed:
+    // kept for now inside the notice window, gone once it closes. Reported,
+    // not acted on — what to renew is the user's call. (Today a client takes
+    // no leases over the wire at all, so this is empty for every real client;
+    // the route exists so that the day leases arrive, the warning is already
+    // on it.)
+    match call(&mut ch, &Request::SweepWarnings) {
+        Ok(Response::Addrs(at_risk)) => {
+            if !at_risk.is_empty() {
+                println!(
+                    "  !! {} blobs leased by this device are at risk of sweep: the lease has \
+                     lapsed and the peer deletes them when the notice window closes (SPECS §6.3)",
+                    at_risk.len()
+                );
+                for a in at_risk.iter().take(8) {
+                    println!("     {}", a.to_hex());
+                }
+                if at_risk.len() > 8 {
+                    println!("     … and {} more", at_risk.len() - 8);
+                }
+            }
+        }
+        Ok(Response::Error(m)) => return refused(format!("sweep warnings: {m}")),
+        Ok(other) => return err(format!("unexpected reply to SweepWarnings: {other:?}")),
+        Err(e) => return err(e),
+    }
+
     // ── Blobs ──
     let addrs = match blobs.addrs() {
         Ok(a) => a,

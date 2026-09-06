@@ -20,6 +20,7 @@ use nas_lease::{sweep::DAY, GcPolicy};
 use nas_peer::{holder_id, Hostility, Peer};
 use nas_slots::{SlotId, Witness};
 use nas_store::Addressing;
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::PathBuf;
 
@@ -235,10 +236,10 @@ pub fn offline_30d(ns: &str) -> i32 {
 /// The trap in this check is that "nothing was lost" is satisfied perfectly by
 /// a peer that never sweeps. So the drill establishes three points on the same
 /// timeline against the same peer: away 30 days (protected), away past
-/// `expiry` but inside grace (still protected — §6.3's second clause, which is
-/// the one an implementation is most likely to get wrong), and away past
-/// `expiry + grace` (swept). If the last one does not sweep, the first two
-/// prove nothing and the drill says so.
+/// `expiry` but inside the notice window (still protected — §6.3's second
+/// clause, which is the one an implementation is most likely to get wrong),
+/// and away past `expiry + notice` (swept). If the last one does not sweep,
+/// the first two prove nothing and the drill says so.
 fn absence(away: u64) -> Result<Result<String, String>, String> {
     let policy = GcPolicy::default();
     let mut lab = Lab::open("offline")?;
@@ -263,12 +264,12 @@ fn absence(away: u64) -> Result<Result<String, String>, String> {
 
     // The honest floor first: a holder gone long enough really does lose
     // protection. Without this every other assertion here is vacuous.
-    let long_gone = swept_at(&mut lab, policy.lease_expiry + policy.grace + DAY)?;
+    let long_gone = swept_at(&mut lab, policy.lease_expiry + policy.notice + DAY)?;
     if long_gone.is_empty() {
         return Ok(Err(format!(
             "nothing is swept even {} days after the holder expired, so this peer never \
              sweeps and 'a 30-day absence loses nothing' means nothing",
-            (policy.lease_expiry + policy.grace + DAY) / DAY
+            (policy.lease_expiry + policy.notice + DAY) / DAY
         )));
     }
 
@@ -283,25 +284,28 @@ fn absence(away: u64) -> Result<Result<String, String>, String> {
         )));
     }
 
-    // Past expiry but inside grace: §6.3's "must not sweep until expiry +
-    // grace". The clause most likely to be implemented as a bare `>` on
-    // expiry alone.
-    let in_grace = swept_at(&mut lab, policy.lease_expiry + policy.grace / 2)?;
-    if !in_grace.is_empty() {
+    // Past expiry but inside the notice window: §6.3's "must not sweep until
+    // expiry + notice". The clause most likely to be implemented as a bare
+    // `>` on expiry alone — or, as it was, against the wrong window: the
+    // 24-hour young-blob grace of §6.2, which has nothing to do with absence.
+    // So the probe sits just past `expiry + grace`, where that mistake sweeps.
+    let in_notice = swept_at(&mut lab, policy.lease_expiry + policy.grace + DAY)?;
+    if !in_notice.is_empty() {
         return Ok(Err(format!(
-            "{} blobs swept past expiry but inside the grace window; §6.3 says not until \
-             expiry + grace",
-            in_grace.len()
+            "{} blobs swept past expiry but inside the {}-day notice window; §6.3 says not \
+             until expiry + notice",
+            in_notice.len(),
+            policy.notice / DAY
         )));
     }
 
     Ok(Ok(format!(
-        "away {} days: nothing swept (expiry {} days); past expiry but inside the {}-hour \
-         grace: still nothing; past expiry + grace: {} of {} blobs swept, so the mechanism \
-         is real (SPECS §6.3)",
+        "away {} days: nothing swept (expiry {} days); past expiry but inside the {}-day \
+         notice: still nothing; past expiry + notice: {} of {} blobs swept, so the \
+         mechanism is real (SPECS §6.3)",
         away / DAY,
         policy.lease_expiry / DAY,
-        policy.grace / 3600,
+        policy.notice / DAY,
         long_gone.len(),
         a.len()
     )))
@@ -351,19 +355,23 @@ fn warned() -> Result<Result<String, String>, String> {
         )));
     }
 
-    // The laptop comes back after its leases have lapsed. It is entitled to
-    // know what was at risk while it was away.
-    let returned = Timestamp(departed.secs() + policy.lease_expiry + policy.grace + DAY);
+    // The laptop comes back after its leases have lapsed but inside the
+    // notice window. It is entitled to know what is at risk — now, while
+    // renewing still saves it. A warning that only fires once the window has
+    // closed reaches the client after the deletion, which is an obituary.
+    let returned = Timestamp(departed.secs() + policy.lease_expiry + policy.notice / 2);
     let warnings = lab
         .peer
         .sweep_warnings(&holder, returned)
         .map_err(|e| format!("warnings: {e}"))?;
     if warnings.is_empty() {
-        return Ok(Err(
-            "a returning client past its expiry is told nothing is at risk, so loss here \
-             would be silent — which §6.3 names as the failure mode"
-                .to_string(),
-        ));
+        return Ok(Err(format!(
+            "a client back {} days past its expiry, inside the {}-day notice window, is told \
+             nothing is at risk, so loss here would be silent — which §6.3 names as the \
+             failure mode",
+            policy.notice / 2 / DAY,
+            policy.notice / DAY
+        )));
     }
 
     // Asking must not have destroyed anything: the plan is a plan.
@@ -376,10 +384,33 @@ fn warned() -> Result<Result<String, String>, String> {
         )));
     }
 
+    // And the warning has to be honest: what it names must be exactly what a
+    // sweep once the window closes would take. Dry-run, so nothing is
+    // deleted by checking.
+    let holders = lab.peer.holders();
+    let closed = Timestamp(departed.secs() + policy.lease_expiry + policy.notice + DAY);
+    let would_take = lab
+        .peer
+        .sweep(&holders, &policy, closed, true)
+        .map_err(|e| format!("sweep: {e}"))?
+        .delete;
+    let named: BTreeSet<&[u8; 32]> = warnings.iter().map(Addr::as_bytes).collect();
+    let taken: BTreeSet<&[u8; 32]> = would_take.iter().map(Addr::as_bytes).collect();
+    if named != taken {
+        return Ok(Err(format!(
+            "the warning names {} blobs but the sweep after the window would take {}; a \
+             warning about one set and a sweep of another is worse than none",
+            named.len(),
+            taken.len()
+        )));
+    }
+
     Ok(Ok(format!(
-        "quiet while the holder is inside expiry; on return {} of {} blobs named as \
-         at-risk and all {} still held, so the client can renew instead of discovering \
-         the loss (SPECS §6.3)",
+        "quiet while the holder is inside expiry; back inside the {}-day notice window, {} \
+         of {} blobs named as at-risk, all {} still held, and the list is exactly what the \
+         sweep would take once the window closes, so the client can renew instead of \
+         discovering the loss (SPECS §6.3)",
+        policy.notice / DAY,
         warnings.len(),
         a.len(),
         warnings.len()

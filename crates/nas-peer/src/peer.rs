@@ -1010,16 +1010,17 @@ impl Peer {
             .collect())
     }
 
-    /// What a returning holder would have lost (SPECS §6.3, warn-before-sweep).
+    /// What a returning holder stands to lose (SPECS §6.3, warn-before-sweep).
     ///
     /// Planned against the peer's **own** holders and policy, not against a
     /// set the caller supplies, so the answer is about the sweep that would
     /// actually run. Nothing is deleted by asking: `plan_sweep` is pure and
     /// this only reads the plan.
     ///
-    /// "Silent loss is not the failure mode" is the whole of §6.3 here — a
-    /// client that comes back inside its expiry is entitled to know what was
-    /// at risk while it was away, and an empty answer means nothing was.
+    /// "Silent loss is not the failure mode" is the whole of §6.3 here. A
+    /// holder back inside the notice window is told what a sweep would take
+    /// while renewing can still save it; one back after the window is told
+    /// what went. An empty answer means nothing is at risk.
     pub fn sweep_warnings(
         &self,
         holder: &[u8; 32],
@@ -2520,16 +2521,25 @@ mod worm_tests {
 
     #[test]
     fn an_expiring_holder_still_protects_and_is_warned() {
-        // §6.3's window: past expiry, inside grace. Nothing is deleted, and
-        // the returning client is the one that needs telling.
+        // §6.3's window: past expiry, inside notice. Nothing is deleted, and
+        // the returning client is the one that needs telling — now, while
+        // renewing still saves the blob, not once it is gone.
         let (_s, mut p) = peer("expiring", Hostility::HONEST);
         let a = seed(&p, 1);
         let policy = GcPolicy::default();
         let now = later();
-        let last = now.0 - policy.lease_expiry - policy.grace / 2;
+        let last = now.0 - policy.lease_expiry - policy.notice / 2;
         let plan = p.sweep(&[holder(7, &a, last)], &policy, now, true).unwrap();
-        assert!(plan.delete.is_empty(), "inside grace, nothing may be swept");
+        assert!(
+            plan.delete.is_empty(),
+            "inside notice, nothing may be swept"
+        );
         assert_eq!(plan.keep, vec![(a[0], nas_lease::Keep::LeasedByExpiring)]);
+        assert_eq!(
+            plan.warnings.get(&[7u8; 32]),
+            Some(&a),
+            "this test's name promised a warning, and it was not being checked"
+        );
     }
 
     #[test]
@@ -3190,14 +3200,22 @@ mod lease_tests {
             .unwrap()
             .is_empty());
 
+        // Back inside the notice window: told, while renewing still saves it.
+        // This is the case that matters, and the one that used to answer
+        // nothing — the warning fired only once the window had closed.
         let policy = p.gc_policy;
-        let returned = Timestamp(now().secs() + policy.lease_expiry + policy.grace + DAY);
-        let warned = p.sweep_warnings(&h, returned).unwrap();
-        assert_eq!(warned.len(), 3, "everything it leased was at risk");
+        let inside = Timestamp(now().secs() + policy.lease_expiry + policy.notice / 2);
+        let warned = p.sweep_warnings(&h, inside).unwrap();
+        assert_eq!(warned.len(), 3, "everything it leased is at risk");
         assert!(
             warned.iter().all(|x| p.has_blob(x)),
             "and asking destroyed none of it"
         );
+
+        // Back after the window: the same list, now naming what a sweep
+        // would already have taken.
+        let after = Timestamp(now().secs() + policy.lease_expiry + policy.notice + DAY);
+        assert_eq!(p.sweep_warnings(&h, after).unwrap(), warned);
     }
 
     #[test]
@@ -3210,7 +3228,7 @@ mod lease_tests {
         p.take_lease(phone, &a[2..], now()).unwrap();
 
         let policy = p.gc_policy;
-        let late = Timestamp(now().secs() + policy.lease_expiry + policy.grace + DAY);
+        let late = Timestamp(now().secs() + policy.lease_expiry + policy.notice / 2);
         let l = p.sweep_warnings(&laptop, late).unwrap();
         let f = p.sweep_warnings(&phone, late).unwrap();
         assert_eq!(l.len(), 2);

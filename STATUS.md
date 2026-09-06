@@ -407,11 +407,15 @@ These drills had the opposite trap from the hostile-peer ones. They assert that
 nothing *bad* happened, and a peer that never sweeps at all satisfies "a 30-day
 absence loses nothing" perfectly while proving nothing. So each one also makes
 the mechanism bite and refuses if it does not: `offline-30d` establishes three
-points on one timeline — away 30 days (protected), past expiry but inside grace
-(still protected, which is the §6.3 clause most likely to be coded as a bare
-`>` on expiry), and past `expiry + grace` (swept, 4 of 4). `sweep-warning`
-requires the returning client to be both *told* and still *holding*: a warning
-delivered by deleting the data first is not a warning.
+points on one timeline — away 30 days (protected), past expiry but inside the
+30-day notice window (still protected, which is the §6.3 clause most likely to
+be coded as a bare `>` on expiry — or, as it was, against the 24-hour young-blob
+grace instead of a notice window of its own), and past `expiry + notice` (swept,
+4 of 4). `sweep-warning` requires the returning client to be *told* while it is
+still inside the window, to still be *holding* everything it was told about, and
+the list to be exactly what the sweep would take once the window closes: a
+warning delivered by deleting the data first is not a warning, and one about a
+different set than the sweep's is worse than none.
 
 `witness-opportunistic` has to prove an absence — that no schedule exists. Its
 first draft checked that two signings of one observation were byte-identical,

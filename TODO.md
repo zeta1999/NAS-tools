@@ -243,13 +243,30 @@ settled and the work that follows from them.
       100 addresses, where signing each address individually would cost
       334100 B, **39x more**. A LeaseCheckpoint is 5377 B whether it covers 100
       addresses or ten million. That is SPECS §3.8 and §6.1 in numbers.
-- [ ] **The warn-before-sweep window is only `grace` wide.** SPECS §6.3 says the
+- [x] **The warn-before-sweep window is only `grace` wide.** SPECS §6.3 says the
       peer must not sweep until `expiry + grace`, and a returning client inside
       that window is warned. With the defaults that is a **24-hour** warning
       after a **90-day** absence, which is not much of a warning. Either the
       window wants its own (longer) setting, or the warning has to reach the
       client by some route other than it happening to reconnect. Decide before
       `nas-peer` starts actually deleting.
+      **Decided (SPECS revision 6):** its own setting. `GcPolicy::notice`,
+      default **30 days**, is §6.3's window; `grace` stays §6.2's 24-hour
+      upload-race immunity and no longer has anything to do with absence. Two
+      things were wrong, not one: the window was `grace` wide, *and* the
+      warning fired only for blobs already in `delete` — i.e. only once the
+      window had closed, after the deletion, which is an obituary. Now every
+      holder of a `LeasedByExpiring` blob is warned, so inside the window the
+      list is what a sweep *would* take and renewing still saves it; the
+      `sweep.rs` tests pin that the inside-window list equals the after-window
+      `delete`. The route is `nas peer sync`, which now asks `SweepWarnings`
+      first thing and prints what is at risk. The peer test named
+      `..._and_is_warned` had never asserted a warning; it does now, and both
+      UC07 drills probe just past `expiry + grace`, where the conflation
+      swept. **Still open:** no real client takes leases over the wire yet, so
+      for every real client the answer is empty until `sync` leases what it
+      pushes; and a client that never reconnects is never told — the spec's
+      "some route other than reconnecting" is not built.
 - [x] Proof-of-possession responder (`Request::Prove` → `BlobStore::prove`,
       `nas-transfer/src/server.rs:36`; the client checks with `check_proof`
       before trusting a dedup claim, SPECS §4.5)

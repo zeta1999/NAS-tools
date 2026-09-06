@@ -805,10 +805,18 @@ The median case for a NAS is a laptop closed for weeks; revision 1 left this as 
 open question, which was not good enough.
 
 - Lease expiry defaults to **90 days**, not one epoch.
-- The peer must not sweep a holder's set until `expiry + grace`.
+- Two windows follow an upload and an expiry, and they are not the same one.
+  §6.2's `grace` (24 h) closes an upload race and has nothing to do with
+  absence. The **`notice`** window (default **30 days**) is how long a lapsed
+  lease keeps protecting: the peer must not sweep a holder's set until
+  `expiry + notice`. *(Revision 6: these were one field, which made the warning
+  below 24 hours wide after a 90-day absence.)*
 - A per-repo `retention_floor` is never swept without an authenticated `forget`.
-- **Warn before sweep:** a returning client within expiry receives the list of
-  blobs that *would* have been swept, so silent loss is not the failure mode.
+- **Warn before sweep:** on every sync a client is told which of the blobs it
+  leases are protected by nothing but a lapsed lease. Inside the notice window
+  that is the list a sweep *would* take, and the client can still renew; after
+  it, the list of what went. Silent loss is not the failure mode, and a warning
+  that only fires once the window has closed is an obituary, not a warning.
 
 ### 6.4 Quotas
 
@@ -1762,6 +1770,13 @@ scrutiny.
 | §5.6 roaming section | Unstable connectivity is the primary use case, not an edge case |
 | §7.2 poll-first liveness | Pubsub cannot be load-bearing against an untrusted peer; the doc face was needlessly coupled to an upstream gap |
 | §14 upstream work approved | `simple-network` transcript binding and constant-time pin compare to be fixed in place |
+
+### Revision 6
+
+| Change | Driver |
+|---|---|
+| §6.3 `notice` window (30 days) split from §6.2 `grace` (24 h) | One field served both, so the warn-before-sweep window was 24 hours wide after a 90-day absence |
+| §6.3 warning fires inside the window, on every sync | It fired only once the window had closed — after the deletion, which is an obituary, not a warning |
 
 ### Revision 5
 

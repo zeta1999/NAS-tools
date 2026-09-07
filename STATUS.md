@@ -205,7 +205,7 @@ TLC is green with its three sanity checks still failing as required.
 ## Not built
 
 M2: the object verbs `put`/`rm` — which need the key→object mapping the S3
-face brings, so they are reclassified M3 (§7.1) rather than pending here. **No assertion fails at `NAS_MILESTONE=M2`:** 57 pass, 0 fail, 33 pending.
+face brings, so they are reclassified M3 (§7.1) rather than pending here. **No assertion fails at `NAS_MILESTONE=M2`:** 58 pass, 0 fail, 33 pending.
 
 **The single-writer handoff (§5.1) is built.** `SlotHandoff` is signed by the
 *outgoing* writer and binds slot, sequence and both writers, so it authorises
@@ -475,6 +475,18 @@ against the device's own clock: it buys a human time to notice and compels
 nothing. Key separation is what defeats ransomware; the delay is a convention.
 `nas delete-request execute` accordingly refuses and names the missing step
 rather than pretending to delete.
+
+**Clients lease now.** `nas peer sync` ends its blob step by taking a lease on
+every address it holds (`TakeLease`, `MAX_RECORDS` per request) and prints
+`leases: N blobs leased for this subject, renewed by this sync`. A take is a
+union that stamps the holder's last-seen, so syncing inside the 90-day expiry
+is the renewal §6.3 asks for; a device with nothing local sends an empty take,
+which renews the subject without changing its set. Sync never releases — a
+second device of the same subject holds none of the first's blobs — release is
+§16.2's explicit act. The §6.3 warning is therefore real for a real client,
+printed after the renewal as what *was* at risk when the sync began. Cost: one
+round trip per 256 blobs per sync; the constant-size renewal (a signed §6.1
+checkpoint over the wire) is not built.
 
 Lease-based GC **has** a caller now: `Peer::sweep` plans with
 `nas_lease::plan_sweep` and deletes through `delete_blob`, so retention is

@@ -243,6 +243,26 @@ settled and the work that follows from them.
       100 addresses, where signing each address individually would cost
       334100 B, **39x more**. A LeaseCheckpoint is 5377 B whether it covers 100
       addresses or ten million. That is SPECS §3.8 and §6.1 in numbers.
+- [x] **`nas peer sync` leases what it holds, and renews by syncing.** Until
+      now no client took a lease over the wire: the peer owned leases and a
+      quota (SPECS §6.4), the sweep warned (§6.3), and every real client's
+      answer to both was empty because nothing had ever been leased. Sync now
+      ends its blob step with `TakeLease` over every local address, in
+      `MAX_RECORDS` (256) batches. A take is a union that stamps the holder's
+      last-seen, so one take per sync is both the first lease and the renewal,
+      and a device with nothing local sends an empty take, which renews
+      without changing the set (pinned at the peer:
+      `one_take_renews_the_holder_and_clears_the_warning` — lapsed, warned of
+      3, one empty take, warned of nothing, the sweep that would have ended
+      the window deletes nothing). Sync never releases: a second device of the
+      same subject holds none of the first's blobs, and releasing what is not
+      local would hand the sweep the namespace; release is §16.2's explicit
+      act. uc10 shows the line (`leases: 2 …`, `leases: 0 …` for the blob-less
+      second device) with unchanged exit codes. **Open:** renewal costs one
+      round trip per 256 blobs per sync — the constant-size renewal is a
+      signed §6.1 `LeaseCheckpoint` over the wire, not built; and a quota
+      refusal mid-way leaves the earlier batches leased, which sync reports
+      (`N of M blobs leased before the refusal`) rather than unwinds.
 - [x] **The warn-before-sweep window is only `grace` wide.** SPECS §6.3 says the
       peer must not sweep until `expiry + grace`, and a returning client inside
       that window is warned. With the defaults that is a **24-hour** warning
@@ -263,9 +283,9 @@ settled and the work that follows from them.
       first thing and prints what is at risk. The peer test named
       `..._and_is_warned` had never asserted a warning; it does now, and both
       UC07 drills probe just past `expiry + grace`, where the conflation
-      swept. **Still open:** no real client takes leases over the wire yet, so
-      for every real client the answer is empty until `sync` leases what it
-      pushes; and a client that never reconnects is never told — the spec's
+      swept. **Since closed:** `sync` now leases everything it holds (the
+      item above), so the answer is real for every client. **Still open:** a
+      client that never reconnects is never told — the spec's
       "some route other than reconnecting" is not built.
 - [x] Proof-of-possession responder (`Request::Prove` → `BlobStore::prove`,
       `nas-transfer/src/server.rs:36`; the client checks with `check_proof`

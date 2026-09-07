@@ -625,32 +625,17 @@ pub fn sync(ns: &str, o: SyncOpts<'_>) -> i32 {
     // ── Warn before sweep (SPECS §6.3) ──
     //
     // Asked first, before anything this sync does could change the answer.
-    // The peer names the blobs this device leases whose lease has lapsed:
-    // kept for now inside the notice window, gone once it closes. Reported,
-    // not acted on — what to renew is the user's call. (Today a client takes
-    // no leases over the wire at all, so this is empty for every real client;
-    // the route exists so that the day leases arrive, the warning is already
-    // on it.)
-    match call(&mut ch, &Request::SweepWarnings) {
-        Ok(Response::Addrs(at_risk)) => {
-            if !at_risk.is_empty() {
-                println!(
-                    "  !! {} blobs leased by this device are at risk of sweep: the lease has \
-                     lapsed and the peer deletes them when the notice window closes (SPECS §6.3)",
-                    at_risk.len()
-                );
-                for a in at_risk.iter().take(8) {
-                    println!("     {}", a.to_hex());
-                }
-                if at_risk.len() > 8 {
-                    println!("     … and {} more", at_risk.len() - 8);
-                }
-            }
-        }
+    // The peer names the blobs this subject leases whose lease has lapsed:
+    // kept for now inside the notice window, gone once it closes. The lease
+    // step below renews the subject, so this is what *was* at risk when the
+    // sync began — reported after the renewal, so the user learns what a
+    // longer absence would have cost.
+    let at_risk: Vec<Addr> = match call(&mut ch, &Request::SweepWarnings) {
+        Ok(Response::Addrs(a)) => a,
         Ok(Response::Error(m)) => return refused(format!("sweep warnings: {m}")),
         Ok(other) => return err(format!("unexpected reply to SweepWarnings: {other:?}")),
         Err(e) => return err(e),
-    }
+    };
 
     // ── Blobs ──
     let addrs = match blobs.addrs() {
@@ -710,6 +695,52 @@ pub fn sync(ns: &str, o: SyncOpts<'_>) -> i32 {
         "blobs: {pushed} pushed ({bytes_sent} B), {present} already held and proven, {} total",
         addrs.len()
     );
+
+    // ── Leases (SPECS §6) ──
+    //
+    // Every blob this device holds is now on the peer and proven. Lease all of
+    // them: `TakeLease` is a union that also stamps the holder's last-seen, so
+    // one take per sync is both the first lease and the renewal §6.3 asks of a
+    // returning client — a device that syncs within expiry never lets its
+    // leases lapse. A take with no addresses still stamps the holder, which
+    // is what a device with nothing local (a fresh second device) sends. The
+    // wire bounds one request to MAX_RECORDS addresses, so this costs one
+    // round trip per 256 blobs per sync; the constant-size renewal — a signed
+    // §6.1 checkpoint over the wire — is not built (TODO).
+    //
+    // Nothing is released here. A blob missing locally is not a blob the
+    // subject wants gone: a second device of the same subject holds none of
+    // the first device's blobs, and releasing on its behalf would hand the
+    // sweep the whole namespace. Release is the deletion flow's explicit act
+    // (SPECS §16.2), never a side effect of sync.
+    let batches: Vec<&[Addr]> = if addrs.is_empty() {
+        vec![&addrs[..]]
+    } else {
+        addrs.chunks(nas_transfer::MAX_RECORDS).collect()
+    };
+    let mut leased = 0usize;
+    for batch in batches {
+        match call(&mut ch, &Request::TakeLease(batch.to_vec())) {
+            Ok(Response::Ok) => leased += batch.len(),
+            Ok(Response::Error(m)) => {
+                return refused(format!(
+                    "lease: {m} ({leased} of {} blobs leased before the refusal)",
+                    addrs.len()
+                ))
+            }
+            Ok(other) => return err(format!("unexpected reply to TakeLease: {other:?}")),
+            Err(e) => return err(e),
+        }
+    }
+    println!("leases: {leased} blobs leased for this subject, renewed by this sync");
+    if !at_risk.is_empty() {
+        println!(
+            "  !! {} of this subject's leases had lapsed when this sync began and were at \
+             risk of sweep (SPECS §6.3); this sync renewed them — sync more often than the \
+             peer's lease expiry",
+            at_risk.len()
+        );
+    }
 
     // ── Head ──
     //

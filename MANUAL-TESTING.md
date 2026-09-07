@@ -735,6 +735,15 @@ Observed:
   addressed by BLAKE3 of the ciphertext, and no plaintext marker.
 - A second `nas peer sync` was a **no-op**: the peer reported every blob
   already held and the CAS on the slot refused nothing because nothing changed.
+- Every sync ends its blob step with `leases: N blobs leased for this subject,
+  renewed by this sync`: the client takes a lease on everything it holds, in
+  256-address batches, and a device with nothing local (uc10's second device,
+  `leases: 0`) sends an empty take, which renews the subject without changing
+  its set. Sync never releases — release belongs to the deletion flow (SPECS
+  §16.2). A subject whose lease had lapsed is told so after the renewal
+  (`!! … had lapsed when this sync began`); that line cannot be observed over
+  the socket without a 90-day wait, and is pinned at the peer
+  (`one_take_renews_the_holder_and_clears_the_warning`).
 - A sync with a **wrong `--peer-pub`** was refused at the handshake — the
   client never reached the point of sending a record, which is the property
   the pin exists for. A `--peer-pub` that is not exactly 32 bytes is rejected

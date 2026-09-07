@@ -3249,6 +3249,51 @@ mod lease_tests {
     }
 
     #[test]
+    fn one_take_renews_the_holder_and_clears_the_warning() {
+        // SPECS §6.3, the loop closed. `nas peer sync` renews by taking a
+        // lease on everything it holds — and a device with nothing local
+        // takes an empty one. Either take stamps the holder's last-seen, so
+        // a holder that was inside the notice window is warned of nothing
+        // afterwards, and the sweep that would have ended that window finds
+        // its leases intact.
+        let s = Scratch::new("renew");
+        let mut p = open(&s, u64::MAX);
+        let a = seed(&mut p, 3);
+        let h = holder_id("laptop");
+        p.take_lease(h, &a, now()).unwrap();
+        let policy = p.gc_policy;
+        let inside = Timestamp(now().secs() + policy.lease_expiry + policy.notice / 2);
+        assert_eq!(
+            p.sweep_warnings(&h, inside).unwrap().len(),
+            3,
+            "lapsed: warned"
+        );
+
+        // An empty take renews: the set is unchanged, the holder is seen.
+        p.take_lease(h, &[], inside).unwrap();
+        assert_eq!(
+            p.leases_of(&h).len(),
+            3,
+            "an empty take adds and drops nothing"
+        );
+        assert!(
+            p.sweep_warnings(&h, inside).unwrap().is_empty(),
+            "renewed: warned of nothing"
+        );
+
+        // The sweep the original window would have ended in deletes nothing:
+        // renewed at `inside`, the holder is far from expiry again.
+        let after = Timestamp(now().secs() + policy.lease_expiry + policy.notice + DAY);
+        let holders = p.holders();
+        let plan = p.sweep(&holders, &policy, after, false).unwrap();
+        assert!(plan.delete.is_empty(), "nothing lapsed: {:?}", plan.delete);
+        assert!(
+            a.iter().all(|x| p.has_blob(x)),
+            "and the data is still there"
+        );
+    }
+
+    #[test]
     fn the_holder_id_comes_from_the_subject_and_is_domain_separated() {
         assert_ne!(holder_id("laptop"), holder_id("phone"));
         assert_eq!(holder_id("laptop"), holder_id("laptop"));

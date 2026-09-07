@@ -18,7 +18,7 @@ sleep 1; head -1 $T/peer.log; head -1 $T/wit.log
 SYNC="$N peer sync demo --peer 127.0.0.1:$PP --peer-pub $T/peer/transport.pub"
 WIT="--witness 127.0.0.1:$WP --witness-pub $T/wit/transport.pub"
 step "device 1: sync #1 (seq 0) and #2 (seq 1), both witnessed"
-$SYNC $WIT | grep -E 'head|witness'; echo more > $T/src/b.txt; $N test roundtrip demo $T/src >/dev/null; $SYNC $WIT | grep -E 'head|witness'; echo "exit=${PIPESTATUS[0]}"
+$SYNC $WIT | grep -E 'head|witness|leases'; echo more > $T/src/b.txt; $N test roundtrip demo $T/src >/dev/null; $SYNC $WIT | grep -E 'head|witness'; echo "exit=${PIPESTATUS[0]}"
 step "device 2 joins: copy config+wraps, open by passphrase"
 mkdir -p $T/home2/demo; cp -R $T/home/demo/config $T/home/demo/wraps $T/home2/demo/; NAS_HOME=$T/home2 $N ns open demo | head -1
 step "device 2 against the HONEST peer, with witness (expect: accept seq 1, pin it, witness it)"

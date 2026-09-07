@@ -812,6 +812,12 @@ open question, which was not good enough.
   `expiry + notice`. *(Revision 6: these were one field, which made the warning
   below 24 hours wide after a 90-day absence.)*
 - A per-repo `retention_floor` is never swept without an authenticated `forget`.
+- **Renewal is a side effect of sync.** On every sync a client takes a lease on
+  everything it holds. A take is a union that stamps the holder's last-seen, so
+  a take with no addresses renews without changing the set — what a device
+  with nothing local sends. Sync never releases: a second device of the same
+  subject holds none of the first's blobs, and releasing what is not local
+  would hand the sweep the namespace. Release is §16.2's explicit act.
 - **Warn before sweep:** on every sync a client is told which of the blobs it
   leases are protected by nothing but a lapsed lease. Inside the notice window
   that is the list a sweep *would* take, and the client can still renew; after

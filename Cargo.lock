@@ -566,6 +566,7 @@ name = "nas-cli"
 version = "0.1.0"
 dependencies = [
  "blake3",
+ "libc",
  "nas-core",
  "nas-crypto",
  "nas-delete",
@@ -575,6 +576,7 @@ dependencies = [
  "nas-store",
  "nas-transfer",
  "nas-vault",
+ "zeroize",
 ]
 
 [[package]]

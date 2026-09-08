@@ -10,6 +10,7 @@ mod attack;
 mod exit;
 mod peercmd;
 mod peerscan;
+mod prompt;
 mod repo;
 mod roaming;
 mod testcmds;
@@ -26,7 +27,9 @@ nas — NAS-tools command line
                        [--object-lock governance|compliance|legal-hold --retention 7y]
                        [--device <subject>]   under object-lock, the everyday
                                               device, granted APPEND ONLY
+                       [--passphrase <pw>]    passphrase mode only; see below
   nas ns list
+  nas ns open <ns> [--passphrase <pw>]
   nas ns export-pub <ns> <out-dir>       keys a peer operator needs to admit <ns>
   nas acl grant|revoke|check <ns> --subject <s> --right <r>
   nas acl list <ns>
@@ -43,6 +46,12 @@ nas — NAS-tools command line
   nas test dedup-ratio <ns> --shared <pct> --max-transfer <pct>
   nas test confirmation-attack <ns> --with-cs|--without-cs
   nas test attack <kind>|all [--with-witness-node] [--cold-start]
+
+Passphrase mode takes the passphrase from --passphrase, else $NAS_PASSPHRASE,
+else — only when stdin is a terminal — an unechoed prompt: twice on create, so
+a typo in the one thing that opens the namespace is caught while it can still
+be retyped, and once on open. With no terminal and neither of the other two the
+command refuses; it never invents one. An empty passphrase is refused too.
 
 Exit codes: 0 ok, 1 error, 2 refused by policy, 3 unimplemented.
 ";
@@ -326,10 +335,31 @@ fn ns(args: &[String]) -> i32 {
             // subject the operator actually binds a key to, and inventing one
             // would make the grant decorative.
             let everyday = opt(args, "--device").unwrap_or("default");
-            let passphrase = repo::passphrase_from(opt(args, "--passphrase"));
+            let mut passphrase = repo::passphrase_from(opt(args, "--passphrase"));
+            // Resolved here rather than inside `Repo::create`, which has
+            // already made directories by the time it looks: a prompt the
+            // operator abandons must not leave half a namespace behind.
             if mode == Mode::Passphrase && passphrase.is_none() {
-                eprintln!("passphrase mode needs --passphrase or $NAS_PASSPHRASE");
-                return exit::ERROR;
+                match prompt::passphrase(prompt::Ask::Twice) {
+                    Ok(Some(pw)) => passphrase = Some(pw),
+                    // No terminal — the refusal that was here before there was
+                    // anything to prompt on.
+                    Ok(None) => {
+                        eprintln!("{}", prompt::NO_TERMINAL);
+                        return exit::ERROR;
+                    }
+                    // Nothing typed, or the two entries differed. A decision
+                    // that went against the caller, which is what REFUSED is
+                    // for; a malformed invocation it is not.
+                    Err(e @ prompt::Error::Refused(_)) => {
+                        eprintln!("refused: {e}");
+                        return exit::REFUSED;
+                    }
+                    Err(e) => {
+                        eprintln!("error: {e}");
+                        return exit::ERROR;
+                    }
+                }
             }
             match Repo::create(name, mode, KeyScheme::Convergent, padding, passphrase, lock) {
                 Ok(r) => {

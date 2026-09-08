@@ -19,3 +19,8 @@ nas-slots = { path = "../nas-slots" }
 nas-store = { path = "../nas-store" }
 nas-transfer = { path = "../nas-transfer" }
 nas-vault = { path = "../nas-vault" }
+# Direct, not incidental: turning terminal echo off for the passphrase prompt
+# is a tcgetattr/tcsetattr pair and nothing else. A crate whose whole job is
+# reading a password would be a bigger dependency for a smaller reason.
+libc = "0.2"
+zeroize = "1"

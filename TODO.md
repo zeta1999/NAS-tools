@@ -50,7 +50,7 @@ settled and the work that follows from them.
 ## Formal
 
 - [x] `formal/lean/NasVerify/Transcript.lean` — VERIFIED, 3 theorems
-- [x] `formal/lean/NasVerify/Padding.lean` — VERIFIED, 10 theorems. Models the
+- [x] `formal/lean/NasVerify/Padding.lean` — VERIFIED, 11 theorems. Models the
       *ladder*, closing the gap where `Nat` truncation hid a `usize` underflow,
       and (after the M0 review) the reader's strict check: `unpadStrict_padLadder`
       proves no honest output is rejected, `unpadStrict_rejects_other_classes`
@@ -138,9 +138,11 @@ settled and the work that follows from them.
 - [x] **`transit-only` mode** (SPECS §2.2.3): plaintext at rest, per-tenant
       salted addressing, visible filenames, directory manifests stored
       unsealed. UC01 is green but for the two peer-enforced ACL assertions.
-- [ ] Interactive passphrase prompt. There is none: the CLI takes
-      `--passphrase` or `$NAS_PASSPHRASE` and refuses otherwise, because a
-      prompt that silently fell back to a default would be worse than none.
+- [x] Interactive passphrase prompt (`nas-cli/src/prompt.rs`): `--passphrase`,
+      then `$NAS_PASSPHRASE`, then a person at the controlling terminal. With
+      no terminal the command is refused (`NO_TERMINAL`), never defaulted —
+      a prompt that silently fell back to a default would be worse than none.
+      Namespace creation asks twice and refuses a mismatch or an empty line.
 - [x] **The root manifest key `rk_v` is built** (SPECS §3.1).
       `nas_crypto::root_key` derives `derive_key("nas-tools/root/v1",
       root_secret ‖ le64(seq))` into its own `RootKey` type, which only
@@ -418,7 +420,13 @@ settled and the work that follows from them.
 ## Cross-cutting
 
 - [ ] `ci.sh`: fmt, clippy `-D warnings`, tests; macOS + linux arm64/amd64
-- [ ] Automated "no plaintext on the peer" grep over blobs, slots and leases
+- [x] Automated "no plaintext on the peer" scan: `nas test peer-no-plaintext
+      <ns>` (`nas-cli/src/peerscan.rs`) walks the whole peer root — blobs,
+      slots, leases, witnesses, everything under it — for the fixture's
+      content markers, the fixture file names, and a planted canary.
+      `check_corpus` first confirms the fixture tree really carries the
+      marker, so a stale fixture is an error rather than a green. UC02 and
+      UC03 assert it; UC01 asserts the inverse (`peer-holds-plaintext`).
 - [x] User manual must state plainly: fork detection is not prevention; a blocked
       peer keeps what it already had; a revoked device reads old data until rewritten
       — `MANUAL.md` (§1 "what you're buying", §5 forks, §6 revocation, §8 limits)

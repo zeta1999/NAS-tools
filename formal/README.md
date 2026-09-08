@@ -5,11 +5,13 @@ Mirrors the layout of `../../seal-dao-public/formal/`.
 ## Status, stated honestly
 
 Run `./check.sh` — it fetches `tla2tools.jar` if absent and gates everything.
+The default gate is MaxSeq=2 and takes seconds; `DEEP=1 ./check.sh` is MaxSeq=3
+and takes ~11 minutes on a laptop, almost all of it in the ForkAt=1 run.
 
 | Artefact | Tool | State |
 |---|---|---|
 | `lean/NasVerify/Transcript.lean` | Lean 4.28 | **VERIFIED** — 3 theorems, 0 admitted, axioms clean |
-| `lean/NasVerify/Padding.lean` | Lean 4.28 | **VERIFIED** — 10 theorems, 0 admitted, axioms clean. Models the *ladder* (closing the gap where `Nat` truncation hid a `usize` underflow) and the reader's strict check (closing the class-selection covert channel the M0 review found) |
+| `lean/NasVerify/Padding.lean` | Lean 4.28 | **VERIFIED** — 11 theorems, 0 admitted, axioms clean. Models the *ladder* (closing the gap where `Nat` truncation hid a `usize` underflow) and the reader's strict check (closing the class-selection covert channel the M0 review found) |
 | `tlaplus/SlotConsistency.tla` | TLA+ / TLC | **MODEL-CHECKED** — but note it constrains §5, which is **M2** code; it is assurance about the design, not about anything shipped in M0. `ForkAt` (the sequence number at which branch "b" diverges) is varied over every admissible point, `1..MaxSeq`, not fixed at one value — see [Varying `ForkAt`](#varying-forkat) below. CI gate, MaxSeq=2: ForkAt=1 337,817 distinct states, depth 25 (~3 s); ForkAt=2 38,709 distinct states, depth 20 (~1 s). Deep gate (`DEEP=1`), MaxSeq=3: ForkAt=1 38,366,601 distinct states from 570.7 M generated, depth 35 (~10 min); ForkAt=2 4,699,837 distinct states from 60.1 M generated, depth 30 (~1 min); ForkAt=3 443,429 distinct states, depth 25 (~7 s). 4 invariants + 1 action property hold at every (MaxSeq, ForkAt) pair. |
 | sanity checks | TLA+ / TLC | **3 required counterexamples found, at both ForkAt=1 and ForkAt=2** — the model is not vacuous at either end of the admissible range |
 

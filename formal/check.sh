@@ -85,23 +85,43 @@ fi
 pushd tlaplus >/dev/null
 run() { java -Xmx2g -XX:+UseParallelGC -cp tla2tools.jar tlc2.TLC -workers 4 -nowarning -config "$1" SlotConsistency 2>&1; }
 
-CFG=MC_small.cfg; BOUND="MaxSeq=2"
-if [ "${DEEP:-0}" = "1" ]; then CFG=MC_full.cfg; BOUND="MaxSeq=3, deep"; fi
-out=$(run $CFG)
-if echo "$out" | grep -q "No error has been found"; then
-  n=$(echo "$out" | grep -oE "[0-9]+ distinct states" | head -1)
-  say "SlotConsistency invariants ($BOUND)" "ok — $n"
+# ForkAt ranges over every admissible divergence point, 1..MaxSeq: ForkAt=1 is
+# a fork at genesis (branches share no prefix at all — see SlotConsistency.tla
+# IsAncestor), ForkAt=MaxSeq is the latest possible fork (maximal shared
+# prefix). Both ends are meaningful, not degenerate, so both are gated.
+if [ "${DEEP:-0}" = "1" ]; then
+  MAXSEQ=3
+  FORK_CFGS="1:MC_full_fork1.cfg 2:MC_full.cfg 3:MC_full_fork3.cfg"
 else
-  say "SlotConsistency invariants ($BOUND)" "FAIL"; echo "$out" | tail -20; fail=1
+  MAXSEQ=2
+  FORK_CFGS="1:MC_small_fork1.cfg 2:MC_small.cfg"
 fi
 
-for inv in NeverForks NeverAlarms ForkAlwaysDetected; do
-  out=$(run "MC_$inv.cfg")
-  if echo "$out" | grep -q "Invariant $inv is violated"; then
-    say "sanity: $inv" "violated as required"
+for entry in $FORK_CFGS; do
+  forkat=${entry%%:*}
+  cfg=${entry#*:}
+  label="SlotConsistency invariants (MaxSeq=$MAXSEQ, ForkAt=$forkat)"
+  out=$(run "$cfg")
+  if echo "$out" | grep -q "No error has been found"; then
+    n=$(echo "$out" | grep -oE "[0-9]+ distinct states" | head -1)
+    say "$label" "ok — $n"
   else
-    say "sanity: $inv" "FAIL — model is VACUOUS"; fail=1
+    say "$label" "FAIL"; echo "$out" | tail -60; fail=1
   fi
+done
+
+for inv in NeverForks NeverAlarms ForkAlwaysDetected; do
+  for entry in "1:MC_${inv}_fork1.cfg" "2:MC_${inv}.cfg"; do
+    forkat=${entry%%:*}
+    cfg=${entry#*:}
+    label="sanity: $inv (MaxSeq=2, ForkAt=$forkat)"
+    out=$(run "$cfg")
+    if echo "$out" | grep -q "Invariant $inv is violated"; then
+      say "$label" "violated as required"
+    else
+      say "$label" "FAIL — model is VACUOUS"; fail=1
+    fi
+  done
 done
 popd >/dev/null
 

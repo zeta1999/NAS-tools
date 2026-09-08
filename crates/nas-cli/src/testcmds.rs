@@ -7,6 +7,7 @@
 //! pending rather than as a passing security control.
 
 use crate::exit;
+use crate::peerscan;
 use crate::repo::Repo;
 use nas_core::{Addr, PaddingProfile};
 use nas_crypto::{seal_chunk, ConvergenceSecret};
@@ -385,55 +386,136 @@ pub fn argon2_params(ns: &str, min_mem: &str, min_time: u32) -> i32 {
     }
 }
 
-/// `nas test peer-no-plaintext <ns>` — SPECS §1, §12.2.
+/// Plant both markers on the peer through the **real** write pipeline, then
+/// walk the peer's entire on-disk root looking for them.
 ///
-/// Writes a canary through the real pipeline, then scans every stored blob for
-/// it. In `transit-only` the expectation is inverted (§12.2), which is why the
-/// mode is consulted rather than assumed.
+/// Two payloads, because they travel different code paths: the fixture corpus
+/// goes through [`TreeStore::write_dir`] (which is what puts file *names* into
+/// directory manifests, §4.4), and the canary goes through [`ObjectWriter`]
+/// (chunk, pad, seal) on bytes the corpus does not contain.
+fn plant_and_scan(repo: &Repo) -> Result<peerscan::Scan, String> {
+    let blobs = repo.blobs().map_err(|e| e.to_string())?;
+
+    let tree = fixture_tree();
+    if !tree.is_dir() {
+        return Err(format!(
+            "fixture corpus missing at {} — run tests/usecases/fixtures/make.sh. \
+             Without it there is no marker to look for and no name to look for, \
+             and a scan that finds nothing because nothing was planted proves nothing",
+            tree.display()
+        ));
+    }
+    // And the corpus has to carry what the scan will look for, or the scan
+    // finds nothing because nothing was planted and calls the peer clean.
+    peerscan::check_corpus(&tree)?;
+
+    let ts = TreeStore::new(&blobs, repo.sealer(), repo.padding);
+    ts.write_dir(&repo.dir_root(), &tree)
+        .map_err(|e| e.to_string())?;
+
+    let mut data = bytes(300 << 10, "nas-tools/test/canary");
+    let c = peerscan::CANARY.as_bytes();
+    data.splice(4096..4096 + c.len(), c.iter().copied());
+    let w = ObjectWriter::with_defaults(&blobs, repo.sealer(), repo.padding)
+        .map_err(|e| e.to_string())?;
+    w.write(Kind::File, &data[..]).map_err(|e| e.to_string())?;
+
+    let root = repo.blobs_root();
+    peerscan::scan(&root).map_err(|e| format!("scanning {}: {e}", root.display()))
+}
+
+/// `nas test peer-no-plaintext <ns>` — SPECS §1, §12.2, §19.3.
+///
+/// The negative assertion (UC02, UC03). See [`peer_plaintext`].
 pub fn peer_no_plaintext(ns: &str) -> i32 {
+    peer_plaintext(ns)
+}
+
+/// `nas test peer-holds-plaintext <ns>` — SPECS §19.1, §12.2.
+///
+/// The **positive control** (UC01, `transit-only`), and deliberately the same
+/// code as the negative one. See [`peer_plaintext`].
+pub fn peer_holds_plaintext(ns: &str) -> i32 {
+    peer_plaintext(ns)
+}
+
+/// One scan, one expectation, flipped by the mode.
+///
+/// This is a single function on purpose. The negative assertion — "the peer
+/// holds no plaintext" — is the kind that passes for free if the scanner
+/// stops working: a scanner that reads nothing, looks in the wrong place, or
+/// searches for a string nobody planted reports a clean peer every time.
+/// `transit-only` is the control that rules that out, because there the *same*
+/// walk over the *same* root looking for the *same* bytes has to come back
+/// with something. Two implementations could drift until only one of them
+/// worked; one cannot.
+fn peer_plaintext(ns: &str) -> i32 {
     let repo = match Repo::open_with(ns, crate::repo::passphrase_from(None)) {
         Ok(r) => r,
         Err(e) => return err(format!("namespace {ns}: {e}")),
     };
-    let blobs = match repo.blobs() {
-        Ok(b) => b,
+    let scan = match plant_and_scan(&repo) {
+        Ok(s) => s,
         Err(e) => return err(e),
     };
-    let needle = b"CANARY-PLAINTEXT-MUST-NOT-APPEAR";
-    let mut data = bytes(300 << 10, "nas-tools/test/canary");
-    data.splice(4096..4096 + needle.len(), needle.iter().copied());
+    let root = repo.blobs_root();
 
-    let w = match ObjectWriter::with_defaults(&blobs, repo.sealer(), repo.padding) {
-        Ok(w) => w,
-        Err(e) => return err(e),
-    };
-    if let Err(e) = w.write(Kind::File, &data[..]) {
-        return err(e);
+    if scan.files == 0 {
+        return err(format!(
+            "nothing under {} — the write planted no file, so the scan asserts nothing",
+            root.display()
+        ));
+    }
+    if !scan.not_read.is_empty() {
+        return err(format!(
+            "{} entr(ies) under {} were not read ({}); \"no plaintext on the peer\" \
+             is not a claim anyone can make about bytes nobody looked at",
+            scan.not_read.len(),
+            root.display(),
+            scan.list_not_read(3)
+        ));
     }
 
-    let mut found = 0usize;
-    for a in blobs.addrs().unwrap_or_default() {
-        if let Ok(ct) = blobs.get(&a) {
-            if ct.windows(needle.len()).any(|x| x == needle) {
-                found += 1;
-            }
+    let where_ = format!(
+        "{} file(s) in {} director(ies), {} B under {}",
+        scan.files,
+        scan.dirs,
+        scan.bytes,
+        root.display()
+    );
+
+    if repo.mode.peer_reads_plaintext() {
+        // SPECS §2.2.3: readable content and readable names are correct here.
+        // What is asserted is that the scanner FOUND them.
+        if scan.content_hits() == 0 {
+            return err(format!(
+                "{:?} must store readable content; scanned {where_} and found no marker — \
+                 either nothing was stored or the scan is blind, and a blind scan is what \
+                 makes every other namespace look clean",
+                repo.mode
+            ));
         }
-    }
-    let expect_plaintext = repo.mode.peer_reads_plaintext();
-    match (found > 0, expect_plaintext) {
-        (false, false) => {
-            println!("no plaintext canary in any blob ({:?})", repo.mode);
-            exit::OK
-        }
-        (true, true) => {
-            println!("plaintext present as {:?} requires", repo.mode);
-            exit::OK
-        }
-        (true, false) => err(format!("LEAK: canary found in {found} blob(s)")),
-        (false, true) => err(format!(
-            "{:?} should store plaintext and does not",
+        println!(
+            "scanned {where_}: content marker in {} place(s), fixture filename in {} — \
+             readable, as {:?} requires",
+            scan.content_hits(),
+            scan.name_hits(),
             repo.mode
-        )),
+        );
+        exit::OK
+    } else if scan.findings.is_empty() {
+        println!(
+            "scanned {where_}: no content marker, and no fixture filename in any file's \
+             bytes or in any path component ({:?})",
+            repo.mode
+        );
+        exit::OK
+    } else {
+        err(format!(
+            "LEAK in a {:?} namespace — {}",
+            repo.mode,
+            scan.report(5)
+        ))
     }
 }
 
@@ -711,46 +793,15 @@ fn fixture_tree() -> PathBuf {
     PathBuf::from("tests/usecases/fixtures/tree")
 }
 
-/// `nas test peer-holds-plaintext <ns>` — SPECS §19.1, §12.2.
-///
-/// The inverted assertion: here readable content on the peer is **correct**.
-/// One test with an expectation that flips on the mode, rather than a test that
-/// quietly skips the mode it cannot handle.
-pub fn peer_holds_plaintext(ns: &str) -> i32 {
-    let repo = match Repo::open_with(ns, crate::repo::passphrase_from(None)) {
-        Ok(r) => r,
-        Err(e) => return err(format!("namespace {ns}: {e}")),
-    };
-    let blobs = match stored_blobs_of(&repo, &fixture_tree()) {
-        Ok(b) => b,
-        Err(e) => return err(e),
-    };
-    let needle = b"# work tree fixture";
-    let readable = blobs
-        .iter()
-        .any(|b| b.windows(needle.len()).any(|w| w == needle));
-    if repo.mode.peer_reads_plaintext() {
-        if readable {
-            println!("peer stores readable content, as {:?} requires", repo.mode);
-            exit::OK
-        } else {
-            err(format!("{:?} must store plaintext and does not", repo.mode))
-        }
-    } else if readable {
-        err(format!(
-            "LEAK: readable content in a {:?} namespace",
-            repo.mode
-        ))
-    } else {
-        println!("no readable content ({:?})", repo.mode);
-        exit::OK
-    }
-}
-
 /// `nas test peer-names-visible <ns>` and `nas test peer-names-encrypted <ns>`.
 ///
 /// One implementation, because they are the same question asked of two modes,
 /// and `expect_visible` says which answer is correct.
+///
+/// Blob bytes only, and narrower than [`peer_no_plaintext`] on purpose: this
+/// one asks what the *manifests* say, where the whole-root walk asks what the
+/// peer holds anywhere. The names come from [`peerscan::FIXTURE_NAMES`] so
+/// there is one list, not two that can drift apart.
 pub fn peer_names(ns: &str, expect_visible: bool) -> i32 {
     let repo = match Repo::open_with(ns, crate::repo::passphrase_from(None)) {
         Ok(r) => r,
@@ -760,10 +811,12 @@ pub fn peer_names(ns: &str, expect_visible: bool) -> i32 {
         Ok(b) => b,
         Err(e) => return err(e),
     };
-    let name = b"copy-of-lib.rs";
-    let visible = blobs
-        .iter()
-        .any(|b| b.windows(name.len()).any(|w| w == name));
+    let visible = peerscan::FIXTURE_NAMES.iter().any(|n| {
+        let name = n.as_bytes();
+        blobs
+            .iter()
+            .any(|b| b.len() >= name.len() && b.windows(name.len()).any(|w| w == name))
+    });
     match (visible, expect_visible) {
         (true, true) => {
             println!(

@@ -28,5 +28,13 @@ gen 70000   seed-guide > "$out/docs/guide.txt"
 gen 300     seed-hid   > "$out/.hidden/config"
 # A duplicate of an existing file, so intra-tree dedup is exercised too.
 cp "$out/src/lib.rs" "$out/docs/copy-of-lib.rs"
+# A file whose NAME is the secret. Everything else here is named the way a
+# source tree is named -- README.md, main.rs, config, tiny.txt -- and a generic
+# name is not evidence: `config` is also what the namespace's own plaintext
+# configuration file is called, so a "no filename on the peer" check built on
+# it would be red on every honest run. `copy-of-lib.rs` above and this one are
+# the two that cannot collide with anything the peer legitimately writes, and
+# they are the set nas-cli's peerscan module looks for.
+gen 900 seed-minutes > "$out/docs/q3-board-minutes-CONFIDENTIAL.md"
 
 echo "fixture built: $(find "$out" -type f | wc -l | tr -d ' ') files, $(du -sk "$out" | cut -f1) KiB"

@@ -476,6 +476,26 @@ nothing. Key separation is what defeats ransomware; the delay is a convention.
 `nas delete-request execute` accordingly refuses and names the missing step
 rather than pretending to delete.
 
+**The root manifest is sealed under `rk_v` (SPECS §3.1).** Until now the slot
+record's `root` pointed straight at the tree's directory manifest and its
+`root_nonce` was random bytes nothing read. `nas peer sync` now publishes a
+`RootManifest { tree, generation }` sealed under
+`derive_key("nas-tools/root/v1", root_secret ‖ le64(seq))` — one key per
+sequence — with a fresh random nonce that goes into the signed slot record
+rather than into the blob, and AAD binding slot id and sequence. A reader
+verifies the record first, then fetches the root, checks its hash and opens it
+with the nonce the writer signed; a peer that serves the record but not the
+blob it points at is refused as withholding (§5.3), where a client that
+trusted the record alone would hold a signed pointer to nothing. `RootKey` is
+its own type so the general `seal` cannot take it and `seal_root` is the only
+shape — the one that hands back the nonce the record must carry.
+`transit-only` stores the root unsealed with a zero nonce, as it stores every
+manifest. Drilled: uc10's last step restarts the peer `--hostile withhold`
+against a brand-new device 3, which is now refused at the head — `peer serves
+head seq 1 but not the root manifest it points at … a signed pointer to
+nothing is withholding` — where the same step used to exit 0 (MANUAL-TESTING
+§10).
+
 **Clients lease now.** `nas peer sync` ends its blob step by taking a lease on
 every address it holds (`TakeLease`, `MAX_RECORDS` per request) and prints
 `leases: N blobs leased for this subject, renewed by this sync`. A take is a

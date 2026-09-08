@@ -101,8 +101,9 @@ pub const DIR_MANIFEST: &str = "nas-tools/dir/manifest/v1";
 /// the wrong one would encrypt every root version under a single key, which is
 /// exactly the "may it see two plaintexts" hazard §3.1 exists to prevent.
 ///
-/// Unused until the root slot lands in M1; declared here so the next person to
-/// need it does not reach for `NS_ROOT` instead.
+/// Used by `keys::root_key`, the one place that mixes in `seq`; declared
+/// beside `NS_ROOT` so the next person to need it does not reach for the
+/// wrong one.
 pub const ROOT_MANIFEST: &str = "nas-tools/root/v1";
 
 /// Namespace root secret from a passphrase-mode DEK (SPECS §2.2.2).

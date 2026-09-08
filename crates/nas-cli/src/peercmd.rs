@@ -44,9 +44,8 @@ use nas_peer::{Acl, Hostility, Peer, Right, MAX_CHECKPOINTS_PER_SLOT};
 use nas_slots::{
     is_checkpoint_seq, plan_walk, verify_chain_with_handoffs, verify_skip_chain, Checkpoint,
     Regime, Roster, SlotHandoff, SlotId, SlotRecord, Walk, WalkPlan, Witness, RETAIN_N,
-    ROOT_NONCE_LEN,
 };
-use nas_store::{Addressing, BlobStore};
+use nas_store::{Addressing, BlobStore, RootManifest};
 use nas_transfer::{transport_identity, Channel, Request, Response};
 use std::collections::BTreeMap;
 use std::fs;
@@ -607,6 +606,51 @@ fn read_pin(repo: &Repo) -> Option<Pin> {
     Some(Pin { seq, record_hash })
 }
 
+/// What became of one blob offered to the peer.
+enum Pushed {
+    /// Already held — and proven, not merely claimed (SPECS §4.5).
+    Present,
+    /// Uploaded; the byte count is what went over the wire.
+    Sent(usize),
+}
+
+/// Offer one blob: make the peer prove it if it claims to hold it, upload it
+/// if not. `Err` is the exit code, already reported on stderr.
+fn push_blob(ch: &mut Channel, addr: &Addr, ct: &[u8]) -> Result<Pushed, i32> {
+    match call(ch, &Request::HasBlob(*addr)) {
+        Ok(Response::Bool(true)) => {
+            // SPECS §4.5: "I have it" is a claim. Make the peer prove it
+            // before trusting the claim enough to skip the upload.
+            let nonce: [u8; 32] = nas_crypto::random::array().map_err(err)?;
+            match call(ch, &Request::Prove { addr: *addr, nonce }) {
+                Ok(Response::Proof(p)) if BlobStore::check_proof(ct, &nonce, &p) => {
+                    Ok(Pushed::Present)
+                }
+                Ok(Response::Proof(_)) | Ok(Response::Error(_)) => Err(refused(format!(
+                    "peer claims to hold {} but cannot prove it (dedup lie, SPECS §4.5)",
+                    addr.to_hex()
+                ))),
+                Ok(other) => Err(err(format!("unexpected reply to Prove: {other:?}"))),
+                Err(e) => Err(err(e)),
+            }
+        }
+        Ok(Response::Bool(false)) => match call(ch, &Request::PutBlob(ct.to_vec())) {
+            Ok(Response::Stored(a)) if a == *addr => Ok(Pushed::Sent(ct.len())),
+            Ok(Response::Stored(a)) => Err(refused(format!(
+                "peer stored {} under {} — not our bytes",
+                addr.to_hex(),
+                a.to_hex()
+            ))),
+            Ok(Response::Error(m)) => Err(refused(format!("put {}: {m}", addr.to_hex()))),
+            Ok(other) => Err(err(format!("unexpected reply to PutBlob: {other:?}"))),
+            Err(e) => Err(err(e)),
+        },
+        Ok(Response::Error(m)) => Err(refused(format!("has {}: {m}", addr.to_hex()))),
+        Ok(other) => Err(err(format!("unexpected reply to HasBlob: {other:?}"))),
+        Err(e) => Err(err(e)),
+    }
+}
+
 /// `nas peer sync <ns> --peer <host:port> --peer-pub <file>`
 pub fn sync(ns: &str, o: SyncOpts<'_>) -> i32 {
     let repo = match Repo::open_with(ns, o.passphrase) {
@@ -648,47 +692,13 @@ pub fn sync(ns: &str, o: SyncOpts<'_>) -> i32 {
             Ok(b) => b,
             Err(e) => return err(format!("{}: {e}", addr.to_hex())),
         };
-        match call(&mut ch, &Request::HasBlob(*addr)) {
-            Ok(Response::Bool(true)) => {
-                // SPECS §4.5: "I have it" is a claim. Make the peer prove it
-                // before trusting the claim enough to skip the upload.
-                let nonce: [u8; 32] = match nas_crypto::random::array() {
-                    Ok(n) => n,
-                    Err(e) => return err(e),
-                };
-                match call(&mut ch, &Request::Prove { addr: *addr, nonce }) {
-                    Ok(Response::Proof(p)) if BlobStore::check_proof(&ct, &nonce, &p) => {
-                        present += 1;
-                    }
-                    Ok(Response::Proof(_)) | Ok(Response::Error(_)) => {
-                        return refused(format!(
-                            "peer claims to hold {} but cannot prove it (dedup lie, SPECS §4.5)",
-                            addr.to_hex()
-                        ));
-                    }
-                    Ok(other) => return err(format!("unexpected reply to Prove: {other:?}")),
-                    Err(e) => return err(e),
-                }
+        match push_blob(&mut ch, addr, &ct) {
+            Ok(Pushed::Present) => present += 1,
+            Ok(Pushed::Sent(n)) => {
+                pushed += 1;
+                bytes_sent += n;
             }
-            Ok(Response::Bool(false)) => match call(&mut ch, &Request::PutBlob(ct.clone())) {
-                Ok(Response::Stored(a)) if a == *addr => {
-                    pushed += 1;
-                    bytes_sent += ct.len();
-                }
-                Ok(Response::Stored(a)) => {
-                    return refused(format!(
-                        "peer stored {} under {} — not our bytes",
-                        addr.to_hex(),
-                        a.to_hex()
-                    ));
-                }
-                Ok(Response::Error(m)) => return refused(format!("put {}: {m}", addr.to_hex())),
-                Ok(other) => return err(format!("unexpected reply to PutBlob: {other:?}")),
-                Err(e) => return err(e),
-            },
-            Ok(Response::Error(m)) => return refused(format!("has {}: {m}", addr.to_hex())),
-            Ok(other) => return err(format!("unexpected reply to HasBlob: {other:?}")),
-            Err(e) => return err(e),
+            Err(code) => return code,
         }
     }
     println!(
@@ -1278,21 +1288,71 @@ pub fn sync(ns: &str, o: SyncOpts<'_>) -> i32 {
         );
     }
 
+    // ── Root manifest (SPECS §3.1, `rk_v`) ──
+    //
+    // The record is verified; now the object it points at. `root` is the
+    // address of a root manifest sealed under `rk_seq` — a key this sequence
+    // alone has — with the nonce the record carries under its signature, and
+    // only that pair opens it. So this is where a head this namespace signed
+    // is checked to *be* this namespace's root, and where a peer that serves
+    // the record but not the blob is caught: a reader that trusted the record
+    // alone would hold a signed pointer to nothing.
+    let served_root = match &served {
+        None => None,
+        Some(h) => {
+            let bytes = match call(&mut ch, &Request::GetBlob(h.root)) {
+                Ok(Response::Blob(b)) => b,
+                Ok(Response::Error(m)) => {
+                    return refused(format!(
+                        "peer serves head seq {} but not the root manifest it points at ({}): \
+                         {m} — a signed pointer to nothing is withholding (SPECS §5.3)",
+                        h.seq,
+                        h.root.to_hex()
+                    ))
+                }
+                Ok(other) => return err(format!("unexpected reply to GetBlob: {other:?}")),
+                Err(e) => return err(e),
+            };
+            if !blobs.addressing().verifies(&h.root, &bytes) {
+                return refused(format!(
+                    "peer served bytes for {} that do not hash to it",
+                    h.root.to_hex()
+                ));
+            }
+            match repo.open_root(slot.as_bytes(), h.seq, &h.root_nonce, &bytes) {
+                Ok(r) => Some(r),
+                Err(e) => return refused(e),
+            }
+        }
+    };
+
     // `None` means there is nothing to publish (the peer already serves this
     // HEAD, or there is no local HEAD); `Some` is the next record to publish.
     let next = match &served {
         None => root.map(|r| (0, [0u8; 32], r)),
-        Some(h) => match root {
-            Some(r) if h.root == r => {
+        Some(h) => match (root, &served_root) {
+            (Some(r), Some(sr)) if sr.tree == r => {
                 println!(
-                    "head: seq {} already points at {}; up to date",
+                    "head: seq {} already points at tree {} (root manifest {}); up to date",
                     h.seq,
-                    r.to_hex()
+                    r.to_hex(),
+                    h.root.to_hex()
                 );
                 None
             }
-            Some(r) => Some((h.seq + 1, h.record_hash(), r)),
-            None => {
+            (Some(r), _) => Some((h.seq + 1, h.record_hash(), r)),
+            (None, Some(sr)) => {
+                println!(
+                    "head: peer serves seq {} -> root manifest {} (tree {}, generation {}); \
+                     nothing local to publish",
+                    h.seq,
+                    h.root.to_hex(),
+                    sr.tree.to_hex(),
+                    sr.generation
+                );
+                None
+            }
+            (None, None) => {
                 println!(
                     "head: peer serves seq {} -> {}; nothing local to publish",
                     h.seq,
@@ -1321,11 +1381,38 @@ pub fn sync(ns: &str, o: SyncOpts<'_>) -> i32 {
             }
             (h.seq, h.sig_hash())
         }
-        Some((seq, prev, root)) => {
-            let nonce: [u8; ROOT_NONCE_LEN] = match nas_crypto::random::array() {
-                Ok(n) => n,
+        Some((seq, prev, tree)) => {
+            // ── Root manifest (SPECS §3.1) ──
+            //
+            // Sealed under `rk_seq`, and the nonce goes into the record where
+            // the signature covers it. Kept locally as well, so the next
+            // sync's blob step offers, proves and leases it like any other
+            // blob: a peer that loses it is healed by the writer, and refused
+            // by every reader in between.
+            let manifest = RootManifest {
+                tree,
+                generation: repo.generation(),
+            };
+            let (sealed, nonce) = match repo.seal_root(slot.as_bytes(), seq, &manifest) {
+                Ok(x) => x,
                 Err(e) => return err(e),
             };
+            let root = match blobs.put(&sealed) {
+                Ok(a) => a,
+                Err(e) => return err(format!("store root manifest: {e}")),
+            };
+            if let Err(code) = push_blob(&mut ch, &root, &sealed) {
+                return code;
+            }
+            // Leased now rather than at the next sync: it is the one blob a
+            // reader cannot do without, and it did not exist when the lease
+            // step ran.
+            match call(&mut ch, &Request::TakeLease(vec![root])) {
+                Ok(Response::Ok) => {}
+                Ok(Response::Error(m)) => return refused(format!("lease root manifest: {m}")),
+                Ok(other) => return err(format!("unexpected reply to TakeLease: {other:?}")),
+                Err(e) => return err(e),
+            }
             let rec =
                 match SlotRecord::sign(&writer, slot, seq, root, nonce, prev, Regime::CasMerge) {
                     Ok(r) => r,
@@ -1345,8 +1432,9 @@ pub fn sync(ns: &str, o: SyncOpts<'_>) -> i32 {
                 return err(e);
             }
             println!(
-                "head: published seq {seq} -> {} to slot {}",
+                "head: published seq {seq} -> root manifest {} (tree {}) to slot {}",
                 root.to_hex(),
+                tree.to_hex(),
                 slot.to_hex()
             );
 

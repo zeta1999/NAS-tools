@@ -145,6 +145,73 @@ pub fn manifest_key(dir: &DirSecret) -> Key {
     }
 }
 
+/// Root manifest key `rk_v` (SPECS §3.1) — **one key per slot sequence**.
+///
+/// `derive_key("nas-tools/root/v1", root_secret ‖ le64(seq))`. The root
+/// manifest is the object that anchors a namespace, and the one revision 1
+/// was "one implementer inference away" from encrypting under a fixed key
+/// with a fixed nonce. Deriving per version means a well-behaved writer never
+/// seals two roots under one key; a *forking* writer could seal two at one
+/// `seq`, which is why the nonce is random anyway rather than derived.
+///
+/// That nonce is drawn by [`seal_root`] and handed back to the caller, who
+/// stores it in the **signed slot record** beside the ciphertext's address
+/// (SPECS §5, `root_nonce`) rather than inside the blob. A reader verifies the
+/// record before it touches the blob, so the nonce it uses is one the writer
+/// signed — and the blob alone, without its record, does not open.
+///
+/// This is its own type rather than a [`Key`] so that [`seal`] and [`open`]
+/// cannot take it: sealing a root has exactly one shape, and that shape emits
+/// the nonce the record must carry.
+#[derive(Zeroize, ZeroizeOnDrop)]
+pub struct RootKey {
+    bytes: [u8; KEY_LEN],
+}
+
+impl std::fmt::Debug for RootKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "RootKey(<redacted>)")
+    }
+}
+
+/// Derive `rk_seq` from the namespace root secret (SPECS §3.1).
+pub fn root_key(root_secret: &[u8; KEY_LEN], seq: u64) -> RootKey {
+    let mut input = [0u8; KEY_LEN + 8];
+    input[..KEY_LEN].copy_from_slice(root_secret);
+    input[KEY_LEN..].copy_from_slice(&seq.to_le_bytes());
+    let key = RootKey {
+        bytes: blake3::derive_key(context::ROOT_MANIFEST, &input),
+    };
+    input.zeroize();
+    key
+}
+
+/// Seal one version of the root manifest.
+///
+/// Draws the fresh random nonce §3.1 requires and returns it. The sealed bytes
+/// are `ciphertext ‖ tag` **without** the nonce: it belongs in the slot record
+/// that points at this blob, where the writer's signature covers it.
+pub fn seal_root(
+    key: &RootKey,
+    plaintext: &[u8],
+    aad: &[u8],
+) -> Result<(Vec<u8>, [u8; NONCE_LEN]), CryptoError> {
+    let nonce: [u8; NONCE_LEN] = crate::random::array().map_err(|_| CryptoError::Seal)?;
+    let sealed =
+        seal_with_nonce(&key.bytes, &nonce, plaintext, aad).map_err(|_| CryptoError::Seal)?;
+    Ok((sealed, nonce))
+}
+
+/// Open a root manifest with the nonce recorded in its slot record.
+pub fn open_root(
+    key: &RootKey,
+    nonce: &[u8; NONCE_LEN],
+    sealed: &[u8],
+    aad: &[u8],
+) -> Result<Vec<u8>, CryptoError> {
+    open_with_nonce(&key.bytes, nonce, sealed, aad).map_err(|_| CryptoError::Open)
+}
+
 /// A key-encryption key built from bytes a caller already holds.
 ///
 /// # Why this is not the hole [`ChunkReadKey`] exists to avoid
@@ -486,6 +553,78 @@ mod tests {
             let s = cs(17);
             let _ = open(&chunk_key(&s, b"k"), &bytes, b"");
             let _ = open(&manifest_key(&DirSecret::root(&[2u8; KEY_LEN])), &bytes, b"");
+        }
+    }
+}
+
+#[cfg(test)]
+mod root_tests {
+    use super::*;
+
+    const SECRET: [u8; KEY_LEN] = [7u8; KEY_LEN];
+    const AAD: &[u8] = b"nas-tools/aad/root/v1 test";
+
+    #[test]
+    fn round_trips_under_the_recorded_nonce() {
+        let k = root_key(&SECRET, 3);
+        let (sealed, nonce) = seal_root(&k, b"tree", AAD).unwrap();
+        assert_eq!(open_root(&k, &nonce, &sealed, AAD).unwrap(), b"tree");
+        // The nonce is not inside the blob: the sealed bytes are ct ‖ tag.
+        assert_eq!(sealed.len(), b"tree".len() + 16);
+    }
+
+    #[test]
+    fn derivation_is_the_spec_string_over_root_secret_then_le64_seq() {
+        // Pins SPECS §3.1 literally, so a refactor that mixes `seq` in
+        // differently — or reaches for NS_ROOT — cannot pass silently.
+        let mut input = Vec::new();
+        input.extend_from_slice(&SECRET);
+        input.extend_from_slice(&9u64.to_le_bytes());
+        let by_hand = RootKey {
+            bytes: blake3::derive_key("nas-tools/root/v1", &input),
+        };
+        let (sealed, nonce) = seal_root(&root_key(&SECRET, 9), b"x", AAD).unwrap();
+        assert_eq!(open_root(&by_hand, &nonce, &sealed, AAD).unwrap(), b"x");
+    }
+
+    #[test]
+    fn each_sequence_has_its_own_key() {
+        let (sealed, nonce) = seal_root(&root_key(&SECRET, 0), b"x", AAD).unwrap();
+        assert_eq!(
+            open_root(&root_key(&SECRET, 1), &nonce, &sealed, AAD),
+            Err(CryptoError::Open)
+        );
+    }
+
+    #[test]
+    fn every_seal_draws_a_fresh_nonce() {
+        let k = root_key(&SECRET, 0);
+        let (a, na) = seal_root(&k, b"same", AAD).unwrap();
+        let (b, nb) = seal_root(&k, b"same", AAD).unwrap();
+        assert_ne!(na, nb);
+        assert_ne!(
+            a, b,
+            "same plaintext, same key, same bytes: keystream reuse"
+        );
+    }
+
+    #[test]
+    fn the_nonce_and_the_aad_are_both_binding() {
+        let k = root_key(&SECRET, 0);
+        let (sealed, mut nonce) = seal_root(&k, b"x", AAD).unwrap();
+        assert_eq!(
+            open_root(&k, &nonce, &sealed, b"other slot"),
+            Err(CryptoError::Open)
+        );
+        nonce[0] ^= 1;
+        assert_eq!(open_root(&k, &nonce, &sealed, AAD), Err(CryptoError::Open));
+    }
+
+    #[test]
+    fn open_root_never_panics_on_short_input() {
+        let k = root_key(&SECRET, 0);
+        for n in 0..40 {
+            let _ = open_root(&k, &[0u8; NONCE_LEN], &vec![0u8; n], AAD);
         }
     }
 }

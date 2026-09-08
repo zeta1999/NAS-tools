@@ -30,8 +30,11 @@
 //! `state/` is local-only and never shipped to a peer (SPECS §4).
 
 use nas_core::{KeyScheme, Mode, PaddingProfile};
-use nas_crypto::{random, ConvergenceSecret, DirSecret, Identity, Role, KEY_LEN};
+use nas_crypto::{
+    random, ConvergenceSecret, DirSecret, Identity, Role, RootKey, KEY_LEN, NONCE_LEN,
+};
 use nas_slots::Anchor;
+use nas_store::{root_aad, RootManifest};
 use nas_vault::{Argon2Params, NamespaceSecrets, Vault, WrapPolicy, WrapRecord};
 use std::fs;
 use std::io;
@@ -576,6 +579,62 @@ impl Repo {
             Secrets::Vault(v) => v.dir_root(),
             Secrets::Passphrase(ns, _) => ns.dir_root(),
         }
+    }
+
+    /// `rk_seq`: the key one version of the root manifest is sealed under
+    /// (SPECS §3.1). Per sequence, so no two roots share a key.
+    pub fn root_key(&self, seq: u64) -> RootKey {
+        match &self.secrets {
+            Secrets::Vault(v) => v.root_key(seq),
+            Secrets::Passphrase(ns, _) => ns.root_key(seq),
+        }
+    }
+
+    /// Seal a root manifest for publication at `seq` in `slot_id`. Returns
+    /// the blob to store and the nonce the slot record must carry.
+    ///
+    /// `transit-only` stores it as it stores every manifest — unsealed, so
+    /// the peer can browse from the slot down (SPECS §2.2.3) — and the
+    /// record's nonce is all zero: nothing was sealed, so there is no nonce.
+    pub fn seal_root(
+        &self,
+        slot_id: &[u8; 32],
+        seq: u64,
+        root: &RootManifest,
+    ) -> Result<(Vec<u8>, [u8; NONCE_LEN]), String> {
+        let plain = root.encode().map_err(|e| e.to_string())?;
+        match self.mode {
+            Mode::TransitOnly => Ok((plain, [0u8; NONCE_LEN])),
+            Mode::E2ee | Mode::Passphrase => {
+                nas_crypto::seal_root(&self.root_key(seq), &plain, &root_aad(slot_id, seq))
+                    .map_err(|e| format!("seal root manifest: {e}"))
+            }
+        }
+    }
+
+    /// Open the root manifest a verified slot record points at, with the
+    /// nonce that record carries.
+    pub fn open_root(
+        &self,
+        slot_id: &[u8; 32],
+        seq: u64,
+        nonce: &[u8; NONCE_LEN],
+        blob: &[u8],
+    ) -> Result<RootManifest, String> {
+        let plain = match self.mode {
+            Mode::TransitOnly => blob.to_vec(),
+            Mode::E2ee | Mode::Passphrase => {
+                nas_crypto::open_root(&self.root_key(seq), nonce, blob, &root_aad(slot_id, seq))
+                    .map_err(|_| {
+                        format!(
+                            "root manifest at seq {seq} does not open under this namespace's \
+                             key for this slot (wrong namespace, wrong nonce, or a blob that \
+                             is not the one the record was signed over)"
+                        )
+                    })?
+            }
+        };
+        RootManifest::decode(&plain).map_err(|e| e.to_string())
     }
 
     pub fn blobs_root(&self) -> PathBuf {

@@ -141,14 +141,20 @@ settled and the work that follows from them.
 - [ ] Interactive passphrase prompt. There is none: the CLI takes
       `--passphrase` or `$NAS_PASSPHRASE` and refuses otherwise, because a
       prompt that silently fell back to a default would be worse than none.
-- [ ] **The root manifest key `rk_v` is unbuilt.** SPECS §3.1 specifies
-      per-version derivation `derive_key("nas-tools/root/v1", root_secret ‖
-      le64(seq))`; M0 uses a local `state/HEAD` file and never derives it. The
-      KDF context now exists as `context::ROOT_MANIFEST` with a doc warning it
-      apart from `NS_ROOT` — the two differ by one path segment, and using
-      `NS_ROOT` by mistake would encrypt every root version under one key. That
-      is the "may it see two plaintexts" hazard §3.1 exists to prevent. Lands
-      with `nas-slots` (M1 step 5).
+- [x] **The root manifest key `rk_v` is built** (SPECS §3.1).
+      `nas_crypto::root_key` derives `derive_key("nas-tools/root/v1",
+      root_secret ‖ le64(seq))` into its own `RootKey` type, which only
+      `seal_root` / `open_root` accept — the general `seal` cannot take it.
+      `seal_root` draws the random nonce and *returns* it: the nonce lives in
+      the signed slot record (`root_nonce`), not in the blob, and
+      `ROOT_NONCE_LEN == NONCE_LEN` is asserted at compile time. `nas peer sync`
+      seals `RootManifest { tree, generation }` under `rk_seq` with AAD
+      `slot_id ‖ seq`, stores, pushes and leases it; on the read side it
+      fetches, hash-checks and opens the root a verified head points at, and
+      refuses a peer that serves the record but not the blob as withholding.
+      `transit-only` stores it unsealed with a zero nonce, as it stores every
+      manifest. Drilled: uc10's withholding step now refuses at the head, exit
+      2, where it used to exit 0 (MANUAL-TESTING §10).
 
 ## M1 — the peer
 

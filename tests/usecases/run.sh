@@ -16,7 +16,16 @@ fi
 
 # The fixture is generated, not committed: it is 1.3 MB of pseudo-random bytes
 # that compress to nothing and would bloat every clone.
-[ -d fixtures/tree ] || ./fixtures/make.sh >/dev/null
+#
+# Rebuilt when make.sh is NEWER than the tree, not only when the tree is
+# absent. The confidentiality assertions search the peer for markers and file
+# names this script plants, so a corpus generated before one of them was added
+# is a corpus in which that assertion passes because nothing was planted --
+# green, and testing nothing. (`nas test peer-no-plaintext` checks this too and
+# refuses; the rebuild is so it never has to.)
+if [ ! -d fixtures/tree ] || [ fixtures/make.sh -nt fixtures/tree ]; then
+  ./fixtures/make.sh >/dev/null
+fi
 
 # Passphrase-mode assertions need a passphrase and there is no tty here. A fixed
 # test value, set in the harness rather than defaulted inside the binary -- a

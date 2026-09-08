@@ -21,7 +21,9 @@ check         "peer stores plaintext — readable by the NAS"      $NAS test pee
 # The inverted expectation, checked by the harness itself: in transit-only,
 # readable content and readable names on the peer are CORRECT (SPECS §2.2.3).
 check_creates        "transit-only namespace actually stored blobs" "$NAS_HOME/photos/blobs"
-check_present_under  "harness reads fixture text straight off disk" "$NAS_HOME/photos/blobs" "# work tree fixture"
+# Same directory scope as UC03's negative form, so the two are comparable: if
+# this one stopped finding the marker, UC03's silence would mean nothing.
+check_present_under  "harness reads fixture text straight off disk" "$NAS_HOME/photos" "# work tree fixture"
 check         "filenames are visible on the peer"                $NAS test peer-names-visible photos
 check M6      "thumbnails are PERMITTED by the mode (feature deferred, §19.1)" $NAS peer feature-permitted photos thumbnails
 check         "family subject has read via a peer-enforced ACL"  $NAS acl check photos --subject family --right read

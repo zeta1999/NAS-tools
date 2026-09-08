@@ -125,6 +125,31 @@ check_absent_under() { # $1=milestone? $2=desc $3=dir $4=needle
   fi
 }
 
+# Assert no PATH under a directory contains $needle in any component.
+#
+# The name half of "no plaintext on the peer", and it needs its own primitive:
+# `check_absent_under` greps file CONTENT, so a store that filed a blob under
+# the name it came from would pass it without a single readable byte inside any
+# file. SPECS §4.4/§15.3 put path segments inside sealed manifests precisely so
+# the peer never learns them; a directory entry named after one is the same
+# leak by another route.
+check_no_path_under() { # $1=milestone? $2=desc $3=dir $4=needle
+  local ms; ms=$(_take_ms "$1"); [[ "${1:-}" =~ ^M[0-6]$ ]] && shift
+  local desc="$1" dir="$2" needle="$3"
+  if ! _gate "$ms"; then _skip "$desc" "$ms" "$(_reason "$ms")"; return 0; fi
+  if [ ! -d "$dir" ]; then
+    printf '  \033[31m✗ FAIL\033[0m %s\n    └ %s does not exist, so nothing was stored\n' \
+      "$desc" "$dir"; FAIL=$((FAIL+1)); return 0
+  fi
+  local hit; hit=$(find "$dir" -name "*$needle*" -print -quit 2>/dev/null)
+  if [ -n "$hit" ]; then
+    printf '  \033[31m✗ FAIL\033[0m %s\n    └ %s is a path on the peer\n' "$desc" "$hit"
+    FAIL=$((FAIL+1))
+  else
+    printf '  \033[32m✓\033[0m %s\n' "$desc"; PASS=$((PASS+1))
+  fi
+}
+
 # Assert a byte string DOES appear (transit-only: visible names are correct).
 check_present_under() { # $1=milestone? $2=desc $3=dir $4=needle
   local ms; ms=$(_take_ms "$1"); [[ "${1:-}" =~ ^M[0-6]$ ]] && shift

@@ -9,6 +9,7 @@ mod aclcmd;
 mod attack;
 mod exit;
 mod peercmd;
+mod peerscan;
 mod repo;
 mod roaming;
 mod testcmds;

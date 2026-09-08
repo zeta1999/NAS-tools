@@ -419,7 +419,13 @@ settled and the work that follows from them.
 
 - [ ] `ci.sh`: fmt, clippy `-D warnings`, tests; macOS + linux arm64/amd64
 - [ ] Automated "no plaintext on the peer" grep over blobs, slots and leases
-- [ ] User manual must state plainly: fork detection is not prevention; a blocked
+- [x] User manual must state plainly: fork detection is not prevention; a blocked
       peer keeps what it already had; a revoked device reads old data until rewritten
+      — `MANUAL.md` (§1 "what you're buying", §5 forks, §6 revocation, §8 limits)
+- [ ] `MANUAL.md` §6: "a rotated peer can't be un-rotated" is a design statement —
+      re-check once `nas peer` grows a rotation subcommand; and §6 deletion prose
+      needs the M6 quorum flow filled in when it exists
+- [ ] `MANUAL.md` §4: no `nas vault export` / secret-mode command yet; the manual
+      names the path (`vault.key`) rather than a command — update when one exists
 - [ ] Propose CDC + at-rest encryption upstream to `simple-backups` rather than
       maintaining two stores

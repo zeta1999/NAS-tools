@@ -28,6 +28,11 @@ listing; lease-based GC with deltas; **three confidentiality modes** (`e2ee`,
 
 ## Shipped
 
+- **`MANUAL.md`** — the operator-facing manual: what the design does and does not
+  protect (fork detection ≠ prevention, blocked peers keep what they had, revoked
+  devices read old data until rewritten), one-device / two-device / witness setups,
+  `nas peer` ACL mechanics, and a prose reading of the drills in
+  `MANUAL-TESTING.md`. Cross-cutting TODO "user manual must state plainly…" closed.
 - **`../simple-network` protocol v1** — handshake transcript binding + constant-time
   pin comparison. 15 tests green, clippy clean, fmt clean. Wire-breaking by design;
   v0 peers are refused with an explicit version error rather than downgraded.

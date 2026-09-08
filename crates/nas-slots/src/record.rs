@@ -25,7 +25,13 @@ use nas_core::{decode_fields, encode_fields, Addr, DecodeError, ADDR_LEN};
 use nas_crypto::{verify, Identity, SigContext, SignError, SIGNATURE_LEN};
 
 /// Bytes of the per-version root nonce (SPECS §3.1: random 24 B).
+///
+/// The nonce the root manifest at `root` was sealed with, carried here under
+/// the writer's signature rather than inside the blob (`nas_crypto::seal_root`
+/// returns it for exactly this field). The width is the AEAD's, and this
+/// format is frozen (SPECS §20), so the two are tied at compile time.
 pub const ROOT_NONCE_LEN: usize = 24;
+const _: () = assert!(ROOT_NONCE_LEN == nas_crypto::NONCE_LEN);
 
 /// Domain string for the record hash, so a record hash can never equal a hash
 /// computed over some other structure that happens to share bytes.

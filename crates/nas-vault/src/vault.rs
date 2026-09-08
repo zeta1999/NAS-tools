@@ -197,6 +197,16 @@ impl Vault {
         nas_crypto::DirSecret::root(&blake3::derive_key(DIR_ROOT_CONTEXT, &self.seed))
     }
 
+    /// `rk_seq` — the per-version root manifest key (SPECS §3.1), hung off the
+    /// same seed-derived secret as the directory chain so that a read-cap
+    /// carrying `root_secret` (§3.5) reaches both.
+    pub fn root_key(&self, seq: u64) -> nas_crypto::RootKey {
+        let mut root_secret = blake3::derive_key(DIR_ROOT_CONTEXT, &self.seed);
+        let key = nas_crypto::root_key(&root_secret, seq);
+        root_secret.zeroize();
+        key
+    }
+
     /// The generation new writes use: always the highest.
     pub fn current_generation(&self) -> &Generation {
         self.generations

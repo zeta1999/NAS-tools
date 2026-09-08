@@ -9,6 +9,7 @@ pub mod chunker;
 pub mod manifest;
 pub mod object;
 pub mod padding;
+pub mod root;
 pub mod tree;
 
 pub use blobs::{Addressing, BlobStore, StoreError};
@@ -16,4 +17,5 @@ pub use chunker::{Chunker, ChunkerConfig, ConfigError};
 pub use manifest::{ChunkRef, Kind, Manifest, ManifestError};
 pub use object::{read_object, salted_addr, ObjectError, ObjectWriter, Sealer, CHUNK_AAD};
 pub use padding::{pad, unpad, PadError, FIXED_CHUNK, FIXED_CLASS, HEADER, LADDER};
+pub use root::{root_aad, RootError, RootManifest, ROOT_AAD};
 pub use tree::{DirManifest, Entry, TreeError, TreeStore};

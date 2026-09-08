@@ -53,6 +53,12 @@ impl NamespaceSecrets {
         DirSecret::root(&self.root_secret)
     }
 
+    /// `rk_seq` — the per-version root manifest key (SPECS §3.1), from the
+    /// same secret the directory chain hangs off. The secret itself stays here.
+    pub fn root_key(&self, seq: u64) -> nas_crypto::RootKey {
+        nas_crypto::root_key(&self.root_secret, seq)
+    }
+
     /// This namespace's convergence secret. See the module docs on why it is
     /// per-namespace.
     pub fn convergence_secret(&self) -> ConvergenceSecret {

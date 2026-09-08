@@ -917,8 +917,12 @@ Observed, in order:
 - device 3, brand new, no pin, no witness: accepts seq 0, exit 0. That is the
   blind spot SPECS §5.4 describes, and the drill prints it on purpose.
 - device 3 with the witness: `peer serves seq 0, but seq 1 was witnessed
-  (rollback)`, exit 2. Against a withholding peer with the witness: served
-  head is verified, witnessed, exit 0.
+  (rollback)`, exit 2. Against a withholding peer with the witness: refused —
+  `peer serves head seq 1 but not the root manifest it points at (c147…): no
+  blob c147… — a signed pointer to nothing is withholding (SPECS §5.3)`, exit
+  2. Until the root manifest was sealed under `rk_v` (§3.1) this step exited
+  0: sync verified the record and fetched nothing it pointed at, so a peer
+  that denied the blob went unnoticed until something tried to read it.
 
 Two defects only a multi-process drill could have found, both fixed:
 

@@ -515,16 +515,36 @@ mod tests {
         assert!(check_corpus(t.path()).unwrap_err().contains(FIXTURE_MARKER));
     }
 
-    /// The real corpus, when the harness has built it. Skipped rather than
-    /// failed when it has not: `fixtures/tree` is generated, and `cargo test`
-    /// does not generate it.
+    /// The harness's fixture script is the source of truth for what the corpus
+    /// carries, so the constants are checked against *it*: `make.sh` must plant
+    /// [`FIXTURE_MARKER`] and every name in [`FIXTURE_NAMES`] literally. The
+    /// generated `fixtures/tree` is checked too, but only when it is at least
+    /// as new as `make.sh` — the rule `run.sh` uses to decide whether to
+    /// rebuild it. A tree older than the script is what `run.sh` is about to
+    /// replace, not evidence of drift, and `cargo test` does not generate it;
+    /// failing on it made `cargo test` depend on which `run.sh` ran last.
     #[test]
     fn the_real_corpus_carries_what_the_scan_looks_for() {
-        let tree = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../tests/usecases/fixtures/tree")
-            .canonicalize();
-        let Ok(tree) = tree else { return };
-        if !tree.is_dir() {
+        let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/usecases/fixtures");
+        let script = fixtures.join("make.sh");
+        let src =
+            fs::read_to_string(&script).unwrap_or_else(|e| panic!("{}: {e}", script.display()));
+        assert!(
+            src.contains(FIXTURE_MARKER),
+            "make.sh no longer plants {FIXTURE_MARKER:?}"
+        );
+        for name in FIXTURE_NAMES {
+            assert!(src.contains(name), "make.sh no longer creates {name:?}");
+        }
+
+        let tree = fixtures.join("tree");
+        let (Ok(t), Ok(s)) = (fs::metadata(&tree), fs::metadata(&script)) else {
+            return;
+        };
+        let (Ok(tree_at), Ok(script_at)) = (t.modified(), s.modified()) else {
+            return;
+        };
+        if !t.is_dir() || tree_at < script_at {
             return;
         }
         check_corpus(&tree).unwrap();

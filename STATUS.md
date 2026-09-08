@@ -104,10 +104,10 @@ listing; lease-based GC with deltas; **three confidentiality modes** (`e2ee`,
   `nas-transfer` listener; `nas peer sync` pushes a local namespace to it with
   the peer's key pinned on the command line, so a peer presenting any other key
   is refused before a single record is sent.
-- **`tests/usecases/`** — 88 acceptance assertions, milestone-gated; 58 are
-  M0–M2. Measured on the current binary: **5 passing, 0 failing, 83 pending**
-  at `NAS_MILESTONE=M0`; **36 passing, 0 failing, 52 pending** at
-  `NAS_MILESTONE=M1` (what `ci.sh` gates on); **49 passing, 9 failing, 30
+- **`tests/usecases/`** — 95 acceptance assertions, milestone-gated; 62 are
+  M0–M2. Measured on the current binary: **5 passing, 0 failing, 90 pending**
+  at `NAS_MILESTONE=M0`; **40 passing, 0 failing, 55 pending** at
+  `NAS_MILESTONE=M1` (what `ci.sh` gates on); **62 passing, 0 failing, 33
   pending** at `NAS_MILESTONE=M2`. UC07's two witness-node assertions
   (a fork detected by devices that never meet; the node holds no blobs and no
   slot data) pass in-process via `nas test fork-detect-via-witness` and
@@ -179,10 +179,10 @@ See `MANUAL-TESTING.md` §5 for the commands and raw output.
 | Rust unit tests | 367 |
 | Lean theorems (clean axiom gate) | 14 |
 | `cargo-fuzz` targets | 11 |
-| Acceptance assertions passing (≤M1) | 36 of 88 |
-| Acceptance assertions pending (M2+) | 52 |
+| Acceptance assertions passing (≤M1) | 40 of 95 |
+| Acceptance assertions pending (M2+) | 55 |
 
-**36 of 88 is a progress marker, not a verification result.** The 52 pending
+**40 of 95 is a progress marker, not a verification result.** The 55 pending
 assertions are not failures and not successes — they are unwritten code that
 `ci.sh` refuses to score. Every one of them is a claim SPECS makes that nothing
 yet demonstrates, and the four use cases with a passing score (UC01–UC03,
@@ -210,7 +210,7 @@ TLC is green with its three sanity checks still failing as required.
 ## Not built
 
 M2: the object verbs `put`/`rm` — which need the key→object mapping the S3
-face brings, so they are reclassified M3 (§7.1) rather than pending here. **No assertion fails at `NAS_MILESTONE=M2`:** 58 pass, 0 fail, 33 pending.
+face brings, so they are reclassified M3 (§7.1) rather than pending here. **No assertion fails at `NAS_MILESTONE=M2`:** 62 pass, 0 fail, 33 pending.
 
 **The single-writer handoff (§5.1) is built.** `SlotHandoff` is signed by the
 *outgoing* writer and binds slot, sequence and both writers, so it authorises

@@ -103,7 +103,9 @@ for entry in $FORK_CFGS; do
   label="SlotConsistency invariants (MaxSeq=$MAXSEQ, ForkAt=$forkat)"
   out=$(run "$cfg")
   if echo "$out" | grep -q "No error has been found"; then
-    n=$(echo "$out" | grep -oE "[0-9]+ distinct states" | head -1)
+    # Last match, not first: TLC prints a progress line per minute before the
+    # final total, and formats large counts with thousands separators.
+    n=$(echo "$out" | grep -oE "[0-9][0-9,]* distinct states" | tail -1)
     say "$label" "ok — $n"
   else
     say "$label" "FAIL"; echo "$out" | tail -60; fail=1

@@ -10,8 +10,8 @@ Run `./check.sh` — it fetches `tla2tools.jar` if absent and gates everything.
 |---|---|---|
 | `lean/NasVerify/Transcript.lean` | Lean 4.28 | **VERIFIED** — 3 theorems, 0 admitted, axioms clean |
 | `lean/NasVerify/Padding.lean` | Lean 4.28 | **VERIFIED** — 10 theorems, 0 admitted, axioms clean. Models the *ladder* (closing the gap where `Nat` truncation hid a `usize` underflow) and the reader's strict check (closing the class-selection covert channel the M0 review found) |
-| `tlaplus/SlotConsistency.tla` | TLA+ / TLC | **MODEL-CHECKED** — but note it constrains §5, which is **M2** code; it is assurance about the design, not about anything shipped in M0. — MaxSeq=2: 38,709 distinct states, depth 20 (<1 s, the CI gate). MaxSeq=3: **4,699,837 distinct states from 60.1 M generated, depth 30, 46 s** (the deep gate). 4 invariants + 1 action property hold at both bounds. |
-| sanity checks | TLA+ / TLC | **3 required counterexamples found** — the model is not vacuous |
+| `tlaplus/SlotConsistency.tla` | TLA+ / TLC | **MODEL-CHECKED** — but note it constrains §5, which is **M2** code; it is assurance about the design, not about anything shipped in M0. `ForkAt` (the sequence number at which branch "b" diverges) is varied over every admissible point, `1..MaxSeq`, not fixed at one value — see [Varying `ForkAt`](#varying-forkat) below. CI gate, MaxSeq=2: ForkAt=1 337,817 distinct states, depth 25 (~3 s); ForkAt=2 38,709 distinct states, depth 20 (~1 s). Deep gate (`DEEP=1`), MaxSeq=3: ForkAt=1 38,366,601 distinct states from 570.7 M generated, depth 35 (~10 min); ForkAt=2 4,699,837 distinct states from 60.1 M generated, depth 30 (~1 min); ForkAt=3 443,429 distinct states, depth 25 (~7 s). 4 invariants + 1 action property hold at every (MaxSeq, ForkAt) pair. |
+| sanity checks | TLA+ / TLC | **3 required counterexamples found, at both ForkAt=1 and ForkAt=2** — the model is not vacuous at either end of the admissible range |
 
 ### What the model check actually caught
 
@@ -32,6 +32,44 @@ as a client bug:
 3. **Compatibility was branch equality**, so divergence at *different* sequence
    numbers was invisible. Replaced with a real ancestry relation over a shared
    prefix.
+
+### Varying `ForkAt`
+
+`ForkAt` is a CONSTANT: the sequence number at which branch "b" first diverges
+from "a". Earlier revisions fixed it at 2 in every config, so the model never
+explored forks originating anywhere else. It is now varied over the full
+admissible range, `1..MaxSeq`, at both bounds:
+
+- **CI gate** (`./check.sh`, MaxSeq=2): `MC_small_fork1.cfg` (ForkAt=1) and
+  `MC_small.cfg` (ForkAt=2).
+- **Deep gate** (`DEEP=1 ./check.sh`, MaxSeq=3): `MC_full_fork1.cfg` (ForkAt=1),
+  `MC_full.cfg` (ForkAt=2), and `MC_full_fork3.cfg` (ForkAt=3).
+
+Both ends of the range turned out to be meaningful, not degenerate, once
+worked out from `Versions` and `IsAncestor`:
+
+- **`ForkAt=1`** is a fork **at genesis**. `Versions` becomes
+  `v[2] = "a" \/ v[1] >= 1`, which is every `(seq, branch)` pair — branch "b"
+  exists at every sequence number, not just from the fork point on. And in
+  `IsAncestor`, the shared-prefix clause `v1[2] = "a" /\ v2[2] = "b" /\
+  v1[1] < ForkAt` can never fire, because no `v1[1] \in 1..MaxSeq` is `< 1`.
+  So "a" and "b" share **no** common ancestor at all: this is two chains that
+  diverge as early as they possibly can, immediately after the first
+  `Publish`. `PeerForks`'s `\E s \in ForkAt..MaxSeq` is non-empty (`1..MaxSeq`),
+  and TLC reaches it — the model handles this case correctly, and it is the
+  structurally distinct regime where the "shared prefix" the model's own
+  comments describe is, for once, empty.
+- **`ForkAt=MaxSeq`** is the latest possible fork: `\E s \in ForkAt..MaxSeq`
+  narrows to the single point `{MaxSeq}`, and the shared prefix is maximal
+  (everything below `MaxSeq` is common ancestry). Checked at MaxSeq=3 as
+  `MC_full_fork3.cfg`; not checked separately at MaxSeq=2 because there
+  `ForkAt=2` (the pre-existing default) already *is* `MaxSeq`.
+
+The sanity (must-FAIL) checks are cheap at MaxSeq=2 (under a few seconds each),
+so they now also run at both ForkAt=1 and ForkAt=2: `MC_NeverForks_fork1.cfg`,
+`MC_NeverAlarms_fork1.cfg`, `MC_ForkAlwaysDetected_fork1.cfg` alongside the
+existing `MC_NeverForks.cfg`, `MC_NeverAlarms.cfg`, `MC_ForkAlwaysDetected.cfg`.
+All six must produce a counterexample, or the corresponding bound is vacuous.
 
 ### Why the sanity checks matter as much as the invariants
 

@@ -79,8 +79,16 @@ pub fn wrap_path(root: &Path, seq: u64) -> PathBuf {
 
 /// The passphrase, from `--passphrase` or `$NAS_PASSPHRASE`.
 ///
-/// No interactive prompt yet: this runs under a harness with no tty, and a
-/// prompt that silently fell back to a default would be worse than none.
+/// Non-interactive on purpose, and it stays that way: this is the function the
+/// `nas test` substrate calls, and that runs under a harness with no tty.
+/// `None` here means "nobody supplied one", not "there is none to be had".
+///
+/// Asking a person is [`crate::prompt`]'s job, and it happens one layer up —
+/// at `ns create` (which must resolve the passphrase before any directory
+/// exists) and inside [`Repo::open_with`] (which only knows the namespace is
+/// passphrase-mode after reading its config). Both prompt only when stdin is a
+/// terminal; everywhere else the refusal stands, because a prompt that
+/// silently fell back to a default would be worse than none.
 pub fn passphrase_from(explicit: Option<&str>) -> Option<Vec<u8>> {
     explicit
         .map(|s| s.as_bytes().to_vec())
@@ -337,9 +345,11 @@ impl Repo {
 
         let secrets = match mode {
             Mode::Passphrase => {
-                let pw = passphrase.ok_or_else(|| {
-                    io::Error::other("passphrase mode needs --passphrase or $NAS_PASSPHRASE")
-                })?;
+                // No prompt here, unlike `open_with`: the directories above
+                // already exist by this point, so the CLI resolves the
+                // passphrase — prompting if it can — before calling in. This
+                // is the invariant, not the user-facing refusal.
+                let pw = passphrase.ok_or_else(|| io::Error::other(crate::prompt::NO_TERMINAL))?;
                 let dek = random_secret()?;
                 // At creation there is no slot history, so the floor is
                 // genuinely zero -- there is nothing to be rolled back to. It
@@ -412,6 +422,11 @@ impl Repo {
     // There is deliberately no `open(ns)` without a passphrase argument: the
     // three `nas test` commands that used one silently dropped
     // `$NAS_PASSPHRASE` and failed on every passphrase-mode namespace.
+    //
+    // The terminal prompt below does not walk that back. It is not a second
+    // source every caller now shares: it fires only when the caller passed
+    // nothing *and* stdin is a terminal, which the harness never is. A caller
+    // that has a passphrase must still hand it over.
     pub fn open_with(ns: &str, passphrase: Option<Vec<u8>>) -> io::Result<Self> {
         let root = path_of(ns);
         let cfg = fs::read_to_string(root.join("config"))?;
@@ -450,9 +465,15 @@ impl Repo {
 
         let secrets = match mode {
             Mode::Passphrase => {
-                let pw = passphrase.ok_or_else(|| {
-                    io::Error::other("passphrase mode needs --passphrase or $NAS_PASSPHRASE")
-                })?;
+                // Only now is it known that this namespace needs one at all —
+                // which is why the prompt lives here and not at the call
+                // sites. Opening an e2ee namespace must never ask.
+                let pw = match passphrase {
+                    Some(pw) => pw,
+                    None => crate::prompt::passphrase(crate::prompt::Ask::Once)
+                        .map_err(|e| io::Error::other(e.to_string()))?
+                        .ok_or_else(|| io::Error::other(crate::prompt::NO_TERMINAL))?,
+                };
                 let seq = Self::latest_wrap_seq(&root)?;
                 let w = Self::load_wrap(&root, seq)?;
                 let (ns, anchor) = w

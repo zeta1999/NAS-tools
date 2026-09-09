@@ -1253,8 +1253,11 @@ pub fn sync(ns: &str, o: SyncOpts<'_>) -> i32 {
             //     carry the record hash, and it can);
             //   - the record *above* it, whose `prev` names it — which reaches
             //     into the skipped span from its upper edge.
-            let below = chain.iter().find(|r| r.seq == w.seq + 1);
-            match (at(w.seq), rung_at(w.seq), below) {
+            let above = w
+                .seq
+                .checked_add(1)
+                .and_then(|s| chain.iter().find(|r| r.seq == s));
+            match (at(w.seq), rung_at(w.seq), above) {
                 (Some(r), _, _) if r.record_hash() != w.record_hash => {
                     return refused(format!(
                         "fork: the witness saw a different record at seq {} than the chain the peer now serves (SPECS §5.3)",

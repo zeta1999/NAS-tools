@@ -14,7 +14,7 @@
 //! A [`Witness`] now carries one **edge of the chain**: the observed record's
 //! [`record_hash`](SlotRecord::record_hash) and that record's own `prev`. So a
 //! client holding witnesses holds a partial edge relation `record_hash →
-//! (seq, prev)`, and [`forked`](Self::forked) raises when two admitted
+//! (seq, prev)`, and [`SlotClient::forked`] raises when two admitted
 //! witnesses cannot both describe one history:
 //!
 //! * **same sequence, different record** — two observations at one `seq`
@@ -86,6 +86,8 @@
 //! remembers the answer.
 //!
 //! [`observe`]: SlotClient::observe
+//! [`observe_witness`]: SlotClient::observe_witness
+//! [`fork_proof`]: SlotClient::fork_proof
 
 use crate::chain::{verify_chain, ChainError};
 use crate::id::{SlotId, WriterId};
@@ -372,7 +374,8 @@ impl SlotClient {
     /// 1. two `sig_hash` values at one sequence (the anchor, and offers);
     /// 2. two `record_hash` values at one sequence (offers, and witnesses);
     /// 3. two witnesses at *different* sequences that the client holds enough
-    ///    edges to link — see [`witness_conflict`](Self::witness_conflict).
+    ///    edges to link — see `witness_conflict`, which is private because a
+    ///    caller wanting the link should ask for the proof.
     pub fn forked(&self) -> Option<u64> {
         let by_hash = |m: &BTreeMap<u64, BTreeSet<[u8; 32]>>| {
             m.iter().find(|(_, hs)| hs.len() > 1).map(|(seq, _)| *seq)

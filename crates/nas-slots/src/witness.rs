@@ -769,11 +769,15 @@ mod tests {
         // 1952 pk + 32 slot + 8 seq + 32 record_hash + 32 prev + 8 time
         // + 3309 sig + 7 x 4 B length prefixes.
         assert_eq!(n, 5401, "witness wire size changed");
+        // A same-sequence proof is two witnesses. A proof whose two ends sit
+        // s sequences apart carries the s - 1 steps between them as well, so
+        // s + 1 witnesses in all.
         println!(
-            "Witness: {n} B — self-contained, so a same-sequence fork proof \
-             costs {} B and a proof spanning s sequences {} + s x {n} B",
+            "Witness: {n} B — self-contained, so a same-sequence fork proof costs \
+             {} B, and one spanning s sequences (s + 1) x {n} B, capped at {} B \
+             by MAX_LINK",
             2 * n,
-            2 * n
+            (MAX_LINK + 2) * n
         );
     }
 }

@@ -178,9 +178,9 @@ See `MANUAL-TESTING.md` §5 for the commands and raw output.
 
 | | count |
 |---|---|
-| Rust unit tests | 367 |
+| Rust tests (`cargo test --workspace`, unit + integration) | 537 |
 | Lean theorems (clean axiom gate) | 14 |
-| `cargo-fuzz` targets | 11 |
+| `cargo-fuzz` targets | 14 |
 | Acceptance assertions passing (≤M1) | 40 of 95 |
 | Acceptance assertions pending (M2+) | 55 |
 

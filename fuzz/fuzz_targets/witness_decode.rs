@@ -24,10 +24,10 @@ fuzz_target!(|data: &[u8]| {
             ForkProof::try_linked(&w, &w, vec![]).is_none(),
             "a witness linked against itself"
         );
-        // Nor can an unsigned link stand up to a re-walk.
-        if let Some(p) = ForkProof::try_linked(&w, &w, vec![w.clone()]) {
-            assert!(p.verify(), "try_linked returned a proof that does not verify");
-        }
+        assert!(
+            ForkProof::try_linked(&w, &w, vec![w.clone()]).is_none(),
+            "a witness linked against itself through itself"
+        );
     }
 
     if data.len() < 8 {

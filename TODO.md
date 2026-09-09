@@ -76,9 +76,11 @@ settled and the work that follows from them.
       walk — a witness carries no ancestry: needs witnesses to carry a
       `prev`/checkpoint link, and a model whose witness abstraction matches.
       Asserted by `a_fork_at_disjoint_sequences_is_NOT_detected`.
-- [ ] **Vary `ForkAt` in the TLC configs.** Both `MC_small.cfg` and
-      `MC_full.cfg` fix it at 2, so the model never explores forks originating
-      at different points.
+- [x] **Vary `ForkAt` in the TLC configs.** Was fixed at 2 in both configs.
+      Now gated over the whole admissible range `1..MaxSeq` — `MC_*_fork1.cfg`
+      (fork at genesis, no shared prefix) and `MC_full_fork3.cfg`
+      (`ForkAt=MaxSeq`) — with the sanity counterexamples at both ends. See
+      `formal/README.md` "Varying `ForkAt`".
 - [ ] `LeaseGC.tla` — the write/sweep race against the young-blob grace period
 - [ ] `DeleteQuorum.tla` — quorum, approval replay, cooling-off bypass
 - [x] `cargo-fuzz` targets for every parser consuming peer bytes — **six**
@@ -419,7 +421,14 @@ settled and the work that follows from them.
 
 ## Cross-cutting
 
-- [ ] `ci.sh`: fmt, clippy `-D warnings`, tests; macOS + linux arm64/amd64
+- [x] `ci.sh`: fmt (not `--all` — see the comment there), clippy `-D warnings`,
+      workspace tests, `formal/check.sh`, release `nas`, and the acceptance
+      suite at `CI_MILESTONE` (default M1).
+- [ ] **CI on linux.** `docker/build.sh` builds a static arm64 musl `nas` in a
+      `rust:alpine` container and bakes the `nas-node` image, but nothing runs
+      the tests or the acceptance suite under linux, and amd64 is not built at
+      all. Needs a matrix (macOS host + linux arm64 + linux amd64) that runs
+      `ci.sh` itself, not just the build.
 - [x] Automated "no plaintext on the peer" scan: `nas test peer-no-plaintext
       <ns>` (`nas-cli/src/peerscan.rs`) walks the whole peer root — blobs,
       slots, leases, witnesses, everything under it — for the fixture's

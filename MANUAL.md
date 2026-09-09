@@ -186,6 +186,8 @@ What you will see is `nas peer sync` exiting `2` with one of:
 fork: the peer serves a different record at seq N than the one seen here before (SPECS §5.3)
 fork: the peer's checkpoint at seq N names a different record than the one seen here before (SPECS §5.3)
 fork: the witness saw a different record at seq N than the chain the peer now serves (SPECS §5.3)
+fork: the peer's checkpoint at seq N names a different record than the witness saw (SPECS §5.3, §5.5)
+fork: the record the peer serves at seq N descends from something other than the record the witness saw at seq M (SPECS §5.3)
 peer serves seq N, but seq M was seen here before (rollback)
 peer serves no head, but seq N was witnessed (rollback or withholding)
 … a signed pointer to nothing is withholding (SPECS §5.3)
@@ -194,8 +196,21 @@ peer serves no head, but seq N was witnessed (rollback or withholding)
 There is no `--force`. When you see one of these, the peer has either lost
 data, rolled you back, or is lying; the correct response is to stop trusting
 that peer, not to make the message go away. Two witnesses citing incompatible
-records at the same sequence are a self-contained, publishable proof of the
-fork (SPECS §5.3).
+records are a self-contained, publishable proof of the fork (SPECS §5.3).
+
+**What "incompatible" covers.** A witness names the record it saw *and* the
+record that one descends from — one link of the chain. So two observations at
+the same sequence disagreeing is a fork, and so is one observation whose link
+does not lead back to what another observation saw at a lower sequence. That
+second case is the one that matters in practice: in a real fork each device
+reports its own head, and the two heads sit at different heights.
+
+It still needs the links in between. A device that holds observations of seq 4
+and seq 9 and nothing between them cannot say whether they are one history or
+two, and `nas` says nothing rather than guessing — a peer that withheld one
+observation could otherwise make an honest namespace look forked. This is the
+same "converges once witnesses propagate" limit as above, seen from the other
+side.
 
 ### 4.2 A blocked peer keeps what it already had
 

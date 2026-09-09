@@ -48,9 +48,16 @@ listing; lease-based GC with deltas; **three confidentiality modes** (`e2ee`,
   only over *outputs of the padder*, so the model could not see a malicious
   writer choosing a non-minimal size class.
 
-- **`formal/tlaplus/SlotConsistency.tla`** — MODEL-CHECKED. 38,709 distinct states
-  at MaxSeq=2 (CI gate), 4,699,837 at MaxSeq=3 (deep gate). Its first revision
-  failed TLC in 7 states, catching three defects; see `formal/README.md`.
+- **`formal/tlaplus/SlotConsistency.tla`** — MODEL-CHECKED, revision 3.
+  38,709 distinct states at MaxSeq=2, ForkAt=2 (CI gate), 4,699,837 at MaxSeq=3,
+  ForkAt=2 (deep gate); the full per-`ForkAt` table is in `formal/README.md`.
+  Revision 1 failed TLC in 7 states, catching three defects. Revision 3 fixed a
+  fourth, of the opposite kind: the fix for defect 3 handed the client the
+  *global* ancestry relation, so the model was checking a rule no client can
+  run. Witnesses now carry a predecessor and detection walks only links the
+  client holds. Five invariants and one action property, `NoFalseAlarm` among
+  them; state counts are unchanged, because the change is to what is derived
+  and not to the state space.
 - **`crates/nas-core`** — canonical encoder with proptests mirroring the Lean
   theorems, plus `Addr`, the `Clock` trait and the format discriminants.
   15 tests green.
@@ -68,10 +75,13 @@ listing; lease-based GC with deltas; **three confidentiality modes** (`e2ee`,
   a POSIX filename need not be UTF-8, and `to_string_lossy` collided distinct
   names into one. That is a format decision, made before M1 freezes the layout.
 - **`crates/nas-slots`** — SPECS §5. Signed, hash-chained slot records in both
-  regimes; roster; chain walking; witnesses and publishable fork proofs; and the
-  client accept logic that is the Rust counterpart of `SlotConsistency.tla` —
-  `AnchorFloor`, `MonotonicPins` and `ForkDetected` each map to a specific
-  rejection or alarm. **57 tests green.**
+  regimes; roster; chain walking; witnesses (format v2, each naming one edge of
+  the chain) and publishable fork proofs; and the client accept logic that is
+  the Rust counterpart of `SlotConsistency.tla` — `AnchorFloor`,
+  `MonotonicPins` and `ForkDetected` each map to a specific rejection or alarm,
+  the last of them under the same "linking witnesses are known" hypothesis the
+  model now carries. **117 tests green** (the count here said 57 and had gone
+  stale; measured).
 - **`crates/nas-lease`** — SPECS §6. Deltas and checkpoints, a count-committed
   Merkle root, chain replay, and the sweep decision — the only code in the
   system that deletes user data, so every guard §6.2–§6.4 names is a separate
@@ -202,10 +212,20 @@ TLC is green with its three sanity checks still failing as required.
 
 > The TLA+ model constrains SPECS §5, which is **M2** code. It is assurance
 > about the design, not about anything shipped. Its correspondence to
-> `nas-slots` is **partial**: same-sequence equivocation only, asserted as such
-> by `a_fork_at_disjoint_sequences_is_not_detected`. Once the peer's history
-> is offered it does see it (`…is_detected_once_the_chain_is_walked`), which
-> is what `nas peer sync` does over the wire.
+> `nas-slots` was **partial** — same-sequence equivocation only — and is not
+> any more. A witness is format v2 and carries one edge of the chain
+> (`record_hash` plus the observed record's own `prev`), so `SlotClient::forked`
+> compares two branches at *different* sequence numbers by walking the links it
+> holds, and revision 3 of the model states detection the same way: over a
+> `known`-links relation, not the global `Compatible`.
+>
+> What both now say, and neither rounds up: a walk needs the linking
+> observations. A gap raises **nothing**
+> (`a_gap_in_the_walk_raises_nothing`, `ForkDetected`'s `Linked` antecedent),
+> because a relay that withheld one witness could otherwise make an honest slot
+> look forked — SPECS §5.4's "converges once witnesses propagate", from the
+> other side. `NoFalseAlarm` is the invariant in that direction and holds at
+> every checked bound.
 
 ## Not built
 
@@ -535,7 +555,11 @@ forking peer now exists (`tests/usecases/uc12_fork_drill.sh`,
 MANUAL-TESTING.md §13): `nas peer sync` walks the peer's retained history
 from the lowest witnessed or pinned sequence and compares each witness and
 the pin at its own sequence, so a fork *below* the served head is refused
-over a real socket. The three-node container simulation exists too
+over a real socket. A v2 witness speaks the same hash as a checkpoint rung
+and as a successor's `prev`, so an observation the walk skipped can also be
+checked against a rung naming that record, or against the record above it —
+three ways to check one observation where there was one, and one fewer
+reported as unchecked. The three-node container simulation exists too
 (`tests/usecases/uc11_containers.sh`, MANUAL-TESTING.md §10b): host-built
 `nas` binary, three slim runtime containers on one compose network, honest
 peer restarted `--hostile rollback`, a `--witness` node, three devices —

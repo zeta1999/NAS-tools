@@ -1,13 +1,14 @@
 //! The client's accept decision (SPECS §5.3, §5.5).
 //!
 //! This is the Rust counterpart of `formal/tlaplus/SlotConsistency.tla`, and
-//! the three properties the model checks are the three this module must hold:
+//! the properties the model checks are the properties this module must hold:
 //!
 //! | TLA+ invariant | Here | Faithful? |
 //! |---|---|---|
 //! | `AnchorFloor` — a pin never falls below the cap's anchor | [`Reject::BelowAnchor`] | yes |
 //! | `MonotonicPins` — pins only move forward | [`Reject::Rollback`] | yes |
-//! | `ForkDetected` — incompatible evidence raises once the linking witnesses are known | [`SlotClient::forked`] | yes, under exactly that hypothesis |
+//! | `ForkDetected` — incompatible evidence raises once the linking witnesses are known | [`SlotClient::forked`] | yes, under exactly that hypothesis — see below |
+//! | `NoFalseAlarm` — evidence that is all on one history never raises | [`SlotClient::forked`] | yes; the tests here are what defend it |
 //!
 //! # What "once the linking witnesses are known" means, precisely
 //!

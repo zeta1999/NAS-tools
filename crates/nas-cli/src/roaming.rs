@@ -130,7 +130,7 @@ fn opportunistic() -> Result<Result<String, String>, String> {
     // (2)+(4) Out of order, and with gaps: 5, then 1, then 9.
     let mut scattered = Lab::open("opportunistic-scattered")?;
     for (seq, lt) in [(5u64, 1u64), (1, 2), (9, 3)] {
-        let w = Witness::sign(&observer, slot(), seq, [seq as u8; 32], lt)
+        let w = Witness::sign(&observer, slot(), seq, [seq as u8; 32], [0xE0; 32], lt)
             .map_err(|e| format!("sign: {e}"))?;
         // A refusal here is the property failing, not the lab breaking, so it
         // is `Ok(Err(..))` — exit 2 — and not a harness error. A relay that
@@ -154,7 +154,7 @@ fn opportunistic() -> Result<Result<String, String>, String> {
     // thing to the protocol.
     let mut sequential = Lab::open("opportunistic-sequential")?;
     for (seq, lt) in [(1u64, 2u64), (5, 1), (9, 3)] {
-        let w = Witness::sign(&observer, slot(), seq, [seq as u8; 32], lt)
+        let w = Witness::sign(&observer, slot(), seq, [seq as u8; 32], [0xE0; 32], lt)
             .map_err(|e| format!("sign: {e}"))?;
         if let Err(e) = sequential.peer.publish_witness(w) {
             return Ok(Err(format!(
@@ -187,8 +187,8 @@ fn opportunistic() -> Result<Result<String, String>, String> {
     //
     // A *distinct* sequence, so acceptance cannot be explained away as the
     // relay recognising something it already held.
-    let stale =
-        Witness::sign(&observer, slot(), 4, [0x44; 32], 0).map_err(|e| format!("sign: {e}"))?;
+    let stale = Witness::sign(&observer, slot(), 4, [0x44; 32], [0xE0; 32], 0)
+        .map_err(|e| format!("sign: {e}"))?;
     if let Err(e) = scattered.peer.publish_witness(stale) {
         return Ok(Err(format!(
             "an observation declaring the oldest possible logical time was refused after \

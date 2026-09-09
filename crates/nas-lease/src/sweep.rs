@@ -9,6 +9,16 @@
 //! explanation a user gets names the strongest reason rather than the first one
 //! that happened to match.
 //!
+//! # The ordering is model-checked
+//!
+//! `formal/tlaplus/LeaseGC.tla` transcribes the cascade in [`plan_sweep`],
+//! guard for guard and in this order, and TLC checks that no interleaving of
+//! upload, take-lease, sync and sweep deletes anything a live lease, the grace
+//! period, the notice window or the retention floor protects. Its header
+//! carries the correspondence table and the two places where this file and
+//! SPECS §6 disagree — notably that §6.2's grace is enforced here against the
+//! blob file's mtime, which a deduplicated `BlobStore::put` does not move.
+//!
 //! # Nothing here trusts a clock it did not read locally
 //!
 //! `now` is supplied by the caller and compared with [`Timestamp::saturating_since`],

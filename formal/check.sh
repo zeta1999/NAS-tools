@@ -83,7 +83,9 @@ if [ ! -f "$JAR" ]; then
     say "tla2tools.jar" "FAIL — could not fetch"; exit 1; }
 fi
 pushd tlaplus >/dev/null
-run() { java -Xmx2g -XX:+UseParallelGC -cp tla2tools.jar tlc2.TLC -workers 4 -nowarning -config "$1" SlotConsistency 2>&1; }
+# $2 is the module, defaulting to SlotConsistency so every existing call site
+# reads as it did before LeaseGC arrived.
+run() { java -Xmx2g -XX:+UseParallelGC -cp tla2tools.jar tlc2.TLC -workers 4 -nowarning -config "$1" "${2:-SlotConsistency}" 2>&1; }
 
 # ForkAt ranges over every admissible divergence point, 1..MaxSeq: ForkAt=1 is
 # a fork at genesis (branches share no prefix at all — see SlotConsistency.tla
@@ -124,6 +126,55 @@ for inv in NeverForks NeverAlarms ForkAlwaysDetected; do
       say "$label" "FAIL — model is VACUOUS"; fail=1
     fi
   done
+done
+
+# ── LeaseGC (SPECS §6) ────────────────────────────────────────────────────
+# The write/sweep race, the notice window, and the retention floor. Much
+# smaller than SlotConsistency, so CI affords two windowings and DEEP widens
+# the windows rather than adding a third blob — a third blob does not finish
+# inside ten minutes and buys nothing the second does not.
+#
+# `grace-expiry-notice` in the label is the CONSTANTS triple, and varying it is
+# this model's equivalent of varying ForkAt above:
+#   1-1-1  the tightest, and the windowing the must-FAIL checks below use;
+#          cheapest, but with grace = notice it cannot tell §6.2's window
+#          apart from §6.3's;
+#   1-2-3  all three distinct, which is the windowing in which revision 6's
+#          "these were one field" defect is visible at all;
+#   2-2-1  a grace window more than one tick wide (DEEP only).
+if [ "${DEEP:-0}" = "1" ]; then
+  GC_CFGS="1-1-1:MC_LeaseGC_small.cfg 1-2-3:MC_LeaseGC_full.cfg 2-2-1:MC_LeaseGC_grace2.cfg"
+else
+  GC_CFGS="1-1-1:MC_LeaseGC_small.cfg 1-2-3:MC_LeaseGC_full.cfg"
+fi
+
+for entry in $GC_CFGS; do
+  windows=${entry%%:*}
+  cfg=${entry#*:}
+  label="LeaseGC invariants (grace-expiry-notice $windows)"
+  out=$(run "$cfg" LeaseGC)
+  if echo "$out" | grep -q "No error has been found"; then
+    # Same extraction as the SlotConsistency loop above, for the same reason:
+    # last match, because the progress lines carry the same phrase.
+    n=$(echo "$out" | grep -oE "[0-9][0-9,]* distinct states" | tail -1)
+    say "$label" "ok — $n"
+  else
+    say "$label" "FAIL"; echo "$out" | tail -60; fail=1
+  fi
+done
+
+# Non-vacuity for the CI bound, and one finding. EveryUploadGetsGrace must
+# fail because §6.2's immunity is keyed to the blob file's mtime, which a
+# deduplicated upload does not move — see LeaseGC.tla.
+for inv in NeverSweeps GraceIsRedundant NoticeIsRedundant \
+           RenewalNeverRestores EveryUploadGetsGrace; do
+  label="sanity: $inv (LeaseGC)"
+  out=$(run "MC_LeaseGC_$inv.cfg" LeaseGC)
+  if echo "$out" | grep -q "Invariant $inv is violated"; then
+    say "$label" "violated as required"
+  else
+    say "$label" "FAIL — model is VACUOUS"; fail=1
+  fi
 done
 popd >/dev/null
 

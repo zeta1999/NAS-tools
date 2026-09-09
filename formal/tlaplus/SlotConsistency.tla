@@ -21,6 +21,33 @@
 (*      FIX: an explicit IssueCap action.                                  *)
 (*   3. Compatibility was branch equality, so divergence at *different*    *)
 (*      sequence numbers was invisible. FIX: a real ancestry relation.     *)
+(*                                                                         *)
+(* REVISION 3. The fix for defect 3 handed the client `Compatible`, which  *)
+(* is a GLOBAL ancestry relation — it knows the whole branch structure and *)
+(* answers for any two versions. No client can compute that. A client sees *)
+(* signed observations, and revision 2's witness carried a version and no  *)
+(* ancestry, so the model was checking a detection rule the implementation *)
+(* could not run. That is the mirror image of defect 1: not evidence lost, *)
+(* but evidence assumed.                                                   *)
+(*                                                                         *)
+(*   FIX, in two halves, matching `crates/nas-slots`:                      *)
+(*                                                                         *)
+(*   a. A witness now records its version AND that version's predecessor   *)
+(*      — one EDGE of the chain, which is what a `Witness` carries in the  *)
+(*      Rust (`record_hash` plus the observed record's own `prev`).        *)
+(*   b. Detection uses `KnownIncompatible`, which walks back only along    *)
+(*      edges the client has actually been given (`Named`). A walk that    *)
+(*      runs out of links STOPS and raises nothing: not proven compatible  *)
+(*      is not proven forked. `Compatible` survives only as the yardstick  *)
+(*      the invariants are stated against, never as something a client     *)
+(*      evaluates.                                                         *)
+(*                                                                         *)
+(*   `ForkDetected` is restated to match: incompatible evidence raises     *)
+(*   ONCE THE LINKING WITNESSES ARE KNOWN. Anything stronger would be a    *)
+(*   claim about a client that can see links nobody sent it. `NoFalseAlarm`*)
+(*   is the new invariant in the other direction, and is the property the  *)
+(*   Rust module defends in its tests: evidence that is genuinely all on   *)
+(*   one history never raises.                                             *)
 (***************************************************************************)
 EXTENDS Naturals, FiniteSets
 
@@ -35,40 +62,86 @@ Branches == {"a", "b"}
 \* prefix, which is what makes this a fork rather than two unrelated chains.
 Versions == {v \in (1..MaxSeq) \X Branches : v[2] = "a" \/ v[1] >= ForkAt}
 
+\* The predecessor of the first version is nothing at all -- the all-zero
+\* `prev` of a genesis record in SPECS §5. Not a version: a witness of it is a
+\* witness that its subject descends from nowhere.
+Genesis == <<0, "a">>
+
 \* v1 is an ancestor of v2 if they are on one branch and v1 is no later, or if
 \* v1 sits in the shared prefix that "b" also descends from.
 IsAncestor(v1, v2) ==
     \/ (v1[2] = v2[2] /\ v1[1] <= v2[1])
     \/ (v1[2] = "a" /\ v2[2] = "b" /\ v1[1] < ForkAt)
 
-\* Two versions conflict when neither descends from the other. Seeing both is
-\* proof of equivocation -- this is what a client detects by walking `prev`.
+\* Two versions conflict when neither descends from the other.
+\*
+\* THE YARDSTICK, NOT THE RULE. This is global: it answers for any two
+\* versions, using branch structure no client is ever told. The invariants
+\* below are stated against it; `KnownIncompatible` is what a client actually
+\* computes, and it is strictly weaker by design.
 Compatible(v1, v2) == IsAncestor(v1, v2) \/ IsAncestor(v2, v1)
+
+\* The version at sequence n on the chain leading to v, for n \in 1..v[1].
+\* Below the fork point every chain runs through branch "a".
+ChainAt(v, n) == IF v[2] = "b" /\ n >= ForkAt THEN <<n, "b">> ELSE <<n, "a">>
+
+\* What a witness of v names as v's predecessor.
+Pred(v) == IF v[1] = 1 THEN Genesis ELSE ChainAt(v, v[1] - 1)
 
 VARIABLES
     published,  \* versions a writer or a forking peer has created
     pinSeq,     \* client -> highest sequence number accepted
     pinBranch,  \* client -> branch currently believed
     anchor,     \* client -> freshness anchor carried in its capability
-    witnessed,  \* signed observations published to the peer
-    known,      \* client -> every version it has learned of, from ANY source
+    witnessed,  \* signed observations published to the peer: <<by, v, Pred(v)>>
+    known,      \* client -> every version it holds an EDGE for, from ANY source
     rolled      \* clients served something below their pin or anchor
 
 vars == <<published, pinSeq, pinBranch, anchor, witnessed, known, rolled>>
 
-\* A client's evidence is inconsistent once it holds two conflicting versions.
-Inconsistent(k) == \E v1 \in k, v2 \in k : ~Compatible(v1, v2)
+(***************************************************************************)
+(* Detection, using only what the client holds.                            *)
+(*                                                                         *)
+(* `known[c]` is the set of versions c holds an edge for: every entry came *)
+(* with its predecessor attached, because that is what a witness and a     *)
+(* served record both carry. So c can always step ONE back from anything   *)
+(* in `known[c]`, and can step further only where the intermediate         *)
+(* versions are themselves in `known[c]`.                                  *)
+(*                                                                         *)
+(* Named(k, v, n): starting at v and walking back along edges in k, the    *)
+(* client can name the version at sequence n. The step from m to m-1 needs *)
+(* the edge of ChainAt(v, m), so every m strictly above n must be in k --  *)
+(* v itself included. A single missing link is a GAP, and a gap ends the   *)
+(* walk without a conclusion.                                             *)
+(***************************************************************************)
+Named(k, v, n) ==
+    /\ n \in 1..v[1]
+    /\ \A m \in (n+1)..v[1] : ChainAt(v, m) \in k
+
+\* Two things the client holds that cannot both describe one history: walk the
+\* higher back to the lower's sequence and land on something else. With
+\* u[1] = v[1] this is same-sequence equivocation, which needs no walk at all.
+KnownIncompatible(k) ==
+    \E v \in k, u \in k :
+        /\ Named(k, v, u[1])
+        /\ ChainAt(v, u[1]) # u
+
+\* Can c1 walk between these two at all? The hypothesis ForkDetected carries.
+Linked(k, v1, v2) ==
+    IF v1[1] <= v2[1] THEN Named(k, v2, v1[1]) ELSE Named(k, v1, v2[1])
+
+Head(c) == <<pinSeq[c], pinBranch[c]>>
 
 \* ALARM IS DERIVED, NOT STORED. That is the whole fix for defect 1: there is
 \* no moment at which evidence is "handled" and then forgotten.
-Alarm == {c \in Clients : Inconsistent(known[c]) \/ c \in rolled}
+Alarm == {c \in Clients : KnownIncompatible(known[c]) \/ c \in rolled}
 
 TypeOK ==
     /\ published \subseteq Versions
     /\ pinSeq    \in [Clients -> 0..MaxSeq]
     /\ pinBranch \in [Clients -> Branches]
     /\ anchor    \in [Clients -> 0..MaxSeq]
-    /\ witnessed \subseteq (Clients \X (1..MaxSeq) \X Branches)
+    /\ witnessed \subseteq (Clients \X Versions \X (Versions \cup {Genesis}))
     /\ known     \in [Clients -> SUBSET Versions]
     /\ rolled    \subseteq Clients
 
@@ -110,7 +183,9 @@ IssueCap(c) ==
     /\ UNCHANGED <<published, pinSeq, pinBranch, witnessed, known, rolled>>
 
 (* The peer serves client c a version of its choosing -- not necessarily the
-   newest, not necessarily on the branch c already follows. *)
+   newest, not necessarily on the branch c already follows. A served record
+   carries its own `prev`, so accepting one adds an edge and not merely a
+   name. *)
 Serve(c, s, b) ==
     /\ <<s, b>> \in published
     /\ \/ /\ s < anchor[c]              \* below the capability anchor: misbehaviour
@@ -129,23 +204,29 @@ Serve(c, s, b) ==
 
 PeerServes == \E c \in Clients, s \in 1..MaxSeq, b \in Branches : Serve(c, s, b)
 
-(* A client publishes a signed observation of what it currently believes. *)
+(* A client publishes a signed observation of what it currently believes --
+   the version AND its predecessor, which together are one edge of the chain.
+   The predecessor is what revision 2's witness lacked, and without it a
+   recipient can only ever compare observations that name the same sequence. *)
 PublishWitness ==
     /\ \E c \in Clients :
         /\ pinSeq[c] > 0
-        /\ witnessed' = witnessed \cup {<<c, pinSeq[c], pinBranch[c]>>}
+        /\ witnessed' = witnessed \cup {<<c, Head(c), Pred(Head(c))>>}
     /\ UNCHANGED <<published, pinSeq, pinBranch, anchor, known, rolled>>
 
 (* The peer MAY relay a witness. It is free never to do so -- that freedom is
    why we claim detection and not prevention (SPECS §5.4).
    NOTE the absence of any guard on the recipient's state: a witness arriving
    at a client that has pinned nothing is still retained. That guard was
-   defect 1. *)
+   defect 1.
+   NOTE ALSO what the recipient gains: the witnessed version, WITH its edge.
+   It does not gain the predecessor's own edge, which is exactly why a walk
+   can run out of links. *)
 RelayWitness ==
     /\ \E c \in Clients, w \in witnessed :
         /\ w[1] # c
-        /\ <<w[2], w[3]>> \notin known[c]
-        /\ known' = [known EXCEPT ![c] = @ \cup {<<w[2], w[3]>>}]
+        /\ w[2] \notin known[c]
+        /\ known' = [known EXCEPT ![c] = @ \cup {w[2]}]
     /\ UNCHANGED <<published, pinSeq, pinBranch, anchor, witnessed, rolled>>
 
 Next == Publish
@@ -168,15 +249,32 @@ AnchorFloor == \A c \in Clients : pinSeq[c] = 0 \/ pinSeq[c] >= anchor[c]
 \* Defect 1 was exactly a violation of this.
 EvidenceRetained == \A c \in Clients : known[c] \subseteq Versions
 
-\* THE DETECTION PROPERTY. If two clients hold conflicting versions and a
-\* witness has crossed between them, the recipient must be alarmed.
+\* THE DETECTION PROPERTY, stated at the strength the design delivers. If two
+\* clients hold conflicting versions, a witness has crossed between them, AND
+\* c1 holds the links to walk one back to the other's sequence, then c1 must
+\* be alarmed.
+\*
+\* The last conjunct is the honest part and was absent in revision 2, which
+\* asked a client to detect ancestry nobody had told it about. It is not
+\* vacuous: what it leaves to be checked is that the walk lands on a DIFFERENT
+\* version whenever the two heads are incompatible, and that a client's own
+\* head is still in its own evidence when the walk needs it.
 ForkDetected ==
     \A c1, c2 \in Clients :
         (   c1 # c2
          /\ pinSeq[c1] > 0 /\ pinSeq[c2] > 0
-         /\ ~Compatible(<<pinSeq[c1], pinBranch[c1]>>, <<pinSeq[c2], pinBranch[c2]>>)
-         /\ <<pinSeq[c2], pinBranch[c2]>> \in known[c1] )
+         /\ ~Compatible(Head(c1), Head(c2))
+         /\ Head(c2) \in known[c1]
+         /\ Linked(known[c1], Head(c1), Head(c2)) )
         => c1 \in Alarm
+
+\* SOUNDNESS, and the direction that matters against a hostile relay. A client
+\* whose evidence is genuinely all on one history never raises a fork. Without
+\* this, "detect more" could always be bought by alarming on everything, and a
+\* relay that withheld one witness could make an honest slot look forked.
+NoFalseAlarm ==
+    \A c \in Clients :
+        (\A v1, v2 \in known[c] : Compatible(v1, v2)) => ~KnownIncompatible(known[c])
 
 \* A client's accepted sequence number never decreases.
 MonotonicPins == [][\A c \in Clients : pinSeq'[c] >= pinSeq[c]]_vars
@@ -191,8 +289,7 @@ MonotonicPins == [][\A c \in Clients : pinSeq'[c] >= pinSeq[c]]_vars
 \* Expect violation: forks must be reachable, or ForkDetected holds trivially.
 NeverForks ==
     \A c1, c2 \in Clients :
-        (pinSeq[c1] > 0 /\ pinSeq[c2] > 0) =>
-            Compatible(<<pinSeq[c1], pinBranch[c1]>>, <<pinSeq[c2], pinBranch[c2]>>)
+        (pinSeq[c1] > 0 /\ pinSeq[c2] > 0) => Compatible(Head(c1), Head(c2))
 
 \* Expect violation: alarms must be reachable, or detection is never exercised.
 NeverAlarms == Alarm = {}
@@ -203,10 +300,14 @@ NeverAlarms == Alarm = {}
 \* counterexample here is positive evidence that the specification says what
 \* §5.4 says it says. If this ever PASSED, we would have accidentally claimed
 \* fork prevention -- a guarantee this architecture cannot deliver.
+\*
+\* Revision 3 gives the peer a second way to win it, and the more realistic
+\* one: relay SOME witnesses but not the ones that link two heads together.
+\* Detection then stalls at a gap rather than at silence.
 ForkAlwaysDetected ==
     (\E c1, c2 \in Clients :
         /\ pinSeq[c1] > 0 /\ pinSeq[c2] > 0
-        /\ ~Compatible(<<pinSeq[c1], pinBranch[c1]>>, <<pinSeq[c2], pinBranch[c2]>>))
+        /\ ~Compatible(Head(c1), Head(c2)))
     => Alarm # {}
 
 ===============================================================================

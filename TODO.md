@@ -123,8 +123,10 @@ settled and the work that follows from them.
       sees a filename, so §4.4's Cryptomator-style second layer buys nothing in
       `e2ee`. The case that actually needs a decision is `transit-only`, where
       the peer legitimately reads plaintext and names must be *visible*. M1.
-- [ ] **Store symlinks.** Currently skipped: following them lets a tree escape
-      its own root, and storing them needs a manifest field that does not exist.
+- [x] **Store symlinks.** Entry kind `2`, target bytes; never followed on
+      store, re-created as a link on restore, and a stale link at a restored
+      name is replaced rather than written through. Mode bits, uid/gid, mtime,
+      xattrs (SPECS §15.1) remain unstored.
 - [x] **`nas-vault` replaces the M0 plaintext vault.** `vault.bin` is sealed and
       authenticated; the seed derives every role identity; `CS` generations are
       kept on rotation so revocation is not a data-loss event.

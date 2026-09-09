@@ -167,8 +167,10 @@ See `MANUAL-TESTING.md` §5 for the commands and raw output.
   inside the sealed directory manifest, so a second layer buys nothing.
   `transit-only` — where the peer legitimately reads plaintext and names must be
   *visible* — will need this reconsidered at M1.
-- **Symlinks are skipped**, not stored: following them lets a tree escape its
-  own root, and storing them needs a format field that does not exist.
+- **Symlinks are stored as links** (manifest entry kind `2`, the target's
+  bytes), never followed on store and re-created as links on restore. The
+  rest of SPECS §15.1 — mode bits, uid/gid, mtime, xattrs — is still not
+  stored.
 
 ## Where the numbers stand
 

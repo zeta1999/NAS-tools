@@ -136,6 +136,16 @@ pub enum Entry {
     File(Manifest),
     /// A subdirectory: where its manifest is, and the id its key derives from.
     Dir { addr: Addr, dir_id: Vec<u8> },
+    /// A symbolic link: the bytes of its target, stored and never followed
+    /// (SPECS §15.1 puts symlinks in the manifest with the other metadata).
+    ///
+    /// The target is content, not a name. An absolute path or one containing
+    /// `..` is exactly what a link legitimately holds, so `safe_name` does not
+    /// apply to it -- storing a link does not follow it, and restoring one
+    /// creates a link, not what it points at. What is checked: the target is
+    /// non-empty, because no OS can create an empty link, so `encode` never
+    /// emits one.
+    Symlink { target: Vec<u8> },
 }
 
 /// A directory manifest: an ordered set of named entries.
@@ -193,6 +203,32 @@ fn name_os(b: &[u8]) -> std::ffi::OsString {
     std::ffi::OsString::from(String::from_utf8_lossy(b).into_owned())
 }
 
+/// Create a link at `at` pointing to `target`. A regular file there (the
+/// name was a file in the last restored revision) is replaced, as
+/// `File::create` would replace it the other way round; a directory is not
+/// removed, and the OS refuses the link instead.
+#[cfg(unix)]
+fn make_symlink(target: &[u8], at: &Path) -> Result<(), TreeError> {
+    if let Ok(md) = fs::symlink_metadata(at) {
+        if md.file_type().is_file() {
+            fs::remove_file(at)?;
+        }
+    }
+    std::os::unix::fs::symlink(name_os(target), at)?;
+    Ok(())
+}
+
+/// An explicit error, not a silent skip: a restore that quietly drops entries
+/// is the bug this store exists to not have.
+#[cfg(not(unix))]
+fn make_symlink(_target: &[u8], _at: &Path) -> Result<(), TreeError> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "symlinks are restored on unix only",
+    )
+    .into())
+}
+
 impl DirManifest {
     pub fn encode(&self) -> Result<Vec<u8>, TreeError> {
         let mut fields: Vec<Vec<u8>> = vec![DIR_MAGIC.to_vec()];
@@ -209,6 +245,17 @@ impl DirManifest {
                     let mut p = addr.as_bytes().to_vec();
                     p.extend_from_slice(dir_id);
                     fields.push(p);
+                }
+                Entry::Symlink { target } => {
+                    // Refused here as well as in `decode`, so the two agree
+                    // on what a manifest can say.
+                    if target.is_empty() {
+                        return Err(TreeError::NonCanonical {
+                            reason: "empty symlink target",
+                        });
+                    }
+                    fields.push(vec![2]);
+                    fields.push(target.clone());
                 }
             }
         }
@@ -301,6 +348,19 @@ impl DirManifest {
                     Entry::Dir {
                         addr: Addr::from_bytes(a),
                         dir_id,
+                    }
+                }
+                2 => {
+                    // `write_dir` reads the target from a real link, and no
+                    // OS creates one with an empty target, so `encode` never
+                    // emits this. Same rule as `empty dir_id` above.
+                    if payload.is_empty() {
+                        return Err(TreeError::NonCanonical {
+                            reason: "empty symlink target",
+                        });
+                    }
+                    Entry::Symlink {
+                        target: payload.to_vec(),
                     }
                 }
                 v => return Err(TreeError::BadEntry { value: v }),
@@ -403,10 +463,14 @@ impl<'a> TreeStore<'a> {
             let name = name_bytes(&e.file_name());
             safe_name(&name)?;
             let ft = e.file_type()?;
-            // Symlinks are skipped, not followed: following them would let a
-            // tree escape its own root, and storing them needs a format field
-            // that does not exist yet. Recorded rather than silently resolved.
+            // A link is stored as its target and never followed: following it
+            // would let a tree escape its own root (or loop), and what it
+            // points at is not this tree's content. `DirEntry::file_type`
+            // does not follow, which is what makes the check sound -- a link
+            // to a directory lands here, not in the `is_dir` branch below.
             if ft.is_symlink() {
+                let target = name_bytes(fs::read_link(e.path())?.as_os_str());
+                dm.entries.insert(name, Entry::Symlink { target });
                 continue;
             }
             names.push((name, e.path(), ft.is_dir()));
@@ -472,6 +536,16 @@ impl<'a> TreeStore<'a> {
                     name: String::from_utf8_lossy(name).into_owned(),
                 });
             }
+            // A link already sitting at `out` -- left by an earlier restore of
+            // a revision in which this name *was* a link -- is followed by
+            // both `File::create` and `create_dir_all`, so the write would
+            // land wherever it points. Restoring replaces the name; it never
+            // writes through it.
+            if let Ok(md) = fs::symlink_metadata(&out) {
+                if md.file_type().is_symlink() {
+                    fs::remove_file(&out)?;
+                }
+            }
             match e {
                 Entry::File(m) => {
                     let mut f = fs::File::create(&out)?;
@@ -480,6 +554,7 @@ impl<'a> TreeStore<'a> {
                 Entry::Dir { addr, dir_id } => {
                     self.read_dir_to(&dir.child(dir_id), addr, &out)?;
                 }
+                Entry::Symlink { target } => make_symlink(target, &out)?,
             }
         }
         Ok(())
@@ -552,7 +627,14 @@ mod tests {
             for e in es {
                 let p = e.path();
                 let mut rel = rel_bytes(base, &p);
-                if e.file_type().unwrap().is_dir() {
+                let ft = e.file_type().unwrap();
+                if ft.is_symlink() {
+                    // The link itself, never what it points at: a dangling
+                    // link is representable, and a link that got *followed*
+                    // on either side shows up as a difference.
+                    rel.push(b'@');
+                    out.insert(rel, name_bytes(fs::read_link(&p).unwrap().as_os_str()));
+                } else if ft.is_dir() {
                     rel.push(b'/');
                     out.insert(rel, Vec::new());
                     walk(base, &p, out);
@@ -605,6 +687,93 @@ mod tests {
             ts.read_dir_to(&root, &addr, &dst).unwrap();
             assert_eq!(snapshot(&src), snapshot(&dst), "{p:?}");
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinks_are_stored_as_links_and_never_followed() {
+        use std::os::unix::fs::symlink;
+        let s = Scratch::new("symlinks");
+        let src = s.0.join("src");
+        let dst = s.0.join("dst");
+        build_tree(&src);
+        // Content outside the tree that a followed link would drag in.
+        fs::create_dir_all(s.0.join("outside")).unwrap();
+        let secret = s.0.join("outside/secret.txt");
+        fs::write(&secret, corpus(50_000, 7)).unwrap();
+
+        let blobs = BlobStore::open(s.0.join("repo")).unwrap();
+        let cs = ConvergenceSecret::from_bytes([9u8; KEY_LEN]);
+        let ts = TreeStore::convergent(&blobs, &cs, PaddingProfile::None);
+        let root = DirSecret::root(&[5u8; KEY_LEN]);
+        let plain = ts.write_dir(&root, &src).unwrap();
+        let n = blobs.addrs().unwrap().len();
+
+        symlink(&secret, src.join("src/escape")).unwrap(); // absolute, outside
+        symlink("nowhere", src.join("src/dangling")).unwrap();
+        symlink("../docs", src.join("src/docs_link")).unwrap(); // to a directory
+        symlink("..", src.join("src/deep/up")).unwrap(); // a loop, if followed
+
+        let addr = ts.write_dir_incremental(&root, &src, Some(&plain)).unwrap();
+        // Exactly the manifests on the changed paths (root, src, src/deep).
+        // The 50 000 bytes behind `escape` were never read, let alone stored,
+        // and `docs_link` did not re-store `docs`.
+        assert_eq!(blobs.addrs().unwrap().len() - n, 3);
+
+        let top = ts.read_dir_manifest(&root, &addr).unwrap();
+        let Entry::Dir { addr: sub, dir_id } = &top.entries[b"src".as_slice()] else {
+            panic!("src must still be a directory");
+        };
+        let sub = ts.read_dir_manifest(&root.child(dir_id), sub).unwrap();
+        assert_eq!(
+            sub.entries[b"escape".as_slice()],
+            Entry::Symlink {
+                target: name_bytes(secret.as_os_str()),
+            }
+        );
+        assert_eq!(
+            sub.entries[b"dangling".as_slice()],
+            Entry::Symlink {
+                target: b"nowhere".to_vec(),
+            }
+        );
+        assert!(matches!(sub.entries[b"docs_link".as_slice()], Entry::Symlink { .. }));
+
+        ts.read_dir_to(&root, &addr, &dst).unwrap();
+        assert_eq!(snapshot(&src), snapshot(&dst));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restore_replaces_a_stale_link_rather_than_writing_through_it() {
+        // What an earlier restore of a different revision could have left in
+        // `dst`: a name that is a link now but a directory (or file) in the
+        // revision being restored. `create_dir_all` and `File::create` both
+        // follow a link at that name, so without the guard the restore would
+        // land wherever the stale link points.
+        use std::os::unix::fs::symlink;
+        let s = Scratch::new("stale-link");
+        let src = s.0.join("src");
+        let dst = s.0.join("dst");
+        let elsewhere = s.0.join("elsewhere");
+        build_tree(&src);
+        fs::create_dir_all(&elsewhere).unwrap();
+        fs::create_dir_all(&dst).unwrap();
+        symlink(&elsewhere, dst.join("src")).unwrap();
+        symlink(elsewhere.join("readme"), dst.join("README.md")).unwrap();
+
+        let blobs = BlobStore::open(s.0.join("repo")).unwrap();
+        let cs = ConvergenceSecret::from_bytes([9u8; KEY_LEN]);
+        let ts = TreeStore::convergent(&blobs, &cs, PaddingProfile::None);
+        let root = DirSecret::root(&[5u8; KEY_LEN]);
+        let addr = ts.write_dir(&root, &src).unwrap();
+        ts.read_dir_to(&root, &addr, &dst).unwrap();
+
+        assert_eq!(snapshot(&src), snapshot(&dst));
+        assert!(
+            fs::read_dir(&elsewhere).unwrap().next().is_none(),
+            "nothing may be written through a stale link"
+        );
     }
 
     #[test]
@@ -892,6 +1061,37 @@ mod tests {
             )),
         );
         assert!(matches!(dm.encode(), Err(TreeError::UnsafeName { .. })));
+    }
+
+    #[test]
+    fn a_link_target_is_content_and_round_trips_unchecked() {
+        // `safe_name` guards names; a target is what a link legitimately
+        // holds, traversal and all. Storing it follows nothing.
+        let mut dm = sample_dm();
+        dm.entries.insert(
+            b"passwd".to_vec(),
+            Entry::Symlink {
+                target: b"../../etc/passwd".to_vec(),
+            },
+        );
+        let bytes = dm.encode().unwrap();
+        assert_eq!(DirManifest::decode(&bytes).unwrap(), dm);
+    }
+
+    #[test]
+    fn an_empty_link_target_is_refused_on_both_paths() {
+        // No OS creates a link with an empty target, so `encode` never emits
+        // one; a decoder that accepted it would have a second spelling with
+        // no first.
+        let mut dm = sample_dm();
+        dm.entries.insert(b"l".to_vec(), Entry::Symlink { target: vec![] });
+        assert!(matches!(dm.encode(), Err(TreeError::NonCanonical { .. })));
+
+        let framed = nas_core::encode_fields(&[&DIR_MAGIC[..], b"l", &[2u8], b""]).unwrap();
+        assert!(matches!(
+            DirManifest::decode(&framed),
+            Err(TreeError::NonCanonical { .. })
+        ));
     }
 
     /// A valid manifest to mutate in the tests below.

@@ -76,11 +76,14 @@
 (*      `--hostile ignore-retention`. `Forget(b)` here is therefore MORE    *)
 (*      permissive than the code — the code is the safer of the two, but    *)
 (*      the authenticated path §6.3 names does not exist yet.               *)
-(*   2. `crates/nas-cli/src/roaming.rs` line ~233 says in prose "the peer   *)
-(*      must not sweep a holder's set until `expiry + grace`". §6.3 and the *)
-(*      code below that comment both say `expiry + notice`. A stale comment *)
-(*      from before revision 6 split the two fields; the model follows the  *)
-(*      code.                                                              *)
+(*   2. `crates/nas-cli/src/roaming.rs` lines 232-234 say in prose "the     *)
+(*      peer must not sweep a holder's set until `expiry + grace`". §6.3    *)
+(*      and that function's own code (`lease_expiry + notice`) both say     *)
+(*      `expiry + notice`. A stale comment from before revision 6 split the *)
+(*      two fields; the model follows the code. (The *other* mention of     *)
+(*      `expiry + grace` further down, at line 291, is deliberate: that     *)
+(*      probe sits there precisely because it is where the conflation bug   *)
+(*      would sweep.)                                                      *)
 (*                                                                         *)
 (* DELIBERATELY ABSTRACTED — these are not checked and must not be claimed: *)
 (*   - §6.1's delta chains, checkpoints and Merkle roots. The model takes   *)
@@ -238,7 +241,11 @@ Tick ==
    `BlobStore::put` returns early on an address it already holds and never
    rewrites the file whose mtime is `uploaded_at`. `offered` moves every time,
    because a client did just hand over the bytes. §6.2 is written about
-   `offered`; the code enforces it on `age`. *)
+   `offered`; the code enforces it on `age`.
+
+   `put` does rewrite -- and so does move the mtime -- when the copy it
+   already holds fails to verify. This models only the intact case, which is
+   the usual one and the pessimistic one. *)
 Upload(b) ==
     /\ ~(b \in stored /\ offered[b] = 0)   \* skip no-ops
     /\ stored'  = stored \cup {b}

@@ -79,7 +79,29 @@ settled and the work that follows from them.
 - [ ] **Vary `ForkAt` in the TLC configs.** Both `MC_small.cfg` and
       `MC_full.cfg` fix it at 2, so the model never explores forks originating
       at different points.
-- [ ] `LeaseGC.tla` — the write/sweep race against the young-blob grace period
+- [x] `LeaseGC.tla` — the write/sweep race against the young-blob grace period.
+      `formal/tlaplus/LeaseGC.tla`, gated by `formal/check.sh`; 7 invariants
+      hold, 5 must-FAIL checks fire. It found one: §6.2's grace is keyed to the
+      blob file's mtime and `BlobStore::put` does not touch a file it already
+      has, so a **deduplicated** upload gets no grace (`EveryUploadGetsGrace`,
+      and `formal/README.md`). Left open below.
+- [ ] **A deduplicated upload gets no young-blob grace (SPECS §6.2).** Found by
+      `LeaseGC.tla`'s `EveryUploadGetsGrace` check. §6.2 promises immunity to
+      "any blob uploaded within `grace_period`"; `Peer::inventory` takes
+      `uploaded_at` from the blob file's mtime and `BlobStore::put` returns
+      early without touching a file whose address it already holds. So a second
+      client's convergent upload (§3.2), or one client retrying after a crash —
+      the case §6.2 names — is swept while it is still inside the window it was
+      promised, and the `take_lease` that follows fails with `NoSuchBlob`. Fix
+      is either to touch the file on a deduplicated put or to record
+      `uploaded_at` out of band; both change what `uploaded_at` means, so it is
+      a decision, not a patch.
+- [ ] **No authenticated `forget` for the retention floor (SPECS §6.3, §16.3).**
+      §16.3's table routes a shrink through the offline delete authority;
+      `Peer::publish_retention` implements no such path and refuses *every*
+      shrink, so the only way an address leaves the floor is a peer running
+      `--hostile ignore-retention`. Safe, but not what the spec describes.
+      `LeaseGC.tla`'s `Forget` models the spec's act, not the code's absence.
 - [ ] `DeleteQuorum.tla` — quorum, approval replay, cooling-off bypass
 - [x] `cargo-fuzz` targets for every parser consuming peer bytes — **six**
       shipped (`fuzz/run.sh`), asserting properties rather than merely absence

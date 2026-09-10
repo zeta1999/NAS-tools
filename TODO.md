@@ -82,7 +82,15 @@ settled and the work that follows from them.
       (`ForkAt=MaxSeq`) — with the sanity counterexamples at both ends. See
       `formal/README.md` "Varying `ForkAt`".
 - [ ] `LeaseGC.tla` — the write/sweep race against the young-blob grace period
-- [ ] `DeleteQuorum.tla` — quorum, approval replay, cooling-off bypass
+- [x] `DeleteQuorum.tla` — quorum, approval replay, cooling-off bypass.
+      A hostile executor assembles the `DeleteExecution` bundle out of every
+      approval that exists, in any multiplicity: replay and re-targeting are
+      built into the model rather than assumed away. 6 invariants hold over
+      1,326,144 distinct states (CI gate, ~24 s). Each of the three defences
+      — the request-hash binding, the offline authority, the approver's own
+      clock — is switched off in a sanity config that must produce a
+      counterexample, so the green run is attributable to the check and not
+      to the shape of the protocol. `formal/README.md` "DeleteQuorum".
 - [x] `cargo-fuzz` targets for every parser consuming peer bytes — **six**
       shipped (`fuzz/run.sh`), asserting properties rather than merely absence
       of panics. Found three canonicalisation defects in 45 seconds that the

@@ -15,20 +15,37 @@ Docker 29.3.0, colima 0.10.1.
 cd formal && ./check.sh
 ```
 
-Observed (2026-08-25):
+Observed (2026-09-08), 22.9 s wall:
 
 ```
 ── Lean ──────────────────────────────────────────────────────────
 no-sorry gate                                  ok
-lean/NasVerify/Transcript.lean                 verified
+lean/NasVerify/Padding.lean                    verified (11 theorems, axioms enumerated)
+lean/NasVerify/Transcript.lean                 verified (3 theorems, axioms enumerated)
 ── TLA+ ──────────────────────────────────────────────────────────
-SlotConsistency invariants (MaxSeq=2)          ok — 38709 distinct states
-sanity: NeverForks                             violated as required
-sanity: NeverAlarms                            violated as required
-sanity: ForkAlwaysDetected                     violated as required
+SlotConsistency invariants (MaxSeq=2, ForkAt=1) ok — 337817 distinct states
+SlotConsistency invariants (MaxSeq=2, ForkAt=2) ok — 38709 distinct states
+sanity: NeverForks (MaxSeq=2, ForkAt=1)        violated as required
+sanity: NeverForks (MaxSeq=2, ForkAt=2)        violated as required
+sanity: NeverAlarms (MaxSeq=2, ForkAt=1)       violated as required
+sanity: NeverAlarms (MaxSeq=2, ForkAt=2)       violated as required
+sanity: ForkAlwaysDetected (MaxSeq=2, ForkAt=1) violated as required
+sanity: ForkAlwaysDetected (MaxSeq=2, ForkAt=2) violated as required
+LeaseGC invariants (grace-expiry-notice 1-1-1) ok — 242988 distinct states
+LeaseGC invariants (grace-expiry-notice 1-2-3) ok — 652268 distinct states
+sanity: NeverSweeps (LeaseGC)                  violated as required
+sanity: GraceIsRedundant (LeaseGC)             violated as required
+sanity: NoticeIsRedundant (LeaseGC)            violated as required
+sanity: RenewalNeverRestores (LeaseGC)         violated as required
+sanity: EveryUploadGetsGrace (LeaseGC)         violated as required
 ──────────────────────────────────────────────────────────────────
 formal: PASS
 ```
+
+The first observation of this gate (2026-08-25) was one Lean file, one TLC
+config and three sanity checks; the gate has since grown a second Lean file,
+`ForkAt` varied over its whole range, and `LeaseGC.tla`. Every line above is
+from a single run on the merged tree.
 
 `check.sh` fetches `tla2tools.jar` (2.2 MB) on first run; it is gitignored.
 

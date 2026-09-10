@@ -58,6 +58,14 @@ listing; lease-based GC with deltas; **three confidentiality modes** (`e2ee`,
   client holds. Five invariants and one action property, `NoFalseAlarm` among
   them; state counts are unchanged, because the change is to what is derived
   and not to the state space.
+- **`formal/tlaplus/LeaseGC.tla`** — MODEL-CHECKED. The write/sweep race of
+  SPECS §6 against an *honest* peer, transcribed guard for guard from
+  `plan_sweep` in `crates/nas-lease/src/sweep.rs`. 242,988 distinct states at
+  the tightest windowing (grace-expiry-notice 1-1-1) and 652,268 at 1-2-3, both
+  in the CI gate. Seven invariants hold and five must-FAIL checks fire — one of
+  them a finding, not a sanity check: `EveryUploadGetsGrace` fails because
+  §6.2's grace is keyed to the blob file's mtime, which a deduplicated upload
+  does not move. Open in TODO.md as a decision about what `uploaded_at` means.
 - **`crates/nas-core`** — canonical encoder with proptests mirroring the Lean
   theorems, plus `Addr`, the `Clock` trait and the format discriminants.
   15 tests green.
@@ -188,7 +196,7 @@ See `MANUAL-TESTING.md` §5 for the commands and raw output.
 
 | | count |
 |---|---|
-| Rust tests (`cargo test --workspace`, unit + integration) | 537 |
+| Rust tests (`cargo test --workspace`, unit + integration) | 552 |
 | Lean theorems (clean axiom gate) | 14 |
 | `cargo-fuzz` targets | 14 |
 | Acceptance assertions passing (≤M1) | 40 of 95 |

@@ -31,6 +31,15 @@ pub enum SigContext {
     SlotCheckpoint,
     Roster,
     Cap,
+    /// SPECS §5.3: a signed observation of a slot head.
+    ///
+    /// **v2.** v1 signed `(slot, seq, BLAKE3(sig), logical_time)` and carried
+    /// no ancestry, so two observations could only be compared when they named
+    /// the same sequence. v2 signs `(slot, seq, record_hash, prev,
+    /// logical_time)` — one edge of the chain — which is what lets a client
+    /// walk one head back to another's sequence. The context string is bumped
+    /// rather than reused: a v1 witness must not verify as a v2 one, because
+    /// its `prev` would then be a field nobody signed.
     Witness,
     Retention,
     DeleteRequest,
@@ -54,7 +63,7 @@ impl SigContext {
             Self::SlotCheckpoint => b"nas-tools/sig/slot-checkpoint/v1",
             Self::Roster => b"nas-tools/sig/roster/v1",
             Self::Cap => b"nas-tools/sig/cap/v1",
-            Self::Witness => b"nas-tools/sig/witness/v1",
+            Self::Witness => b"nas-tools/sig/witness/v2",
             Self::Retention => b"nas-tools/sig/retention/v1",
             Self::DeleteRequest => b"nas-tools/sig/delete-request/v1",
             Self::DeleteApproval => b"nas-tools/sig/delete-approval/v1",

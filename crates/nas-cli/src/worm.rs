@@ -301,7 +301,8 @@ fn cycle(mode: Mode) -> Result<String, String> {
     // The witness relay, on the same peer, in the same mode.
     let observer = Identity::derive(&[0x0B; 32], Role::Witness).map_err(|e| e.to_string())?;
     let slot = SlotId::new(observer.verifying_key(), b"lease-cycle");
-    let w = Witness::sign(&observer, slot, 1, [0xA1; 32], 1).map_err(|e| e.to_string())?;
+    let w =
+        Witness::sign(&observer, slot, 1, [0xA1; 32], [0xA0; 32], 1).map_err(|e| e.to_string())?;
     peer.publish_witness(w)
         .map_err(|e| format!("witness: {e}"))?;
 

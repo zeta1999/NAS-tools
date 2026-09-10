@@ -12,7 +12,7 @@ and takes ~11 minutes on a laptop, almost all of it in the ForkAt=1 run.
 |---|---|---|
 | `lean/NasVerify/Transcript.lean` | Lean 4.28 | **VERIFIED** — 3 theorems, 0 admitted, axioms clean |
 | `lean/NasVerify/Padding.lean` | Lean 4.28 | **VERIFIED** — 11 theorems, 0 admitted, axioms clean. Models the *ladder* (closing the gap where `Nat` truncation hid a `usize` underflow) and the reader's strict check (closing the class-selection covert channel the M0 review found) |
-| `tlaplus/SlotConsistency.tla` | TLA+ / TLC | **MODEL-CHECKED** — but note it constrains §5, which is **M2** code; it is assurance about the design, not about anything shipped in M0. `ForkAt` (the sequence number at which branch "b" diverges) is varied over every admissible point, `1..MaxSeq`, not fixed at one value — see [Varying `ForkAt`](#varying-forkat) below. CI gate, MaxSeq=2: ForkAt=1 337,817 distinct states, depth 25 (~3 s); ForkAt=2 38,709 distinct states, depth 20 (~1 s). Deep gate (`DEEP=1`), MaxSeq=3: ForkAt=1 38,366,601 distinct states from 570.7 M generated, depth 35 (~10 min); ForkAt=2 4,699,837 distinct states from 60.1 M generated, depth 30 (~1 min); ForkAt=3 443,429 distinct states, depth 25 (~7 s). 4 invariants + 1 action property hold at every (MaxSeq, ForkAt) pair. |
+| `tlaplus/SlotConsistency.tla` | TLA+ / TLC | **MODEL-CHECKED**, revision 3 — but note it constrains §5, which is **M2** code; it is assurance about the design, not about anything shipped in M0. `ForkAt` (the sequence number at which branch "b" diverges) is varied over every admissible point, `1..MaxSeq`, not fixed at one value — see [Varying `ForkAt`](#varying-forkat) below. CI gate, MaxSeq=2: ForkAt=1 337,817 distinct states, depth 25 (~3 s); ForkAt=2 38,709 distinct states, depth 20 (~1 s). Deep gate (`DEEP=1`), MaxSeq=3: ForkAt=1 38,366,601 distinct states from 570.7 M generated, depth 35; ForkAt=2 4,699,837 distinct states from 60.1 M generated, depth 30; ForkAt=3 443,429 distinct states, depth 25. **5** invariants + 1 action property hold at every (MaxSeq, ForkAt) pair. Revision 3 changed what is *derived* from the state, not the state space, so every count above is unchanged from revision 2 — measured, not assumed. |
 | sanity checks | TLA+ / TLC | **3 required counterexamples found, at both ForkAt=1 and ForkAt=2** — the model is not vacuous at either end of the admissible range |
 
 ### What the model check actually caught
@@ -34,6 +34,34 @@ as a client bug:
 3. **Compatibility was branch equality**, so divergence at *different* sequence
    numbers was invisible. Replaced with a real ancestry relation over a shared
    prefix.
+
+### The defect revision 3 caught, which is defect 1 in a mirror
+
+The fix for defect 3 gave the client `Compatible` — a *global* ancestry
+relation that answers for any two versions using branch structure nobody ever
+sent it. Defect 1 was evidence lost; this was evidence **assumed**, and it is
+the harder one to notice, because the model goes green either way. What it
+meant in practice: TLC was checking a detection rule `nas-slots` could not run,
+and `client.rs` said so in its own header rather than pretending otherwise.
+
+The fix has two halves, and they match the Rust one for one:
+
+- a witness records its version **and that version's predecessor** — one edge
+  of the chain (`Pred`), which is `record_hash` plus the observed record's own
+  `prev` in `crates/nas-slots/src/witness.rs`;
+- detection is `KnownIncompatible`, which walks back only along edges in
+  `known[c]` (`Named`). A missing link is a **gap**: the walk stops and raises
+  nothing.
+
+`ForkDetected` carries the hypothesis in its antecedent — `Linked(known[c1], …)`
+— so it now says *incompatible evidence raises once the linking witnesses are
+known*, which is what the design delivers and no more. `NoFalseAlarm` is the
+fifth invariant and states the other direction: evidence that is genuinely all
+on one history never raises. That is the property the Rust module defends in
+its tests, and the one a "detect more" change would quietly break.
+
+`Compatible` survives as the yardstick the invariants are stated against. It is
+never something a client evaluates.
 
 ### Varying `ForkAt`
 
@@ -83,7 +111,7 @@ state. Three properties are therefore asserted **expecting failure**, and
 |---|---|
 | `NeverForks` | forks must be reachable, or `ForkDetected` is trivially true |
 | `NeverAlarms` | alarms must be reachable, or detection is never exercised |
-| `ForkAlwaysDetected` | **SPECS §5.4 claims detection, explicitly not prevention.** TLC finds a 6-state trace where a peer withholds every witness and two clients stay forked with nobody alarmed. If this ever *passed*, we would have accidentally claimed a guarantee this architecture cannot deliver. |
+| `ForkAlwaysDetected` | **SPECS §5.4 claims detection, explicitly not prevention.** TLC finds a short trace where a peer withholds every witness and two clients stay forked with nobody alarmed. If this ever *passed*, we would have accidentally claimed a guarantee this architecture cannot deliver. Revision 3 gives the peer a second and more realistic way to win it: relay *some* witnesses, but not the ones that link two heads — detection then stalls at a gap rather than at silence. |
 
 That last row is the one worth internalising: the counterexample is not a
 failure, it is **positive evidence that the specification says what the prose

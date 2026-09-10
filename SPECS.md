@@ -365,7 +365,7 @@ message is prefixed with its context string, and roles use distinct keypairs:
 ```
 "nas-tools/sig/slot/v1"             "nas-tools/sig/lease/v1"
 "nas-tools/sig/checkpoint/v1"       "nas-tools/sig/roster/v1"
-"nas-tools/sig/cap/v1"              "nas-tools/sig/witness/v1"
+"nas-tools/sig/cap/v1"              "nas-tools/sig/witness/v2"
 "nas-tools/sig/retention/v1"        "nas-tools/sig/delete-request/v1"
 "nas-tools/sig/delete-approval/v1"  "nas-tools/sig/delete-execution/v1"
 "nas-tools/sig/wrap/v1"             "nas-tools/sig/mirror-publish/v1"
@@ -700,13 +700,27 @@ Three mechanisms, all new or repaired in revision 2:
    observation and the untrusted peer relays it:
 
    ```
-   Witness { witness_pk, slot_id, seq, sig_hash, logical_time, sig }
-   sig context "nas-tools/sig/witness/v1"
+   Witness { witness_pk, slot_id, seq, record_hash, prev, logical_time, sig }
+   sig context "nas-tools/sig/witness/v2"
    ```
 
+   **v2 — a witness names one edge of the chain.** `record_hash` is the
+   observed record's hash (§5.3 mechanism 2: what the successor's `prev` must
+   equal) and `prev` is that record's own predecessor. v1 carried `BLAKE3(sig)`
+   and no `prev`, which made a witness comparable only against another naming
+   the *same* sequence — and a real fork has each device reporting its own
+   head, so the two live branches sit at different heights. The genesis rule of
+   the record format applies here too: `seq` 0 iff an all-zero `prev`. v1
+   witnesses are refused with a version error rather than upgraded; they carry
+   no ancestry to upgrade.
+
    The peer stores and serves witnesses. It can withhold or delay them; it
-   **cannot forge** them. Two witnesses citing incompatible `(seq, sig_hash)` on one
-   slot are a self-contained, publishable *proof* of a fork — not a heuristic.
+   **cannot forge** them. Witnesses citing incompatible records on one slot are a
+   self-contained, publishable *proof* of a fork — not a heuristic — either at
+   one sequence, or at different sequences once the holder has the links between
+   them. A gap in those links is **not** a fork: a holder that cannot walk from
+   one observation to the other says nothing, because a relay that withheld a
+   single witness could otherwise manufacture an alarm against an honest slot.
    Devices that never meet directly therefore still detect forks, so long as the
    peer does not withhold consistently and forever; and persistent withholding is
    itself a signal, since an active device's witnesses should keep arriving.
@@ -1783,6 +1797,8 @@ scrutiny.
 |---|---|
 | §6.3 `notice` window (30 days) split from §6.2 `grace` (24 h) | One field served both, so the warn-before-sweep window was 24 hours wide after a 90-day absence |
 | §6.3 warning fires inside the window, on every sync | It fired only once the window had closed — after the deletion, which is an obituary, not a warning |
+| §5.3 witness format v2: `record_hash` + `prev`, context `.../sig/witness/v2` | v1 carried `BLAKE3(sig)` and no ancestry, so two observations were comparable only at the *same* sequence — and a real fork has each device reporting its own head, at different heights. A witness now names one edge of the chain. Wire-breaking; rides the §14 coordinated rollout, and a v1 witness is refused with a version error rather than upgraded |
+| §5.3 a gap between observations is stated as **not** a fork | Detection at different sequences needs the links between them; a holder that guessed could be made to alarm on an honest slot by a relay withholding one witness. §5.4's convergence limit, seen from the other side |
 
 ### Revision 5
 

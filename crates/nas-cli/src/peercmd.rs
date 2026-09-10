@@ -1244,18 +1244,42 @@ pub fn sync(ns: &str, o: SyncOpts<'_>) -> i32 {
             }
         }
         for w in witnessed {
-            match at(w.seq) {
-                Some(r) if r.sig_hash() != w.sig_hash => {
+            // Three ways to check one observation, and a witness now speaks
+            // the same hash as the other two, so all three are available:
+            //   - the record itself, if the walk covered that sequence;
+            //   - a checkpoint rung naming that record, if the walk skipped it
+            //     (v1 witnesses carried a signature hash and rungs a record
+            //     hash, so a rung could not stand in for one; v2 witnesses
+            //     carry the record hash, and it can);
+            //   - the record *above* it, whose `prev` names it — which reaches
+            //     into the skipped span from its upper edge.
+            let above = w
+                .seq
+                .checked_add(1)
+                .and_then(|s| chain.iter().find(|r| r.seq == s));
+            match (at(w.seq), rung_at(w.seq), above) {
+                (Some(r), _, _) if r.record_hash() != w.record_hash => {
                     return refused(format!(
                         "fork: the witness saw a different record at seq {} than the chain the peer now serves (SPECS §5.3)",
                         w.seq
                     ))
                 }
-                Some(_) => {}
-                // A witness carries a signature hash and a rung carries a
-                // record hash, so a rung cannot stand in for one. A witness
-                // below the skipped span simply was not checked.
-                None => unchecked += 1,
+                (None, Some(c), _) if c.record_hash != w.record_hash => {
+                    return refused(format!(
+                        "fork: the peer's checkpoint at seq {} names a different record than the witness saw (SPECS §5.3, §5.5)",
+                        w.seq
+                    ))
+                }
+                (None, None, Some(r)) if r.prev != w.record_hash => {
+                    return refused(format!(
+                        "fork: the record the peer serves at seq {} descends from something other than the record the witness saw at seq {} (SPECS §5.3)",
+                        r.seq, w.seq
+                    ))
+                }
+                (Some(_), _, _) | (None, Some(_), _) | (None, None, Some(_)) => {}
+                // Nothing covers this sequence: it fell in the skipped span
+                // and no rung or successor reaches it. NOT a pass.
+                (None, None, None) => unchecked += 1,
             }
         }
 
@@ -1363,7 +1387,10 @@ pub fn sync(ns: &str, o: SyncOpts<'_>) -> i32 {
         },
     };
 
-    let (seq, sig_hash) = match next {
+    // What this device will witness: the record it ends the sync holding,
+    // named the way a v2 witness names one — `(seq, record_hash, prev)`, one
+    // edge of the chain rather than a bare identity.
+    let (seq, record_hash, prev) = match next {
         None => {
             let Some(h) = served.as_ref() else {
                 // Nothing served, nothing local, and (if asked) no witness
@@ -1379,7 +1406,7 @@ pub fn sync(ns: &str, o: SyncOpts<'_>) -> i32 {
                     return err(e);
                 }
             }
-            (h.seq, h.sig_hash())
+            (h.seq, h.record_hash(), h.prev)
         }
         Some((seq, prev, tree)) => {
             // ── Root manifest (SPECS §3.1) ──
@@ -1482,14 +1509,14 @@ pub fn sync(ns: &str, o: SyncOpts<'_>) -> i32 {
                     }
                 }
             }
-            (seq, rec.sig_hash())
+            (seq, rec.record_hash(), rec.prev)
         }
     };
 
     if let Some((mut wch, wid, addr, _, _)) = witness_node {
         // `logical_time` is this observer's own counter, not a clock; the slot
         // sequence is monotone for one namespace's observations of its own slot.
-        let w = match Witness::sign(&wid, slot, seq, sig_hash, seq) {
+        let w = match Witness::sign(&wid, slot, seq, record_hash, prev, seq) {
             Ok(w) => w,
             Err(e) => return err(format!("witness sign: {e}")),
         };

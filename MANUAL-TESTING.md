@@ -51,12 +51,22 @@ Takes ~46 s and ~3 GB heap. Fine on 16 GB; do not run it concurrently with a
 
 ### 1b. Reproducing the defect the model caught
 
-Revision 1 of `SlotConsistency.tla` failed in 7 states. To see it, restore the
-`pinSeq[c] > 0` guard in `RelayWitness` and re-run — TLC reports
-`Invariant ForkDetected is violated` with a trace where a witness reaches a
-client that has not yet pinned anything, is dropped, and is never reconsidered.
-That is a real client bug shape, not a modelling artefact: "handle the event,
-then forget it" is the default way anyone would implement it.
+Revision 1 of `SlotConsistency.tla` failed in 7 states, on a witness that
+reached a client which had not yet pinned anything, was dropped, and was never
+reconsidered. That is a real client bug shape, not a modelling artefact:
+"handle the event, then forget it" is the default way anyone would implement
+it.
+
+> **This recipe no longer reproduces it, and did not before revision 3
+> either.** The instruction here used to be "restore the `pinSeq[c] > 0` guard
+> in `RelayWitness` and re-run". Checked while making revision 3: putting that
+> guard back into revision 2 gives `No error has been found`, and so does
+> putting it into revision 3. `ForkDetected` in both revisions has
+> `Head(c2) \in known[c1]` in its antecedent, and the guard is exactly what
+> stops that becoming true — so the invariant goes vacuous for the pair rather
+> than failing. Revision 1 lost the evidence somewhere else; reproducing it
+> needs revision 1 itself, not one guard added to a later one. Recorded rather
+> than quietly deleted, because the recipe read as verified and was not.
 
 ### 1c. Confirming the sanity checks still bite
 
@@ -965,11 +975,18 @@ Observed, in order:
 - conn 6, main, device 1 **with** the witness node: `refused: fork: the
   witness saw a different record at seq 1 than the chain the peer now serves
   (SPECS §5.3)`, exit 2. The served head is seq 2; the contradicting witness
-  is device 2's, at seq 1 — *below* the head, which is the case
-  `SlotClient::forked` cannot see on its own (a witness carries no ancestry).
+  is device 2's, at seq 1 — *below* the head.
   `nas peer sync` walks the peer's retained history (`SlotHistory`) from the
   lowest witnessed or pinned sequence and compares each witness at its own
   sequence.
+
+  > Recorded as observed on the date above, when a witness carried no ancestry
+  > and this was the *only* route to it. Witnesses are format v2 now and carry
+  > the record they saw plus that record's predecessor, so `SlotClient::forked`
+  > sees this case from witnesses alone once it holds the links. The drill's
+  > output is unchanged — re-run after the change, conns 6 and 10 still refuse
+  > at seq 1 with the same message — because the served history reaches seq 1
+  > here, and that check fires first.
 - conn 7, private, device 2 with the witness node: accepted (`walked seq 0..2;
   the pin and 2 witnesses lie on it`), witnesses seq 2, exit 0. Correct, and
   worth stating: nothing device 1 saw has reached the relay, because device 1

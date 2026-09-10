@@ -14,9 +14,11 @@ pub use checkpoint::{
     is_checkpoint_seq, plan_walk, verify_skip_chain, Checkpoint, CheckpointError, SkipError,
     SkipWalk, WalkPlan, CHECKPOINT_INTERVAL, RETAIN_N,
 };
-pub use client::{Anchor, Pin, Reject, SlotClient, Verdict};
+pub use client::{
+    Anchor, Pin, Reject, SlotClient, Verdict, MAX_HASHES_PER_SEQ, MAX_WALK_STEPS, MAX_WITNESSES,
+};
 pub use handoff::{HandoffError, SlotHandoff};
 pub use id::{SlotId, WriterId};
 pub use record::{RecordError, Regime, SlotRecord, ROOT_NONCE_LEN};
 pub use roster::{Roster, RosterError};
-pub use witness::{ForkProof, Witness, WitnessError};
+pub use witness::{ForkProof, Witness, WitnessError, MAX_LINK};

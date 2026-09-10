@@ -2017,8 +2017,8 @@ mod fork_tests {
         p.set_view(1);
         let head_b = p.slot_head(&slot()).unwrap().clone();
 
-        let wa = Witness::sign(&wa_id, slot(), head_a.seq, head_a.sig_hash(), 0).unwrap();
-        let wb = Witness::sign(&wb_id, slot(), head_b.seq, head_b.sig_hash(), 0).unwrap();
+        let wa = Witness::of_record(&wa_id, &head_a, 0).unwrap();
+        let wb = Witness::of_record(&wb_id, &head_b, 0).unwrap();
         let proof = nas_slots::ForkProof::try_new(&wa, &wb)
             .expect("two clients on a forking peer must be able to prove it");
         assert!(proof.verify());
@@ -2257,8 +2257,11 @@ mod append_tests {
         SlotId::new(b"ns", b"witnessed")
     }
 
-    fn witness(observer: &Identity, seq: u64, sig_hash: [u8; 32]) -> Witness {
-        Witness::sign(observer, slot(), seq, sig_hash, seq).unwrap()
+    fn witness(observer: &Identity, seq: u64, record_hash: [u8; 32]) -> Witness {
+        // A non-zero `prev` at every sequence but 0: these are relay tests, and
+        // the genesis rule is `nas-slots`' to enforce.
+        let prev = if seq == 0 { [0u8; 32] } else { [0xE0; 32] };
+        Witness::sign(observer, slot(), seq, record_hash, prev, seq).unwrap()
     }
 
     #[test]

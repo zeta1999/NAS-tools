@@ -64,18 +64,27 @@ settled and the work that follows from them.
 - [x] CI gate that fails on `sorry` in any Lean file — and a stronger one: every
       theorem carries `#print axioms`, and the gate fails on anything outside
       `propext` / `Classical.choice` / `Quot.sound`. Both verified to bite.
-- [ ] **Close the `ForkDetected` gap in `nas-slots` alone.** `SlotClient::forked`
-      on witnesses only detects same-sequence equivocation; the TLA+
-      `Compatible` relation is a full ancestry check that also catches branches
-      at *different* sequence numbers — which is what a real fork usually looks
-      like, since each device witnesses its own head. **Closed over the wire:**
-      `nas peer sync` walks the peer's retained history from the lowest
-      witnessed/pinned sequence, so every witness is compared at its own
-      sequence (`a_fork_at_disjoint_sequences_is_detected_once_the_chain_is_walked`,
-      `uc12_fork_drill.sh` conns 6 and 10). Still open without a history to
-      walk — a witness carries no ancestry: needs witnesses to carry a
-      `prev`/checkpoint link, and a model whose witness abstraction matches.
-      Asserted by `a_fork_at_disjoint_sequences_is_NOT_detected`.
+- [x] **Close the `ForkDetected` gap in `nas-slots` alone.** **Done.** A
+      `Witness` is now format v2 and carries one edge of the chain — the
+      observed record's `record_hash` plus that record's own `prev` — so
+      `SlotClient::forked` no longer needs a served history to compare two
+      branches at *different* sequence numbers, which is what a real fork looks
+      like since each device witnesses its own head
+      (`a_fork_at_disjoint_sequences_is_detected_once_the_links_are_known`).
+      `SlotConsistency.tla` revision 3 matches: witnesses carry a predecessor,
+      detection is `KnownIncompatible` over links the client actually holds,
+      and `ForkDetected` carries that hypothesis in its antecedent instead of
+      handing the client the global `Compatible`.
+      **What is genuinely left, and it is the design's own limit, not a bug:**
+      a walk still needs the linking observations. Two witnesses with a gap
+      between them are left unproven and raise nothing
+      (`a_gap_in_the_walk_raises_nothing`) — soundness over completeness, since
+      a relay that withheld one witness could otherwise make an honest slot
+      look forked. That is SPECS §5.4's "converges once witnesses propagate",
+      and no data model closes it. The over-the-wire route is unchanged and
+      still stronger where the peer retains history
+      (`a_fork_below_the_served_head_is_detected_by_the_offer_alone`,
+      `uc12_fork_drill.sh` conns 6 and 10).
 - [x] **Vary `ForkAt` in the TLC configs.** Was fixed at 2 in both configs.
       Now gated over the whole admissible range `1..MaxSeq` — `MC_*_fork1.cfg`
       (fork at genesis, no shared prefix) and `MC_full_fork3.cfg`

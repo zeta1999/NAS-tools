@@ -489,8 +489,7 @@ fn witness_withholding(writer: &Identity, with_node: bool, cold: bool) -> Result
     let r1b = record(writer, 1, r0.record_hash(), 0xB2)?;
     let roster = roster_of(writer)?;
     let observer = identity(0x0B, Role::Witness)?;
-    let w = Witness::sign(&observer, slot(), 1, r1a.sig_hash(), 1)
-        .map_err(|e| format!("witness: {e}"))?;
+    let w = Witness::of_record(&observer, r1a, 1).map_err(|e| format!("witness: {e}"))?;
 
     // Relay sanity: an honest peer hands back what was published to it.
     let mut honest = Lab::honest("witness-honest", writer)?;
@@ -770,8 +769,7 @@ fn fork_via_witness() -> Result<Result<String, String>, String> {
     // Device A's witness key. B never meets A — it only ever sees A's signed
     // observation, and only through the node.
     let observer = identity(0x0B, Role::Witness)?;
-    let w = Witness::sign(&observer, slot(), 1, r1a.sig_hash(), 1)
-        .map_err(|e| format!("witness: {e}"))?;
+    let w = Witness::of_record(&observer, r1a, 1).map_err(|e| format!("witness: {e}"))?;
 
     // Honest topology: one straight history, A's witness carried by the node.
     {
@@ -875,8 +873,7 @@ fn node_holds_nothing() -> Result<Result<String, String>, String> {
     let writer = identity(0x0A, Role::Slot)?;
     let base = chain(&writer, 2)?;
     let observer = identity(0x0B, Role::Witness)?;
-    let w = Witness::sign(&observer, slot(), 1, base[1].sig_hash(), 1)
-        .map_err(|e| format!("witness: {e}"))?;
+    let w = Witness::of_record(&observer, &base[1], 1).map_err(|e| format!("witness: {e}"))?;
     let rec = base[0].encode().map_err(|e| e.to_string())?;
 
     let mut full = Lab::honest("wn-full", &writer)?;

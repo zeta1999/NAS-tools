@@ -125,6 +125,63 @@ for inv in NeverForks NeverAlarms ForkAlwaysDetected; do
     fi
   done
 done
+
+# ── DeleteQuorum (SPECS §16.2) ────────────────────────────────────────────
+# Self-contained: its own runner, its own configs, nothing shared above.
+#
+# The deletion loop rests on three checks — the request-hash binding plus the
+# collapse of approvers by key id (`DeleteExecution::verify`, `decide`), the
+# offline authority (`Authority`), and the approver device's own clock
+# (`Approver::may_sign`). Each one is REMOVED in a sanity configuration below,
+# so a green run is attributable to the check rather than to the shape of the
+# protocol. Three further sanity checks establish that the model reaches its
+# interesting states at all: deletions execute, a full escalated quorum of
+# distinct authority members is reachable on one request, and there are states
+# in which a member holds the request but has not yet matured — the window in
+# which back-dating would pay, and without which NoEarlyApproval is vacuous.
+run_dq() { java -Xmx4g -XX:+UseParallelGC -cp tla2tools.jar tlc2.TLC \
+             -workers 4 -nowarning -config "$1" DeleteQuorum 2>&1; }
+
+if [ "${DEEP:-0}" = "1" ]; then
+  DQ_CFGS="small:MC_DeleteQuorum_small.cfg deep:MC_DeleteQuorum.cfg"
+else
+  DQ_CFGS="small:MC_DeleteQuorum_small.cfg"
+fi
+
+for entry in $DQ_CFGS; do
+  size=${entry%%:*}
+  cfg=${entry#*:}
+  case $size in
+    small) label="DeleteQuorum invariants (3-slot bundles)" ;;
+    deep)  label="DeleteQuorum invariants (4-slot bundles)" ;;
+  esac
+  out=$(run_dq "$cfg")
+  if echo "$out" | grep -q "No error has been found"; then
+    # Last match, not first: TLC repeats the phrase on its per-minute progress
+    # line, and only the final summary carries the total.
+    n=$(echo "$out" | grep -oE "[0-9][0-9,]* distinct states" | tail -1)
+    say "$label" "ok — $n"
+  else
+    say "$label" "FAIL"; echo "$out" | tail -60; fail=1
+  fi
+done
+
+for entry in NeverExecutes:NeverExecutes \
+             NeverReachesQuorum:NeverReachesQuorum \
+             NeverPending:NeverPending \
+             replay:NoReplayCountsTwice \
+             minted:NoExecutionWithoutQuorum \
+             backdate:NoEarlyExecution; do
+  cfgname=${entry%%:*}
+  inv=${entry#*:}
+  label="sanity: DeleteQuorum $cfgname"
+  out=$(run_dq "MC_DeleteQuorum_${cfgname}.cfg")
+  if echo "$out" | grep -q "Invariant $inv is violated"; then
+    say "$label" "violated as required ($inv)"
+  else
+    say "$label" "FAIL — model is VACUOUS"; fail=1
+  fi
+done
 popd >/dev/null
 
 echo "──────────────────────────────────────────────────────────────────"

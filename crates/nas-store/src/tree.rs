@@ -737,7 +737,10 @@ mod tests {
                 target: b"nowhere".to_vec(),
             }
         );
-        assert!(matches!(sub.entries[b"docs_link".as_slice()], Entry::Symlink { .. }));
+        assert!(matches!(
+            sub.entries[b"docs_link".as_slice()],
+            Entry::Symlink { .. }
+        ));
 
         ts.read_dir_to(&root, &addr, &dst).unwrap();
         assert_eq!(snapshot(&src), snapshot(&dst));
@@ -1084,7 +1087,8 @@ mod tests {
         // one; a decoder that accepted it would have a second spelling with
         // no first.
         let mut dm = sample_dm();
-        dm.entries.insert(b"l".to_vec(), Entry::Symlink { target: vec![] });
+        dm.entries
+            .insert(b"l".to_vec(), Entry::Symlink { target: vec![] });
         assert!(matches!(dm.encode(), Err(TreeError::NonCanonical { .. })));
 
         let framed = nas_core::encode_fields(&[&DIR_MAGIC[..], b"l", &[2u8], b""]).unwrap();

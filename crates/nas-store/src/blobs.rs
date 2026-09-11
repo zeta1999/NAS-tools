@@ -151,13 +151,24 @@ impl BlobStore {
     /// but only if what is there is actually intact; skipping the check would
     /// turn a corrupt local blob into permanent silent data loss the moment a
     /// second copy of the same chunk was offered and discarded.
+    ///
+    /// A deduplicated put still **moves the file's mtime to now**. The mtime
+    /// is what a peer reports as `uploaded_at`, and SPECS §6.2 owes its
+    /// young-blob grace to *every* upload: the second client whose convergent
+    /// ciphertext deduplicates, and the client retrying after a crash, are
+    /// exactly the ones about to take a lease they do not yet hold.
+    /// `LeaseGC.tla` (`EveryUploadGetsGrace`) found the version of this
+    /// function that returned early without touching. See [`Self::touch`].
     pub fn put(&self, ciphertext: &[u8]) -> Result<Addr, StoreError> {
         let addr = self.addressing.addr_of(ciphertext);
         let dest = self.path(&addr);
 
         if dest.exists() {
             match fs::read(&dest) {
-                Ok(existing) if self.addressing.verifies(&addr, &existing) => return Ok(addr),
+                Ok(existing) if self.addressing.verifies(&addr, &existing) => {
+                    Self::touch_path(&dest)?;
+                    return Ok(addr);
+                }
                 Ok(_) | Err(_) => { /* fall through and rewrite it */ }
             }
         }
@@ -212,12 +223,42 @@ impl BlobStore {
     /// skip an upload has, if it is lying, performed a silent deletion
     /// discovered only at a future read. Only a holder of the ciphertext can
     /// answer this.
+    ///
+    /// Answering also **restarts the blob's mtime**. A client that accepts the
+    /// proof skips its upload and relies on the copy here, so for SPECS §6.2's
+    /// grace this *is* its upload — the peer never sees a `put` on that path —
+    /// and it is treated exactly as a deduplicated [`Self::put`] is.
     pub fn prove(&self, addr: &Addr, nonce: &[u8; 32]) -> Result<[u8; 32], StoreError> {
         let ct = self.get(addr)?;
         let mut h = blake3::Hasher::new();
         h.update(nonce);
         h.update(&ct);
+        self.touch(addr)?;
         Ok(*h.finalize().as_bytes())
+    }
+
+    /// Move a blob's mtime to now — the peer's `uploaded_at` for it.
+    ///
+    /// The mtime records the *latest* moment a client handed over or was
+    /// proven these bytes, not the first: SPECS §6.2's grace is owed to each
+    /// upload, and a deduplicated one is still an upload. [`Self::put`] and
+    /// [`Self::prove`] call this; it is public so a peer can restart the
+    /// window wherever else a client commits to a copy it holds.
+    pub fn touch(&self, addr: &Addr) -> Result<(), StoreError> {
+        match Self::touch_path(&self.path(addr)) {
+            Err(StoreError::Io(e)) if e.kind() == io::ErrorKind::NotFound => {
+                Err(StoreError::Missing { addr: *addr })
+            }
+            r => r,
+        }
+    }
+
+    fn touch_path(path: &Path) -> Result<(), StoreError> {
+        fs::OpenOptions::new()
+            .write(true)
+            .open(path)?
+            .set_modified(std::time::SystemTime::now())?;
+        Ok(())
     }
 
     /// Verify a peer's proof-of-possession answer against local plaintext.
@@ -303,6 +344,76 @@ mod tests {
         let b = st.put(b"chunk").unwrap();
         assert_eq!(a, b);
         assert_eq!(st.addrs().unwrap().len(), 1);
+    }
+
+    /// Backdate a blob's mtime by `secs`, the way a few days passing would.
+    fn backdate(st: &BlobStore, a: &Addr, secs: u64) {
+        let t = std::time::SystemTime::now() - std::time::Duration::from_secs(secs);
+        fs::OpenOptions::new()
+            .write(true)
+            .open(st.path(a))
+            .unwrap()
+            .set_modified(t)
+            .unwrap();
+    }
+
+    fn mtime_secs_ago(st: &BlobStore, a: &Addr) -> u64 {
+        let m = fs::metadata(st.path(a)).unwrap().modified().unwrap();
+        std::time::SystemTime::now()
+            .duration_since(m)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+    }
+
+    #[test]
+    fn a_deduplicated_put_restarts_the_clock() {
+        // SPECS §6.2 owes the grace to every upload. The mtime is the peer's
+        // `uploaded_at`; a put that finds the bytes already there must move
+        // it, or the second uploader is measured against the first one's
+        // clock. `LeaseGC.tla` (`EveryUploadGetsGrace`) found the version of
+        // `put` that did not.
+        let s = Scratch::new("dedup-touch");
+        let st = BlobStore::open(&s.0).unwrap();
+        let a = st.put(b"chunk").unwrap();
+        backdate(&st, &a, 3 * 24 * 3600);
+        assert!(
+            mtime_secs_ago(&st, &a) > 2 * 24 * 3600,
+            "backdating did not take"
+        );
+
+        assert_eq!(st.put(b"chunk").unwrap(), a);
+        assert!(
+            mtime_secs_ago(&st, &a) < 60,
+            "a deduplicated put left the old mtime"
+        );
+        assert_eq!(st.get(&a).unwrap(), b"chunk");
+    }
+
+    #[test]
+    fn an_answered_proof_restarts_the_clock() {
+        // The dedup path a client actually takes is HasBlob -> Prove -> skip:
+        // the peer never sees a put. So the proof is the upload.
+        let s = Scratch::new("prove-touch");
+        let st = BlobStore::open(&s.0).unwrap();
+        let a = st.put(b"chunk").unwrap();
+        backdate(&st, &a, 3 * 24 * 3600);
+        let nonce = [7u8; 32];
+        let p = st.prove(&a, &nonce).unwrap();
+        assert!(BlobStore::check_proof(b"chunk", &nonce, &p));
+        assert!(
+            mtime_secs_ago(&st, &a) < 60,
+            "an answered proof left the old mtime"
+        );
+    }
+
+    #[test]
+    fn touching_what_is_not_there_is_missing() {
+        let s = Scratch::new("touch-missing");
+        let st = BlobStore::open(&s.0).unwrap();
+        match st.touch(&Addr::of_ciphertext(b"never")) {
+            Err(StoreError::Missing { .. }) => {}
+            other => panic!("expected Missing, got {other:?}"),
+        }
     }
 
     #[test]

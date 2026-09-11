@@ -20,8 +20,8 @@ counterexample it finds in single-digit steps.
 | `lean/NasVerify/Padding.lean` | Lean 4.28 | **VERIFIED** — 11 theorems, 0 admitted, axioms clean. Models the *ladder* (closing the gap where `Nat` truncation hid a `usize` underflow) and the reader's strict check (closing the class-selection covert channel the M0 review found) |
 | `tlaplus/SlotConsistency.tla` | TLA+ / TLC | **MODEL-CHECKED**, revision 3 — but note it constrains §5, which is **M2** code; it is assurance about the design, not about anything shipped in M0. `ForkAt` (the sequence number at which branch "b" diverges) is varied over every admissible point, `1..MaxSeq`, not fixed at one value — see [Varying `ForkAt`](#varying-forkat) below. CI gate, MaxSeq=2: ForkAt=1 337,817 distinct states, depth 25 (~3 s); ForkAt=2 38,709 distinct states, depth 20 (~1 s). Deep gate (`DEEP=1`), MaxSeq=3: ForkAt=1 38,366,601 distinct states from 570.7 M generated, depth 35; ForkAt=2 4,699,837 distinct states from 60.1 M generated, depth 30; ForkAt=3 443,429 distinct states, depth 25. **5** invariants + 1 action property hold at every (MaxSeq, ForkAt) pair. Revision 3 changed what is *derived* from the state, not the state space, so every count above is unchanged from revision 2 — measured, not assumed. |
 | sanity checks | TLA+ / TLC | **3 required counterexamples found, at both ForkAt=1 and ForkAt=2** — the model is not vacuous at either end of the admissible range |
-| `tlaplus/LeaseGC.tla` | TLA+ / TLC | **MODEL-CHECKED** — the write/sweep race of SPECS §6, transcribed from `crates/nas-lease/src/sweep.rs`, which is M0 code that ships. 7 invariants hold at every windowing gated. CI gate: grace-expiry-notice 1-1-1 — 242,988 distinct states from 2,578,505 generated, depth 23 (~13 s); 1-2-3 — 652,268 distinct from 6,914,841 generated, depth 30 (~26 s). Deep gate (`DEEP=1`) adds 2-2-1 — 1,345,944 distinct from 15,186,524 generated, depth 25 (~50 s). The state counts are exact; the times were measured on a laptop running three other TLC jobs and are therefore upper bounds. It also **found a real gap** between §6.2 and the code — see [What `LeaseGC.tla` found](#what-leasegctla-covers-and-what-it-found) |
-| LeaseGC sanity checks | TLA+ / TLC | **5 required counterexamples found** at the CI bound — `NeverSweeps`, `GraceIsRedundant`, `NoticeIsRedundant`, `RenewalNeverRestores`, `EveryUploadGetsGrace`. The last is the finding, not a formality |
+| `tlaplus/LeaseGC.tla` | TLA+ / TLC | **MODEL-CHECKED** — the write/sweep race of SPECS §6, transcribed from `crates/nas-lease/src/sweep.rs`, which is M0 code that ships. 7 invariants hold at every windowing gated. CI gate: grace-expiry-notice 1-1-1 — 242,988 distinct states from 2,578,505 generated, depth 23 (~13 s); 1-2-3 — 652,268 distinct from 6,914,841 generated, depth 30 (~26 s). Deep gate (`DEEP=1`) adds 2-2-1 — 1,345,944 distinct from 15,186,524 generated, depth 25 (~50 s). The state counts are exact; the times were measured on a laptop running three other TLC jobs and are therefore upper bounds. It also **found a real gap** between §6.2 and the code, since closed — see [What `LeaseGC.tla` found](#what-leasegctla-covers-and-what-it-found) |
+| LeaseGC sanity checks | TLA+ / TLC | **5 required counterexamples found** at the CI bound — `NeverSweeps`, `GraceIsRedundant`, `NoticeIsRedundant`, `RenewalNeverRestores`, `EveryUploadGetsGrace`. The last is a negative control: its cfg sets `TouchOnDedup = FALSE`, the code the model found the gap in, and must reproduce it |
 | `tlaplus/DeleteQuorum.tla` | TLA+ / TLC | **MODEL-CHECKED** — the §16.2 deletion loop against a hostile executor that assembles the `DeleteExecution` bundle itself, out of every approval record that exists, in any multiplicity: replay and re-targeting are behaviours of the model, not things it assumes away. Constrains `crates/nas-delete` (`decide`, `DeleteExecution::verify`, `Approver::may_sign`), which is **M2** code. 6 invariants + 1 step property. CI gate (3 authority members, 1 minted key, 2 requests, cooling-off 2, bundles of 3): 1,326,144 distinct states from 7,889,266 generated, depth 22 (~24 s). Deep gate (`DEEP=1`, bundles of 4 — room to pad a full quorum with a replayed record): **the same 1,326,144 distinct states** from 12,793,312 generated, depth 22 (11 min 31 s). See [DeleteQuorum](#deletequorum-the-deletion-approval-loop-specs-162) |
 | DeleteQuorum sanity checks | TLA+ / TLC | **6 required counterexamples found** — three reachability, and three *negative controls* that switch off one defence apiece (the request-hash binding, the offline authority, the approver's own clock) and must then break the invariant that defence carries |
 
@@ -132,10 +132,11 @@ notice window; renewal as a side effect of sync (a take is a union that stamps
 `last_seen`, so a take of nothing renews); warn-before-sweep; the retention
 floor and the authenticated `forget` that is the only thing allowed to lift it.
 
-Seven invariants hold at every windowing gated — `TypeOK`,
+Eight invariants hold at every windowing gated — `TypeOK`,
 `LiveLeaseNeverSwept`, `GraceProtectsTheYoung`, `NoticeProtectsTheAbsent`,
-`FloorNeedsForget`, `RenewalRestoresProtection`, `WarnedBeforeSwept` — and five
-checks are asserted **expecting failure**:
+`FloorNeedsForget`, `RenewalRestoresProtection`, `WarnedBeforeSwept`, and since
+the fix below `EveryUploadGetsGrace` — and five checks are asserted
+**expecting failure**:
 
 | Check | Must fail because |
 |---|---|
@@ -143,7 +144,7 @@ checks are asserted **expecting failure**:
 | `GraceIsRedundant` | the race state must be reachable: a blob present, its lease not yet recorded, and nothing but §6.2's grace between it and the sweeper |
 | `NoticeIsRedundant` | a blob kept alive by nothing but a lapsed lease must be reachable, or `NoticeProtectsTheAbsent` is about a state that never occurs |
 | `RenewalNeverRestores` | a lapsed holder must be able to become active again by syncing, or `RenewalRestoresProtection` quantifies over nothing |
-| `EveryUploadGetsGrace` | **the finding** — §6.2's grace is keyed to the blob file's mtime, which a deduplicated upload does not move. See below |
+| `EveryUploadGetsGrace`, with `TouchOnDedup = FALSE` | **the finding, kept as a negative control** — the `BlobStore::put` that did not move the mtime on a deduplicated upload. The gated windowings run with the touch on, and there this invariant *holds*. See below |
 
 **Deliberately abstracted**, and therefore not claimed:
 
@@ -164,9 +165,9 @@ checks are asserted **expecting failure**:
   applies the whole plan in one step. A plan computed and acted on later — the
   `dry_run` path a human looks at — is not modelled.
 
-**The finding.** `EveryUploadGetsGrace` is asserted expecting failure, and the
-counterexample is a real gap between §6.2 and the code rather than a modelling
-formality. §6.2 says "any blob uploaded within `grace_period` is **immune from
+**The finding.** `EveryUploadGetsGrace` was asserted expecting failure, and the
+counterexample was a real gap between §6.2 and the code rather than a modelling
+formality. What follows describes the code as the model found it. §6.2 says "any blob uploaded within `grace_period` is **immune from
 sweep regardless of leases**". The implementation keys that immunity to the
 blob file's mtime (`Peer::inventory` reads `fs::metadata(..).modified()` as
 `uploaded_at`), and `BlobStore::put` returns early **without touching the file**
@@ -181,12 +182,23 @@ to follow fails with `NoSuchBlob`. The model keeps two clocks per blob for
 this: `age` (the peer's mtime, what the code enforces) and `offered` (when a
 client last handed the bytes over, what §6.2 is written about).
 
-Two further places where code and spec disagree are recorded in the module
+**Closed.** `BlobStore::put` now touches the file it already holds, and
+`BlobStore::prove` touches on an answered proof-of-possession — the
+HasBlob → Prove → skip path a second client actually takes, on which the peer
+never sees a put at all. `uploaded_at` therefore means the *latest* upload,
+which is what SPECS §6.2 now says (revision 7). The model carries the decision
+as the `TouchOnDedup` constant: `TRUE` in every gated windowing, where
+`EveryUploadGetsGrace` holds alongside the other seven invariants; `FALSE` in
+`MC_LeaseGC_EveryUploadGetsGrace.cfg`, which must still fail in the same five
+states — so the green run is attributable to the touch, and the finding stays
+reproducible rather than becoming folklore.
+
+One further place where code and spec disagree is recorded in the module
 header and modelled as the code has it: there is no authenticated `forget`
 path at all (`publish_retention` refuses *every* shrink, so the model's
-`Forget` is more permissive than the peer), and a stale doc comment at
-`crates/nas-cli/src/roaming.rs:232-234` says `expiry + grace` where §6.3 and
-that function's own code both say `expiry + notice`.
+`Forget` is more permissive than the peer). A stale doc comment in
+`crates/nas-cli/src/roaming.rs` that said `expiry + grace` where §6.3 and that
+function's own code both say `expiry + notice` has been corrected.
 
 Varying the `grace-expiry-notice` triple is this model's equivalent of varying
 `ForkAt` above. `MC_LeaseGC_small.cfg` (1-1-1) is the tightest and cheapest,
@@ -351,11 +363,12 @@ interleaving, including the ones nobody thought to test.
   interleaving where a blob is uploaded, referenced by a published manifest, and
   still swept? The young-blob grace period (SPECS §6.2) exists to prevent it, and
   a grace period is exactly the kind of thing that is *almost* long enough.
-  **It is**, for a first upload: nothing protected by a live lease, by the
-  grace, by the notice window or by the retention floor is ever swept, at every
-  windowing gated. For a *deduplicated* upload it is not, because the grace is
-  measured from the blob file's mtime and `BlobStore::put` does not touch a file
-  it already has. See [What `LeaseGC.tla` covers, and what it
+  **It is**: nothing protected by a live lease, by the grace, by the notice
+  window or by the retention floor is ever swept, at every windowing gated. For
+  a *deduplicated* upload it was not, until the model said so — the grace was
+  measured from the blob file's mtime and `BlobStore::put` did not touch a file
+  it already had. Closed in the code, and kept checkable as a negative control.
+  See [What `LeaseGC.tla` covers, and what it
   found](#what-leasegctla-covers-and-what-it-found).
 - **`DeleteQuorum.tla`** *(written)* — the deletion authorisation loop (SPECS
   §16.2, not §17: this bullet named the wrong section before the model was

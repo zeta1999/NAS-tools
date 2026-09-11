@@ -163,9 +163,11 @@ for entry in $GC_CFGS; do
   fi
 done
 
-# Non-vacuity for the CI bound, and one finding. EveryUploadGetsGrace must
-# fail because §6.2's immunity is keyed to the blob file's mtime, which a
-# deduplicated upload does not move — see LeaseGC.tla.
+# Non-vacuity for the CI bound, plus one negative control. EveryUploadGetsGrace
+# holds in every windowing gated above; its cfg here sets TouchOnDedup = FALSE
+# — the `BlobStore::put` that returned early without moving the mtime, which is
+# what LeaseGC.tla was written against and found — and must then fail. Green
+# above without red here would say nothing about the touch. See LeaseGC.tla.
 for inv in NeverSweeps GraceIsRedundant NoticeIsRedundant \
            RenewalNeverRestores EveryUploadGetsGrace; do
   label="sanity: $inv (LeaseGC)"

@@ -62,10 +62,12 @@ listing; lease-based GC with deltas; **three confidentiality modes** (`e2ee`,
   SPECS §6 against an *honest* peer, transcribed guard for guard from
   `plan_sweep` in `crates/nas-lease/src/sweep.rs`. 242,988 distinct states at
   the tightest windowing (grace-expiry-notice 1-1-1) and 652,268 at 1-2-3, both
-  in the CI gate. Seven invariants hold and five must-FAIL checks fire — one of
-  them a finding, not a sanity check: `EveryUploadGetsGrace` fails because
-  §6.2's grace is keyed to the blob file's mtime, which a deduplicated upload
-  does not move. Open in TODO.md as a decision about what `uploaded_at` means.
+  in the CI gate. Eight invariants hold and five must-FAIL checks fire — one of
+  them a finding, since closed: `EveryUploadGetsGrace` failed because §6.2's
+  grace was keyed to the blob file's mtime, which a deduplicated upload did not
+  move. `BlobStore::put` and `prove` now touch the file, `uploaded_at` means
+  the latest upload (SPECS §6.2, revision 7), the invariant holds in every
+  gated windowing, and the old code stays checkable as `TouchOnDedup = FALSE`.
 - **`formal/tlaplus/DeleteQuorum.tla`** — MODEL-CHECKED. The §16.2 deletion
   loop as `crates/nas-delete` implements it, against a hostile executor that
   assembles the `DeleteExecution` bundle itself out of every approval that

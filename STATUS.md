@@ -66,6 +66,19 @@ listing; lease-based GC with deltas; **three confidentiality modes** (`e2ee`,
   them a finding, not a sanity check: `EveryUploadGetsGrace` fails because
   §6.2's grace is keyed to the blob file's mtime, which a deduplicated upload
   does not move. Open in TODO.md as a decision about what `uploaded_at` means.
+- **`formal/tlaplus/DeleteQuorum.tla`** — MODEL-CHECKED. The §16.2 deletion
+  loop as `crates/nas-delete` implements it, against a hostile executor that
+  assembles the `DeleteExecution` bundle itself out of every approval that
+  exists, in any multiplicity — replay and re-targeting are moves in the model,
+  not things assumed away. 1,326,144 distinct states in the CI gate (3-slot
+  bundles, ~24 s); the deep gate's 4-slot bundles generate 4.9 M more states and
+  reach not one the CI gate did not, so padding a quorum with a replayed record
+  buys nothing, measured. Six invariants hold; three of them are
+  negative-controlled — a sanity config switches off the request-hash binding,
+  the offline authority or the approver's own clock, and TLC must then break the
+  invariant that defence carries. What it does not claim: that the *protocol*
+  enforces cooling-off. §16.2 says only approver devices can, and the
+  `backdate` counterexample is the honest statement of that limit.
 - **`crates/nas-core`** — canonical encoder with proptests mirroring the Lean
   theorems, plus `Addr`, the `Clock` trait and the format discriminants.
   15 tests green.

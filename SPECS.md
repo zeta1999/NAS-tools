@@ -813,6 +813,16 @@ regardless of leases**. This closes revision 1's race where a blob written
 mid-epoch had no lease yet, and the case where a client crashes between upload and
 lease publication.
 
+*(Revision 7.)* "Uploaded" means the **latest** upload, not the first, and the
+peer measures it from its own record of when it last received the bytes — never
+from a client-supplied time. A deduplicated upload restarts the window, and so
+does a proof of possession the peer answers (§4.5), because that is the moment a
+client that skips its upload commits to the peer's copy: under convergent
+encryption (§3.2) a second client's identical ciphertext deduplicates, and a
+client retrying after a crash takes the same path — the very case this section
+exists for. A holder can therefore prolong a blob's grace by re-proving it; it
+could hold a lease instead, so this grants nothing new.
+
 ### 6.3 Offline clients
 
 The median case for a NAS is a laptop closed for weeks; revision 1 left this as an
@@ -1790,6 +1800,12 @@ scrutiny.
 | §5.6 roaming section | Unstable connectivity is the primary use case, not an edge case |
 | §7.2 poll-first liveness | Pubsub cannot be load-bearing against an untrusted peer; the doc face was needlessly coupled to an upstream gap |
 | §14 upstream work approved | `simple-network` transcript binding and constant-time pin compare to be fixed in place |
+
+### Revision 7
+
+| Change | Driver |
+|---|---|
+| §6.2 grace is measured from the **latest** upload; a deduplicated upload and an answered proof of possession (§4.5) both restart it | `LeaseGC.tla`'s `EveryUploadGetsGrace`: the peer keyed the grace to the blob file's mtime and did not touch a file it already held, so a second client's convergent upload — or a client retrying after a crash, the case §6.2 exists for — was swept inside the window it had been promised |
 
 ### Revision 6
 

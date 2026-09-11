@@ -231,7 +231,7 @@ pub fn offline_30d(ns: &str) -> i32 {
 
 /// SPECS §6.3: expiry is 90 days "precisely so a fortnight of bad connectivity
 /// is uneventful", and the peer must not sweep a holder's set until
-/// `expiry + grace`.
+/// `expiry + notice`.
 ///
 /// The trap in this check is that "nothing was lost" is satisfied perfectly by
 /// a peer that never sweeps. So the drill establishes three points on the same

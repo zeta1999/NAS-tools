@@ -5,112 +5,114 @@
 (* The question the TODO asked: is there an interleaving in which a client *)
 (* uploads a blob and the sweeper takes it away before the lease that      *)
 (* protects it has been recorded? Upload and take-lease are two separate   *)
-(* round trips (`Peer::put_blob` then `Peer::take_lease`), and the sweeper  *)
-(* is not synchronised with either. §6.2's young-blob grace exists to close *)
-(* exactly that window, and a grace period is the kind of thing that is     *)
+(* round trips (`Peer::put_blob` then `Peer::take_lease`), and the sweeper *)
+(* is synchronised with neither. §6.2's young-blob grace exists to close   *)
+(* exactly that window, and a grace period is the kind of thing that is    *)
 (* almost long enough.                                                     *)
 (*                                                                         *)
-(* THE PEER IS HONEST HERE. Unlike SlotConsistency, this model does not     *)
-(* explore a malicious peer: a peer that wants your data gone deletes it,   *)
-(* and no lease protocol prevents that — §16's preamble says so in as many  *)
-(* words, and §5.4 is where detection-not-prevention is argued.             *)
-(* What is being checked is that the policy an *honest* peer computes never *)
-(* contradicts the protection §6 promises — that the bug is not in the      *)
+(* THE PEER IS HONEST HERE. Unlike SlotConsistency, this model does not    *)
+(* explore a malicious peer: a peer that wants your data gone deletes it,  *)
+(* and no lease protocol prevents that — §16's preamble says so in as many *)
+(* words, and §5.4 is where detection-not-prevention is argued.            *)
+(* What is checked is that the policy an *honest* peer computes never      *)
+(* contradicts the protection §6 promises — that the bug is not in the     *)
 (* ordering.                                                               *)
 (*                                                                         *)
-(* WHAT TLC FOUND. One gap, and it is real: `EveryUploadGetsGrace` fails.   *)
-(* §6.2 says "any blob uploaded within `grace_period` is immune from sweep  *)
-(* regardless of leases". The implementation keys that immunity to the      *)
-(* blob file's mtime (`Peer::inventory` reads `fs::metadata(..).modified()` *)
-(* as `uploaded_at`), and `BlobStore::put` returns early without touching   *)
-(* the file when the address is already present. So a client that uploads   *)
-(* content the peer already holds — a case convergent encryption (§3.2)     *)
-(* makes routine, and the exact case where the client is about to take a    *)
-(* lease it does not yet hold — gets no grace at all. TLC reaches it in     *)
-(* five states. See `EveryUploadGetsGrace` at the foot of this file.        *)
+(* WHAT TLC FOUND. One real gap: `EveryUploadGetsGrace` failed.            *)
+(* §6.2 says "any blob uploaded within `grace_period` is immune from sweep *)
+(* regardless of leases". The implementation keys that immunity to the     *)
+(* blob file's mtime (`Peer::inventory` reads `metadata(..).modified()`    *)
+(* as `uploaded_at`), and `BlobStore::put` returned early without touching *)
+(* the file when the address was already present. So a client that uploads *)
+(* content the peer already holds — a case convergent encryption (§3.2)    *)
+(* makes routine, and the exact case where the client is about to take a   *)
+(* lease it does not yet hold — got no grace at all. TLC reached it in     *)
+(* five states. CLOSED: `put` and `prove` now touch the file, and the      *)
+(* `TouchOnDedup` constant keeps the old behaviour checkable as a negative *)
+(* control. See `EveryUploadGetsGrace` at the foot of this file.           *)
 (*                                                                         *)
-(* Correspondence with the Rust. `crates/nas-lease/src/sweep.rs` is the     *)
-(* only code in the system that deletes a user's data; every row below was  *)
-(* transcribed from it rather than from the prose, and where the two        *)
-(* disagree the disagreement is recorded rather than resolved.              *)
+(* Correspondence with the Rust. `crates/nas-lease/src/sweep.rs` is the    *)
+(* only code in the system that deletes a user's data; every row below was *)
+(* transcribed from it rather than from the prose, and where the two       *)
+(* disagree the disagreement is recorded rather than resolved.             *)
 (*                                                                         *)
 (* | Model | Rust | Faithful? |                                            *)
 (* |---|---|---|                                                           *)
-(* | `Upload(b)` | `Peer::put_blob` -> `BlobStore::put` | yes — including   *)
-(*   the dedup short-circuit, which is why `age` (the peer's mtime) and     *)
-(*   `offered` (when a client last handed the bytes over) are two clocks |  *)
-(* | `TakeLease(h,S)` | `Peer::take_lease` | partly — the union and the     *)
-(*   `last_seen := now` stamp are exact; `S \subseteq stored` stands in for *)
-(*   `PeerError::NoSuchBlob`; the §6.4 quota refusal is not modelled |      *)
-(* | `Tick` | the caller's `now` vs `Timestamp::saturating_since` | partly  *)
-(*   — monotone only, so the backwards-clock defence is NOT exercised here  *)
-(*   (`a_backwards_clock_does_not_expire_everything` covers it in Rust) |   *)
-(* | `Retain(b)` | `Peer::extend_retention` | yes |                         *)
-(* | `Forget(b)` | *nothing* | **no** — see the discrepancy note below |    *)
-(* | `Active(h)`, `Expiring(h)` | `Holder::status` | yes, `<=` at both      *)
+(* | `Upload(b)` | `Peer::put_blob` -> `BlobStore::put`, and `Peer::prove` *)
+(*   for the client that skips its upload (§4.5) | yes — `age` (the peer's *)
+(*   mtime) and `offered` (when a client last handed the bytes over) are   *)
+(*   two clocks, and `TouchOnDedup` is whether the code moves both |       *)
+(* | `TakeLease(h,S)` | `Peer::take_lease` | partly — the union and the    *)
+(*   `last_seen := now` stamp are exact; `S \subseteq stored` stands for   *)
+(*   `PeerError::NoSuchBlob`; the §6.4 quota refusal is not modelled |     *)
+(* | `Tick` | the caller's `now` vs `Timestamp::saturating_since` | partly *)
+(*   — monotone only, so the backwards-clock defence is NOT exercised here *)
+(*   (`a_backwards_clock_does_not_expire_everything` covers it in Rust) |  *)
+(* | `Retain(b)` | `Peer::extend_retention` | yes |                        *)
+(* | `Forget(b)` | *nothing* | **no** — see the discrepancy note below |   *)
+(* | `Active(h)`, `Expiring(h)` | `Holder::status` | yes, `<=` at both     *)
 (*   bounds |                                                              *)
-(* | `MaySweep(b)` | the guard cascade in `plan_sweep` | yes, same order    *)
-(*   and the same strict `<` on grace |                                     *)
-(* | `Sweep` | `Peer::sweep` | yes — the whole plan in one step, because    *)
-(*   that call plans and deletes without releasing anything in between, and *)
-(*   it leaves `self.leases` untouched, as this does |                      *)
-(* | `Warned(h)` | `SweepPlan::warnings` | yes — built from a separate      *)
-(*   predicate here, as it is a separate loop there |                       *)
-(* | `LiveLeaseNeverSwept` | `Keep::Leased` | yes |                         *)
-(* | `GraceProtectsTheYoung` | `Keep::YoungBlob` | yes |                    *)
-(* | `NoticeProtectsTheAbsent` | `Keep::LeasedByExpiring` | yes |           *)
-(* | `FloorNeedsForget` | `Keep::RetentionFloor` | yes |                    *)
-(* | `RenewalRestoresProtection` | `take_lease` stamping `last_seen` | yes |*)
-(* | `WarnedBeforeSwept` | `SweepPlan::warnings` vs `SweepPlan::delete` |   *)
+(* | `MaySweep(b)` | the guard cascade in `plan_sweep` | yes, same order   *)
+(*   and the same strict `<` on grace |                                    *)
+(* | `Sweep` | `Peer::sweep` | yes — the whole plan in one step, because   *)
+(*   that call plans and deletes without releasing anything between, and   *)
+(*   it leaves `self.leases` untouched, as this does |                     *)
+(* | `Warned(h)` | `SweepPlan::warnings` | yes — built from a separate     *)
+(*   predicate here, as it is a separate loop there |                      *)
+(* | `LiveLeaseNeverSwept` | `Keep::Leased` | yes |                        *)
+(* | `GraceProtectsTheYoung` | `Keep::YoungBlob` | yes |                   *)
+(* | `NoticeProtectsTheAbsent` | `Keep::LeasedByExpiring` | yes |          *)
+(* | `FloorNeedsForget` | `Keep::RetentionFloor` | yes |                   *)
+(* | `RenewalRestoresProtection` | `take_lease` stamps `last_seen` | yes | *)
+(* | `WarnedBeforeSwept` | `SweepPlan::warnings` vs `SweepPlan::delete` |  *)
 (*   yes |                                                                 *)
-(* | `EveryUploadGetsGrace` (must FAIL) | `BlobStore::put`'s early return   *)
-(*   vs §6.2's "any blob uploaded within grace_period" | this is the gap |  *)
+(* | `EveryUploadGetsGrace` (must FAIL) | `BlobStore::put`'s early return  *)
+(*   vs §6.2's "any blob uploaded within grace_period" | this is the gap | *)
 (*                                                                         *)
-(* TWO PLACES WHERE CODE AND SPEC DISAGREE, both modelled as the code is:   *)
+(* ONE PLACE WHERE CODE AND SPEC DISAGREE, modelled as the code is:        *)
 (*                                                                         *)
-(*   1. §6.3: "a per-repo `retention_floor` is never swept without an       *)
-(*      authenticated `forget`", and §16.3's table routes a shrink through  *)
-(*      the offline delete authority. `Peer::publish_retention` implements  *)
-(*      no such path: it refuses EVERY shrink (`PeerError::RetentionShrink`)*)
-(*      and the only way an address leaves the floor is a peer running      *)
-(*      `--hostile ignore-retention`. `Forget(b)` here is therefore MORE    *)
-(*      permissive than the code — the code is the safer of the two, but    *)
-(*      the authenticated path §6.3 names does not exist yet.               *)
-(*   2. `crates/nas-cli/src/roaming.rs` lines 232-234 say in prose "the     *)
-(*      peer must not sweep a holder's set until `expiry + grace`". §6.3    *)
-(*      and that function's own code (`lease_expiry + notice`) both say     *)
-(*      `expiry + notice`. A stale comment from before revision 6 split the *)
-(*      two fields; the model follows the code. (The *other* mention of     *)
-(*      `expiry + grace` further down, at line 291, is deliberate: that     *)
-(*      probe sits there precisely because it is where the conflation bug   *)
-(*      would sweep.)                                                      *)
+(*   §6.3: "a per-repo `retention_floor` is never swept without an         *)
+(*   authenticated `forget`", and §16.3's table routes a shrink through    *)
+(*   the offline delete authority. `Peer::publish_retention` implements    *)
+(*   no such path: it refuses EVERY shrink (`RetentionShrink`) and the     *)
+(*   only way an address leaves the floor is a peer running                *)
+(*   `--hostile ignore-retention`. `Forget(b)` here is therefore MORE      *)
+(*   permissive than the code — the code is the safer of the two, but the  *)
+(*   authenticated path §6.3 names does not exist yet.                     *)
 (*                                                                         *)
-(* DELIBERATELY ABSTRACTED — these are not checked and must not be claimed: *)
-(*   - §6.1's delta chains, checkpoints and Merkle roots. The model takes   *)
-(*     each holder's replayed set as given; `set.rs::replay` is what earns  *)
-(*     that, and its integrity is a different question (a signature one,    *)
+(*   (A second disagreement this header used to record — a doc comment in  *)
+(*   `crates/nas-cli/src/roaming.rs` saying `expiry + grace` where §6.3    *)
+(*   and the function's own code say `expiry + notice` — has been          *)
+(*   corrected. The `expiry + grace` further down that file, at the probe, *)
+(*   is deliberate: it sits precisely where the conflation bug would       *)
+(*   sweep.)                                                               *)
+(*                                                                         *)
+(* DELIBERATELY ABSTRACTED — these are not checked and may not be claimed: *)
+(*   - §6.1's delta chains, checkpoints and Merkle roots. The model takes  *)
+(*     each holder's replayed set as given; `set.rs::replay` is what earns *)
+(*     that, and its integrity is a different question (a signature one,   *)
 (*     not an ordering one).                                               *)
-(*   - §6.4 quotas. `max_leased_bytes` is reported, never enforced by       *)
+(*   - §6.4 quotas. `max_leased_bytes` is reported, never enforced by      *)
 (*     deleting, so it has no data-loss path to model.                     *)
 (*   - Blob sizes, epochs, and holder identity/authentication.             *)
-(*   - Plan/execute atomicity: `Peer::sweep` plans and deletes inside one   *)
-(*     call, so `Sweep` applies the whole plan in one step, as it does.     *)
-(*   - Lease release (§16.2's explicit act). §6.3 is explicit that sync     *)
-(*     never releases, and the deletion loop is `DeleteQuorum.tla`'s job.   *)
+(*   - Plan/execute atomicity: `Peer::sweep` plans and deletes inside one  *)
+(*     call, so `Sweep` applies the whole plan in one step, as it does.    *)
+(*   - Lease release (§16.2's explicit act). §6.3 is explicit that sync    *)
+(*     never releases, and the deletion loop is `DeleteQuorum.tla`'s job.  *)
 (*                                                                         *)
-(* HOW MUCH THIS PROVES, stated before anyone quotes the green run.         *)
-(* `Sweep` is enabled by `MaySweep`, which is the code; the four            *)
-(* protections it records against — `LiveLease`, `Young`,                   *)
-(* `ProtectedByNotice`, `Floored` — are written from the specification, and *)
-(* the invariants say the two never disagree on a reachable state. Where    *)
-(* the two expressions coincide, as they mostly do, the invariant is a      *)
-(* transcription check rather than a discovery: it catches the day someone  *)
-(* edits one of them. The part that is NOT structural is the interleaving — *)
-(* upload, take-lease, sync and sweep in every order, at every age — and    *)
-(* that is where `EveryUploadGetsGrace` found something, by holding two     *)
-(* clocks (`age` and `offered`) that the code conflates into one. The       *)
-(* must-FAIL checks are what keep the rest from being vacuous: without      *)
-(* `GraceIsRedundant` failing, "nothing young is ever swept" could be true  *)
+(* HOW MUCH THIS PROVES, stated before anyone quotes the green run.        *)
+(* `Sweep` is enabled by `MaySweep`, which is the code; the four           *)
+(* protections it records against — `LiveLease`, `Young`,                  *)
+(* `ProtectedByNotice`, `Floored` — are written from SPECS.md, and         *)
+(* the invariants say the two never disagree on a reachable state. Where   *)
+(* the two expressions coincide, as they mostly do, the invariant is a     *)
+(* transcription check rather than a discovery: it catches the day someone *)
+(* edits one of them. The part that is NOT structural is the interleaving: *)
+(* upload, take-lease, sync and sweep in every order, at every age — and   *)
+(* that is where `EveryUploadGetsGrace` found something, by holding two    *)
+(* clocks (`age` and `offered`) that the code conflates into one. The      *)
+(* must-FAIL checks are what keep the rest from being vacuous: without     *)
+(* `GraceIsRedundant` failing, "nothing young is ever swept" could be true *)
 (* only because nothing is ever young.                                     *)
 (***************************************************************************)
 EXTENDS Naturals, FiniteSets
@@ -120,11 +122,16 @@ CONSTANTS
     Holders,  \* lease-holding devices (§6.1's `holder_pk`)
     Grace,    \* §6.2 young-blob immunity      — 24 h in `GcPolicy::default`
     Expiry,   \* §6.3 lease expiry             — 90 days
-    Notice    \* §6.3 post-expiry notice window — 30 days
+    Notice,   \* §6.3 post-expiry notice window — 30 days
+    TouchOnDedup  \* does an upload of bytes the peer already holds move the
+                  \* peer's mtime? TRUE is `BlobStore::put` and `prove` as they
+                  \* now are; FALSE is the code `EveryUploadGetsGrace` was found
+                  \* against, kept as a negative control (foot of this file)
 
 ASSUME /\ Grace  \in Nat /\ Grace  >= 1
        /\ Expiry \in Nat /\ Expiry >= 1
        /\ Notice \in Nat /\ Notice >= 1
+       /\ TouchOnDedup \in BOOLEAN
 
 \* The instant a lease stops protecting: §6.3's "must not sweep until
 \* `expiry + notice`", which is `Holder::status`'s second bound.
@@ -237,11 +244,14 @@ Tick ==
    invariant here reads it, and `offered` already carries the only fact that
    matters -- that a client handed these bytes over just now.
 
-   `age` moves only when the blob was not already present, because
-   `BlobStore::put` returns early on an address it already holds and never
-   rewrites the file whose mtime is `uploaded_at`. `offered` moves every time,
-   because a client did just hand over the bytes. §6.2 is written about
-   `offered`; the code enforces it on `age`.
+   `offered` moves every time, because a client did just hand over the bytes;
+   §6.2 is written about `offered`. `age` is the file's mtime, which is what
+   the code enforces §6.2 on. With `TouchOnDedup` it moves every time too:
+   `BlobStore::put` now touches the file it already holds, and `prove` touches
+   on an answered proof-of-possession, which is how a client that skips its
+   upload (§4.5) "offers" the bytes -- `Upload(b)` with `b \in stored` stands
+   for both paths. With `~TouchOnDedup` it moves only on a first upload, which
+   is the code this model was written against, and the two clocks disagree.
 
    `put` does rewrite -- and so does move the mtime -- when the copy it
    already holds fails to verify. This models only the intact case, which is
@@ -250,7 +260,9 @@ Upload(b) ==
     /\ ~(b \in stored /\ offered[b] = 0)   \* skip no-ops
     /\ stored'  = stored \cup {b}
     /\ offered' = [offered EXCEPT ![b] = 0]
-    /\ age'     = IF b \in stored THEN age ELSE [age EXCEPT ![b] = 0]
+    /\ age'     = IF b \in stored /\ ~TouchOnDedup
+                     THEN age
+                     ELSE [age EXCEPT ![b] = 0]
     /\ UNCHANGED <<leases, idle, floor, swept, lapsed, violated>>
 
 (* §6.3: "renewal is a side effect of sync. On every sync a client takes a
@@ -383,7 +395,7 @@ NoticeIsRedundant ==
 \* something -- without it that invariant quantifies over nothing.
 RenewalNeverRestores == \A h \in Holders : h \in lapsed => ~Active(h)
 
-\* EXPECT VIOLATION -- and this one is a finding, not a formality.
+\* THE FINDING, now closed in the code and kept here as a negative control.
 \*
 \* §6.2: "Any blob uploaded within `grace_period` is immune from sweep
 \* regardless of leases. This closes revision 1's race where a blob written
@@ -391,21 +403,26 @@ RenewalNeverRestores == \A h \in Holders : h \in lapsed => ~Active(h)
 \* upload and lease publication."
 \*
 \* The code enforces that on the blob file's mtime (`Peer::inventory` ->
-\* `uploaded_at`), and `BlobStore::put` returns early without touching the file
-\* when the address is already present. So an upload that DEDUPLICATES gets no
-\* grace: the clock it is measured against never restarted. Under convergent
-\* encryption (§3.2) two clients producing identical ciphertext hit exactly
-\* this path, and so does one client re-uploading after a crash.
+\* `uploaded_at`). When this model was written, `BlobStore::put` returned early
+\* without touching the file when the address was already present, so an
+\* upload that DEDUPLICATED got no grace: the clock it was measured against
+\* never restarted. Under convergent encryption (§3.2) two clients producing
+\* identical ciphertext hit exactly this path, and so did one client
+\* re-uploading after a crash.
 \*
-\* TLC's counterexample is five states: upload; tick past the grace; upload the
-\* same address again -- deduplicated, so the peer's mtime does not move while
-\* `offered` restarts; sweep. The blob is deleted while it
-\* is still inside the window §6.2 promises it, and the `take_lease` that was
-\* about to follow will fail with `NoSuchBlob`.
+\* TLC's counterexample was five states: upload; tick past the grace; upload
+\* the same address again -- deduplicated, so the peer's mtime did not move
+\* while `offered` restarted; sweep. The blob went while it was still inside
+\* the window §6.2 promises it, and the `take_lease` about to follow would
+\* have failed with `NoSuchBlob`.
 \*
-\* Making this PASS means either touching the file on a deduplicated put, or
-\* recording `uploaded_at` out of band. Neither is a change this model should
-\* make on its own; recorded in the report and in ../README.md.
+\* CLOSED: `BlobStore::put` touches the file it already holds, and
+\* `BlobStore::prove` touches on an answered proof-of-possession -- the moment
+\* a client that skips its upload (§4.5) commits to the peer's copy. With
+\* `TouchOnDedup = TRUE` (every gated windowing) this invariant HOLDS. With
+\* `TouchOnDedup = FALSE` (`MC_LeaseGC_EveryUploadGetsGrace.cfg`) it must fail
+\* in those same five states: the negative control that keeps the finding
+\* reproducible, and shows the green run is attributable to the touch.
 EveryUploadGetsGrace == violated["offered"] = {}
 
 ===============================================================================

@@ -95,8 +95,8 @@ settled and the work that follows from them.
       hold, 5 must-FAIL checks fire. It found one: §6.2's grace is keyed to the
       blob file's mtime and `BlobStore::put` does not touch a file it already
       has, so a **deduplicated** upload gets no grace (`EveryUploadGetsGrace`,
-      and `formal/README.md`). Left open below.
-- [ ] **A deduplicated upload gets no young-blob grace (SPECS §6.2).** Found by
+      and `formal/README.md`). Closed below.
+- [x] **A deduplicated upload gets no young-blob grace (SPECS §6.2).** Found by
       `LeaseGC.tla`'s `EveryUploadGetsGrace` check. §6.2 promises immunity to
       "any blob uploaded within `grace_period`"; `Peer::inventory` takes
       `uploaded_at` from the blob file's mtime and `BlobStore::put` returns
@@ -106,7 +106,14 @@ settled and the work that follows from them.
       promised, and the `take_lease` that follows fails with `NoSuchBlob`. Fix
       is either to touch the file on a deduplicated put or to record
       `uploaded_at` out of band; both change what `uploaded_at` means, so it is
-      a decision, not a patch.
+      a decision, not a patch. **Decided: `uploaded_at` is the *latest*
+      upload.** `BlobStore::put` touches the file it already holds and
+      `BlobStore::prove` touches on an answered proof — the HasBlob → Prove →
+      skip path is the one a second client actually takes, and the peer never
+      sees a put on it. SPECS §6.2 says so (revision 7). `LeaseGC.tla` gained a
+      `TouchOnDedup` constant: the invariant holds at every gated windowing and
+      the old code is the `FALSE` negative control, so the finding stays
+      reproducible. Tests at both layers back-date the mtime and re-plan.
 - [ ] **No authenticated `forget` for the retention floor (SPECS §6.3, §16.3).**
       §16.3's table routes a shrink through the offline delete authority;
       `Peer::publish_retention` implements no such path and refuses *every*

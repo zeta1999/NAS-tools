@@ -1228,6 +1228,11 @@ impl Peer {
     /// Only a peer actually holding the bytes can answer. A `dedup_lie` peer
     /// claimed to have it and now cannot produce this, which is the whole point
     /// of the challenge.
+    ///
+    /// Answering restarts the blob's §6.2 grace (see `BlobStore::prove`): the
+    /// client is about to skip its upload on the strength of this. Only a
+    /// subject past the transport handshake can ask, and such a subject could
+    /// hold a lease instead, so prolonging grace this way grants nothing new.
     pub fn prove(&self, addr: &Addr, nonce: &[u8; 32]) -> Result<[u8; 32], PeerError> {
         Ok(self.blobs.prove(addr, nonce)?)
     }
@@ -1491,10 +1496,13 @@ impl Peer {
     /// Every blob with the size and upload time a sweep decision needs.
     ///
     /// `uploaded_at` is the file's mtime. That is the peer's own record of
-    /// when it received the bytes, not a client claim — which matters, because
-    /// §6.2's grace period exists to protect a blob whose lease has not
-    /// arrived yet, and a client-supplied time would let that same client
-    /// extend its own immunity.
+    /// when it last received the bytes, not a client claim — which matters,
+    /// because §6.2's grace period exists to protect a blob whose lease has
+    /// not arrived yet, and a client-supplied time would let that same client
+    /// extend its own immunity. "Last", not "first": a deduplicated put and an
+    /// answered proof-of-possession both move it (`BlobStore::put`, `prove`),
+    /// because each is an upload §6.2 owes a grace to, and `LeaseGC.tla`
+    /// found the sweep that ran when they did not.
     pub fn inventory(&self) -> Result<Vec<BlobInfo>, PeerError> {
         let mut out = Vec::new();
         for addr in self.blobs.addrs()? {
@@ -2519,6 +2527,64 @@ mod worm_tests {
             .sweep(&[], &GcPolicy::default(), Timestamp(real_now()), true)
             .unwrap();
         assert!(plan.delete.is_empty());
+        assert_eq!(plan.keep, vec![(a[0], nas_lease::Keep::YoungBlob)]);
+    }
+
+    /// Move a blob's file mtime `secs` into the past, as time passing would.
+    fn backdate(p: &Peer, a: &Addr, secs: u64) {
+        let t = std::time::SystemTime::now() - std::time::Duration::from_secs(secs);
+        fs::OpenOptions::new()
+            .write(true)
+            .open(p.blobs.path(a))
+            .unwrap()
+            .set_modified(t)
+            .unwrap();
+    }
+
+    #[test]
+    fn a_deduplicated_upload_restarts_the_grace() {
+        // §6.2 owes the grace to every upload, and a second client's
+        // convergent ciphertext — or this client retrying after a crash —
+        // deduplicates. `LeaseGC.tla` (`EveryUploadGetsGrace`) found the `put`
+        // that left the first upload's clock running, so a sweep took the blob
+        // out from under the lease about to be taken on it.
+        let (_s, mut p) = peer("dedup-grace", Hostility::HONEST);
+        let a = seed(&p, 1);
+        backdate(&p, &a[0], 2 * DAY);
+        let plan = p
+            .sweep(&[], &GcPolicy::default(), Timestamp(real_now()), true)
+            .unwrap();
+        assert_eq!(
+            plan.delete.len(),
+            1,
+            "past the grace, unleased: the premise"
+        );
+
+        assert_eq!(p.put_blob(b"blob-0").unwrap(), a[0]);
+        let plan = p
+            .sweep(&[], &GcPolicy::default(), Timestamp(real_now()), true)
+            .unwrap();
+        assert!(plan.delete.is_empty(), "a deduplicated upload got no grace");
+        assert_eq!(plan.keep, vec![(a[0], nas_lease::Keep::YoungBlob)]);
+    }
+
+    #[test]
+    fn an_answered_proof_restarts_the_grace() {
+        // The dedup path a client takes is HasBlob -> Prove -> skip (§4.5):
+        // the peer never sees a put, so the proof is that client's upload.
+        let (_s, mut p) = peer("prove-grace", Hostility::HONEST);
+        let a = seed(&p, 1);
+        backdate(&p, &a[0], 2 * DAY);
+        let plan = p
+            .sweep(&[], &GcPolicy::default(), Timestamp(real_now()), true)
+            .unwrap();
+        assert_eq!(plan.delete.len(), 1);
+
+        p.prove(&a[0], &[9u8; 32]).unwrap();
+        let plan = p
+            .sweep(&[], &GcPolicy::default(), Timestamp(real_now()), true)
+            .unwrap();
+        assert!(plan.delete.is_empty(), "an answered proof got no grace");
         assert_eq!(plan.keep, vec![(a[0], nas_lease::Keep::YoungBlob)]);
     }
 

@@ -8,8 +8,8 @@ claim comes from, and the section is the authority if the two ever disagree.
 **Maturity.** Pre-release. What exists today is the substrate (M0) and the
 networked peer protocol (M1): encrypted chunk storage, a peer you do not have to
 trust, slot consistency with fork detection, lease-based garbage collection and
-the deletion approval loop. The mount, the S3 face, the git face and the doc
-face (M3–M6) do not exist yet. Treat every command below as a building block,
+the deletion approval loop, and a localhost S3 face (`nas gateway`, `nas put`).
+The mount, the git face and the doc face (M4–M6) do not exist yet. Treat every command below as a building block,
 not a product. `STATUS.md` is the current state; `MANUAL-TESTING.md` records what
 has actually been exercised against real processes and containers.
 

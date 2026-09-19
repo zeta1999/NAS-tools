@@ -445,11 +445,17 @@ settled and the work that follows from them.
 
 ## M3 — S3 face
 
-- [ ] `nas-gateway`: unix socket + loopback TCP with SigV4
-- [ ] `cas-merge` with per-key LWW, Lamport clocks, roster tiebreak, tombstones
-- [ ] Local listing from decrypted manifests
-- [ ] `state/outbox/` staging for offline writes + replay-with-remerge
-- [ ] `aws s3` and `rclone` work; unauthenticated local process is refused
+- [x] `nas-gateway`: unix socket (mode `0600`, no SigV4) + loopback TCP with SigV4
+- [x] `cas-merge` with per-key LWW, Lamport clocks, roster tiebreak, tombstones
+- [x] Local listing from decrypted manifests (`nas ls` / `nas get` / ListObjects)
+- [x] `state/outbox/` staging for offline writes + replay-with-remerge
+- [x] S3 subset (`aws`/`rclone` verbs) on localhost; unauthenticated TCP is 403
+      (`nas test gateway-auth-required`). The binaries themselves were not on
+      this machine; the face is the path-style SigV4 subset they speak.
+- [ ] **Tor onion carrier** (`nas peer status`, UC07). Specified at M3 as a
+      reachability path, not built. The other three UC07 M3 assertions (offline
+      write / outbox replay / conflict-merge) are green. Do not raise
+      `CI_MILESTONE` to M3 until this one is honest or re-gated.
 
 ## M4 — read-only mount
 

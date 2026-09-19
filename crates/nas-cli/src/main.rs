@@ -8,6 +8,9 @@
 mod aclcmd;
 mod attack;
 mod exit;
+mod gateway;
+mod objectcmd;
+mod outbox;
 mod peercmd;
 mod peerscan;
 mod prompt;
@@ -42,6 +45,12 @@ nas — NAS-tools command line
                        [--salt <tenant.salt>] [--once] [--witness]
   nas peer sync <ns> --peer <host:port> --peer-pub <transport.pub>
                      [--witness <host:port> --witness-pub <transport.pub>]
+  nas put <ns>/<key> <file> [--subject <s>]
+  nas get <ns>/<key> <out>
+  nas rm  <ns>/<key> [--subject <s>]
+  nas ls  <ns>[/<prefix>]
+  nas gateway status [--face s3]
+  nas gateway serve [--listen 127.0.0.1:<port>|/path.sock] [--once]
   nas test roundtrip <ns> <path>
   nas test dedup-ratio <ns> --shared <pct> --max-transfer <pct>
   nas test confirmation-attack <ns> --with-cs|--without-cs
@@ -85,6 +94,7 @@ fn positional(args: &[String]) -> Vec<&str> {
                     | "object-lock"
                     | "retention"
                     | "subject"
+                    | "device"
                     | "right"
                     | "min-mem"
                     | "agents"
@@ -97,6 +107,7 @@ fn positional(args: &[String]) -> Vec<&str> {
                     | "salt"
                     | "peer"
                     | "peer-pub"
+                    | "face"
             ) {
                 i += 2;
                 continue;
@@ -141,7 +152,7 @@ fn run(argv: &[String]) -> i32 {
         // Recognised in SPECS, not built. Never REFUSED — see exit.rs.
         "acl" => acl(rest),
         "peer" => peer(rest),
-        "gateway" => testcmds::unimplemented("gateway", "M3 (§2.1)"),
+        "gateway" => gateway_cmd(rest),
         "mirror" => testcmds::unimplemented("mirror", "M5 (§7.6)"),
         "delete-request" => match (positional(rest).first().copied(), positional(rest).get(1)) {
             (Some("execute"), Some(target)) => worm::delete_request_execute(target),
@@ -150,11 +161,63 @@ fn run(argv: &[String]) -> i32 {
                 exit::ERROR
             }
         },
-        // The object verbs need the key->object mapping the S3 face brings.
-        "put" | "rm" => testcmds::unimplemented(cmd, "M3 (§7.1)"),
+        "put" => {
+            let pos = positional(rest);
+            match (pos.first().copied(), pos.get(1).copied()) {
+                (Some(target), Some(file)) => objectcmd::put(target, file, opt(rest, "--subject")),
+                _ => {
+                    eprintln!("usage: nas put <namespace>/<key> <file> [--subject <s>]");
+                    exit::ERROR
+                }
+            }
+        }
+        "get" => {
+            let pos = positional(rest);
+            match (pos.first().copied(), pos.get(1).copied()) {
+                (Some(target), Some(out)) => objectcmd::get(target, out),
+                _ => {
+                    eprintln!("usage: nas get <namespace>/<key> <out>");
+                    exit::ERROR
+                }
+            }
+        }
+        "rm" => {
+            let pos = positional(rest);
+            match pos.first().copied() {
+                Some(target) => objectcmd::rm(target, opt(rest, "--subject")),
+                _ => {
+                    eprintln!("usage: nas rm <namespace>/<key> [--subject <s>]");
+                    exit::ERROR
+                }
+            }
+        }
+        "ls" => {
+            let pos = positional(rest);
+            match pos.first().copied() {
+                Some(target) => objectcmd::ls(target),
+                _ => {
+                    eprintln!("usage: nas ls <namespace>[/<prefix>]");
+                    exit::ERROR
+                }
+            }
+        }
         other => {
             eprintln!("unknown command {other:?}\n");
             eprint!("{USAGE}");
+            exit::ERROR
+        }
+    }
+}
+
+fn gateway_cmd(args: &[String]) -> i32 {
+    let pos = positional(args);
+    match pos.first().copied() {
+        Some("status") => gateway::status(opt(args, "--face")),
+        Some("serve") => gateway::serve(opt(args, "--listen"), flag(args, "--once")),
+        _ => {
+            eprintln!(
+                "usage: nas gateway status [--face s3]\n       nas gateway serve [--listen 127.0.0.1:<port>|/path.sock] [--once]"
+            );
             exit::ERROR
         }
     }
@@ -361,7 +424,16 @@ fn ns(args: &[String]) -> i32 {
                     }
                 }
             }
-            match Repo::create(name, mode, KeyScheme::Convergent, padding, passphrase, lock) {
+            let device = lock.as_ref().map(|_| everyday);
+            match Repo::create(
+                name,
+                mode,
+                KeyScheme::Convergent,
+                padding,
+                passphrase,
+                lock,
+                device,
+            ) {
                 Ok(r) => {
                     println!("created {name} at {}", r.root.display());
                     println!(
@@ -682,6 +754,25 @@ fn test(args: &[String]) -> i32 {
         Some("quorum-decomposition-attack") => one_ns(&pos, worm::quorum_decomposition_attack),
         Some("approval-replay") => one_ns(&pos, worm::approval_replay),
         Some("witness-node-holds-nothing") => attack::witness_node_holds_nothing(),
+        Some("gateway-auth-required") => gateway::auth_required(),
+        Some("offline-write") => one_ns(&pos, outbox::offline_write),
+        Some("outbox-replay") => one_ns(&pos, outbox::outbox_replay),
+        Some("outbox-conflict-merges") => one_ns(&pos, outbox::outbox_conflict_merges),
+        Some("dvc-roundtrip") => one_ns(&pos, gateway::dvc_roundtrip),
+        Some("dvc-incremental") => match pos.get(1) {
+            Some(ns) => {
+                let rows = opt(args, "--rows")
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(1);
+                let budget = opt(args, "--max-transfer").unwrap_or("5MiB");
+                gateway::dvc_incremental(ns, rows, budget)
+            }
+            None => {
+                eprintln!("usage: nas test dvc-incremental <ns> --rows <n> --max-transfer <size>");
+                exit::ERROR
+            }
+        },
+        Some("dvc-md5-not-trusted") => one_ns(&pos, gateway::dvc_md5_not_trusted),
         Some("cross-tenant-dedup") => match (pos.get(1), pos.get(2)) {
             (Some(ns), Some(other)) => testcmds::cross_tenant_dedup(ns, other),
             _ => {

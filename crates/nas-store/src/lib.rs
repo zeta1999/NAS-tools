@@ -5,6 +5,7 @@
 //! CLI sit on top of.
 
 pub mod blobs;
+pub mod bucket;
 pub mod chunker;
 pub mod manifest;
 pub mod object;
@@ -13,6 +14,7 @@ pub mod root;
 pub mod tree;
 
 pub use blobs::{Addressing, BlobStore, StoreError};
+pub use bucket::{BucketError, BucketManifest, BucketStore, KeyObject, BUCKET_AAD, BUCKET_MAGIC};
 pub use chunker::{Chunker, ChunkerConfig, ConfigError};
 pub use manifest::{ChunkRef, Kind, Manifest, ManifestError};
 pub use object::{read_object, salted_addr, ObjectError, ObjectWriter, Sealer, CHUNK_AAD};

@@ -95,6 +95,10 @@ pub fn passphrase_from(explicit: Option<&str>) -> Option<Vec<u8>> {
         .or_else(|| std::env::var("NAS_PASSPHRASE").ok().map(String::into_bytes))
 }
 
+pub fn nas_home() -> PathBuf {
+    home()
+}
+
 fn home() -> PathBuf {
     if let Ok(h) = std::env::var("NAS_HOME") {
         return PathBuf::from(h);
@@ -248,7 +252,7 @@ fn write_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
 /// Listing namespaces must not require unlocking them: a passphrase namespace
 /// would otherwise have to be opened — and its Argon2id derivation run — just to
 /// print its name, which is both slow and wrong.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Description {
     pub mode: Mode,
     pub key_scheme: KeyScheme,
@@ -257,6 +261,10 @@ pub struct Description {
     pub object_lock: Option<ObjectLock>,
     /// Retention period in seconds, if one was set.
     pub retention_secs: Option<u64>,
+    /// Everyday device named at create (`--device`). The honest client
+    /// enforces append-only against this subject; the peer cannot, in an
+    /// encrypted mode (SPECS §2.2).
+    pub device: Option<String>,
 }
 
 impl Repo {
@@ -269,6 +277,7 @@ impl Repo {
             padding: PaddingProfile::None,
             object_lock: None,
             retention_secs: None,
+            device: None,
         };
         for line in cfg.lines() {
             let mut it = line.split_whitespace();
@@ -293,6 +302,7 @@ impl Repo {
                             .map_err(|_| io::Error::other("bad retention_secs"))?,
                     )
                 }
+                (Some("device"), Some(v)) => d.device = Some(v.to_string()),
                 _ => {}
             }
         }
@@ -310,6 +320,7 @@ impl Repo {
         padding: PaddingProfile,
         passphrase: Option<Vec<u8>>,
         lock: Option<(ObjectLock, u64)>,
+        device: Option<&str>,
     ) -> io::Result<Self> {
         let root = path_of(ns);
         fs::create_dir_all(root.join("state"))?;
@@ -332,10 +343,16 @@ impl Repo {
             Some((l, secs)) => format!("object_lock {}\nretention_secs {secs}\n", l.as_str()),
             None => String::new(),
         };
+        // Named at create so `nas put` / `nas rm` know which ACL subject they
+        // are. Inventing one at first write would make the grant decorative.
+        let device_line = match device {
+            Some(d) if !d.is_empty() => format!("device {d}\n"),
+            _ => String::new(),
+        };
         fs::write(
             root.join("config"),
             format!(
-                "version 1\nmode {}\nkey_scheme {}\npadding_profile {}\ntenant_salt {}\n{lock_lines}",
+                "version 1\nmode {}\nkey_scheme {}\npadding_profile {}\ntenant_salt {}\n{lock_lines}{device_line}",
                 mode_str(mode),
                 key_scheme_str(key_scheme),
                 padding_str(padding),

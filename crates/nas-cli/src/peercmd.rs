@@ -657,6 +657,23 @@ pub fn sync(ns: &str, o: SyncOpts<'_>) -> i32 {
         Ok(r) => r,
         Err(e) => return err(format!("namespace {ns}: {e}")),
     };
+    // Offline writes sit in `state/outbox/` until reconnect (SPECS §5.6).
+    // Merge them onto HEAD before we push, so a CAS conflict with whatever
+    // the slot has become is a merge, not an error, and the published root
+    // is the working view the operator already listed.
+    match crate::outbox::replay_into_head(&repo) {
+        Ok(0) => {}
+        Ok(n) => println!("outbox: {n} write(s) merged onto HEAD"),
+        Err(e) => {
+            // A directory-tree namespace has no S3 outbox. Syncing one must
+            // not fail because we looked.
+            if e.contains("directory tree") {
+                // nothing staged as a bucket
+            } else {
+                return err(e);
+            }
+        }
+    }
     let blobs = match repo.blobs() {
         Ok(b) => b,
         Err(e) => return err(e),

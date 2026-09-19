@@ -1,15 +1,16 @@
 # NAS-tools Status
 
-**Current state:** **M0 is done and has survived its brutal review.** All four
-steps built, the 5 M0-tagged acceptance assertions pass against the real binary,
-and the padding measurement that M0 gated on is complete — it **contradicted the
-spec by 2-3×**. The review found **four reproduced defects**, all fixed; see
-MANUAL-TESTING.md §7. **M1 is in progress:** the peer, the slot system and the
-transfer protocol are built and networked, and the CLI now drives them
-(`nas peer serve` / `nas peer sync`) — a namespace has been pushed over a real
-PQC socket between two `nas` processes on localhost, and again between three
-containers. The ownership handoff (§5.1) and the skip-chain ladder (§5.5) are both built
-and served over the wire, which closes the last two M1 protocol items.
+**Current state:** **M0–M2 are done.** M3's S3 face is built (localhost
+gateway, bucket LWW, outbox) and green except UC07's Tor onion carrier, so
+`ci.sh` stays at M1. All four M0 steps built, the 5 M0-tagged acceptance
+assertions pass against the real binary, and the padding measurement that M0
+gated on is complete — it **contradicted the spec by 2-3×**. The review found
+**four reproduced defects**, all fixed; see MANUAL-TESTING.md §7. The peer, the
+slot system and the transfer protocol are networked (`nas peer serve` /
+`nas peer sync`) — a namespace has been pushed over a real PQC socket between
+two `nas` processes on localhost, and again between three containers. The
+ownership handoff (§5.1) and the skip-chain ladder (§5.5) are both built and
+served over the wire.
 
 `SPECS.md` is at **revision 5** (~1476 lines, 21 sections). It has survived one
 adversarial review (rev 1→2, 15 findings, all accepted), a round closing its own
@@ -137,18 +138,19 @@ listing; lease-based GC with deltas; **three confidentiality modes** (`e2ee`,
   `nas-transfer` listener; `nas peer sync` pushes a local namespace to it with
   the peer's key pinned on the command line, so a peer presenting any other key
   is refused before a single record is sent.
-- **`tests/usecases/`** — 95 acceptance assertions, milestone-gated; 62 are
-  M0–M2. Measured on the current binary: **5 passing, 0 failing, 90 pending**
-  at `NAS_MILESTONE=M0`; **40 passing, 0 failing, 55 pending** at
+- **`tests/usecases/`** — 95 acceptance assertions, milestone-gated. Measured
+  on the current binary: **5 passing, 0 failing, 90 pending** at
+  `NAS_MILESTONE=M0`; **40 passing, 0 failing, 55 pending** at
   `NAS_MILESTONE=M1` (what `ci.sh` gates on); **62 passing, 0 failing, 33
-  pending** at `NAS_MILESTONE=M2`. UC07's two witness-node assertions
+  pending** at `NAS_MILESTONE=M2`; **73 passing, 1 failing, 21 pending** at
+  `NAS_MILESTONE=M3`. The one M3 failure is UC07's Tor onion carrier
+  (`nas peer status`), which is not built; do not raise `CI_MILESTONE`. UC07's two witness-node assertions
   (a fork detected by devices that never meet; the node holds no blobs and no
   slot data) pass in-process via `nas test fork-detect-via-witness` and
   `nas test witness-node-holds-nothing`. UC01 (transit-only), UC02 (passphrase)
-  and UC03 (e2ee) are all green end to end; UC04 (WORM) is 9 of 13, the four
-  remaining being the object verbs and the ACL grant they need; UC09 (hostile
-  peer) is 6 of 8, the two remaining being lease griefing and the `all` drill
-  that contains it. Verified to
+  and UC03 (e2ee) are all green end to end; UC04 (WORM) including the object
+  verbs is green at M3; UC05 (DVC/S3) is green; UC09 (hostile
+  peer) is 8 of 8 at M2. Verified to
   bite: a stub that always exits 0 fails the refusal assertion, and one that
   always exits 1 is reported BROKEN rather than refused (MANUAL-TESTING.md §6a).
 
@@ -254,8 +256,13 @@ TLC is green with its three sanity checks still failing as required.
 
 ## Not built
 
-M2: the object verbs `put`/`rm` — which need the key→object mapping the S3
-face brings, so they are reclassified M3 (§7.1) rather than pending here. **No assertion fails at `NAS_MILESTONE=M2`:** 62 pass, 0 fail, 33 pending.
+M3 S3 face is built: `nas-gateway` (unix `0600` + loopback SigV4), bucket
+manifests with per-key LWW, `nas put|get|rm|ls`, `state/outbox/` replay, UC04
+object verbs, UC05, and UC07's offline-write path. **No assertion fails at
+`NAS_MILESTONE=M2`:** 62 pass, 0 fail, 33 pending. At M3: 73 pass, 1 fail
+(Tor onion), 21 pending.
+
+M4+: WebDAV mount, git face, doc face. UC07's Tor carrier.
 
 **The single-writer handoff (§5.1) is built.** `SlotHandoff` is signed by the
 *outgoing* writer and binds slot, sequence and both writers, so it authorises
@@ -444,10 +451,10 @@ the ACL stays empty and default-deny is untouched.
 
 UC04 gained the other half of "append only" as two new assertions — the laptop
 does **not** hold `write`, nor any delete authority — since the first line is
-decorative without them. Its three object-verb assertions are now gated M3:
-`nas put` / `nas rm` need the key→object mapping the S3 face brings (§7.1) and
-already exit 3, so scoring them as refusals was wrong. PENDING is still not
-success.
+decorative without them. The three object-verb assertions (`nas put` / overwrite
+/ `nas rm`) are gated M3 and now pass: the key→object map is a bucket
+manifest (§7.1), and append-only is an honest-client check against the
+everyday device.
 
 **UC07's roaming claims are checked (§5.6, §6.3).** A laptop that is offline
 for weeks and reconnects on no schedule is the design target, and three spec

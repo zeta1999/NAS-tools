@@ -37,4 +37,10 @@ cp "$out/src/lib.rs" "$out/docs/copy-of-lib.rs"
 # they are the set nas-cli's peerscan module looks for.
 gen 900 seed-minutes > "$out/docs/q3-board-minutes-CONFIDENTIAL.md"
 
+# UC04 object verbs (M3). Named like PDFs because that is the key the
+# assertion puts; the bytes only have to be distinct so an overwrite is
+# actually a different object.
+printf 'scan-v1\n' > scan.pdf
+printf 'scan-v2\n' > other.pdf
+
 echo "fixture built: $(find "$out" -type f | wc -l | tr -d ' ') files, $(du -sk "$out" | cut -f1) KiB"

@@ -19,9 +19,12 @@ use crate::outbox::{self, Outbox};
 use crate::repo::Repo;
 use nas_core::Addr;
 use nas_crypto::Role;
-use nas_gateway::s3::{Buckets, FaceError, ObjectInfo};
+use nas_gateway::s3::{Buckets, FaceError, ObjectInfo, RangeBody};
 use nas_peer::{Decision, Right};
-use nas_store::{read_object, BucketManifest, BucketStore, KeyObject, Kind, ObjectWriter};
+use nas_store::{
+    read_object, read_object_range, BucketManifest, BucketStore, ChunkCache, KeyObject, Kind,
+    ObjectWriter, DEFAULT_CAP,
+};
 use std::fs::File;
 use std::io::{Cursor, Write};
 use std::path::Path;
@@ -436,9 +439,27 @@ fn open_repo_face(ns: &str) -> Result<Repo, FaceError> {
         .map_err(|e| FaceError::Error(format!("namespace {ns}: {e}")))
 }
 
-/// The localhost S3 face. Each call opens the namespace; the gateway is
-/// a shim, not a cache.
-pub struct LocalBuckets;
+/// The localhost S3 + WebDAV face. Each call opens the namespace; the
+/// gateway is a shim. The chunk cache is the one exception: it lives for
+/// the process (one boot key) so a ranged GET does not refetch.
+pub struct LocalBuckets {
+    cache: Option<ChunkCache>,
+}
+
+impl LocalBuckets {
+    pub fn new() -> Self {
+        let dir = crate::repo::nas_home().join("state/cache");
+        Self {
+            cache: ChunkCache::open(dir, DEFAULT_CAP).ok(),
+        }
+    }
+}
+
+impl Default for LocalBuckets {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl Buckets for LocalBuckets {
     fn list_buckets(&self) -> Result<Vec<String>, FaceError> {
@@ -489,8 +510,42 @@ impl Buckets for LocalBuckets {
             .live(key.as_bytes())
             .ok_or_else(|| FaceError::NotFound(key.into()))?;
         let mut out = Vec::new();
-        read_object(&blobs, m, &mut out).map_err(map_err)?;
+        read_object_range(&blobs, m, 0, u64::MAX, self.cache.as_ref(), &mut out)
+            .map_err(map_err)?;
         Ok(out)
+    }
+
+    fn get_range(
+        &self,
+        bucket: &str,
+        key: &str,
+        start: u64,
+        end: u64,
+    ) -> Result<RangeBody, FaceError> {
+        if !Repo::exists(bucket) {
+            return Err(FaceError::NotFound(bucket.into()));
+        }
+        let repo = open_repo_face(bucket)?;
+        let blobs = repo.blobs().map_err(map_err)?;
+        let store = BucketStore::new(&blobs, repo.sealer());
+        let b = load_or_empty_face(&store, &repo)?;
+        let m = b
+            .live(key.as_bytes())
+            .ok_or_else(|| FaceError::NotFound(key.into()))?;
+        let total = m.size;
+        let start = start.min(total);
+        let end = end.min(total).max(start);
+        let mut out = Vec::new();
+        let (_, stats) = read_object_range(&blobs, m, start, end, self.cache.as_ref(), &mut out)
+            .map_err(map_err)?;
+        Ok(RangeBody {
+            data: out,
+            total,
+            start,
+            end,
+            chunks_fetched: stats.chunks_fetched,
+            bytes_fetched: stats.bytes_fetched,
+        })
     }
 
     fn put(&self, bucket: &str, key: &str, body: &[u8]) -> Result<u64, FaceError> {

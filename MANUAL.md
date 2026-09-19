@@ -9,7 +9,9 @@ claim comes from, and the section is the authority if the two ever disagree.
 networked peer protocol (M1): encrypted chunk storage, a peer you do not have to
 trust, slot consistency with fork detection, lease-based garbage collection and
 the deletion approval loop, and a localhost S3 face (`nas gateway`, `nas put`).
-The mount, the git face and the doc face (M4–M6) do not exist yet. Treat every command below as a building block,
+A read-only WebDAV face rides the same localhost gateway as S3 (`nas gateway
+status --face webdav`). The git face and the doc face (M5–M6) do not exist yet.
+Treat every command below as a building block,
 not a product. `STATUS.md` is the current state; `MANUAL-TESTING.md` records what
 has actually been exercised against real processes and containers.
 

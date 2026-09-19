@@ -1,6 +1,6 @@
 //! Path-style S3 subset: ListBuckets, ListObjects, Get, Put, Head, Delete.
 
-use crate::http1::{write_empty, write_response, Request};
+use crate::http1::{parse_byte_range, write_empty, write_response, write_response_with, Request};
 use std::io::Write;
 
 #[derive(Debug)]
@@ -25,6 +25,18 @@ pub struct ObjectInfo {
     pub tombstone: bool,
 }
 
+/// Result of a ranged GET. `end` is exclusive. `bytes_fetched` is what the
+/// store actually opened, so a caller can check O(range) rather than O(file).
+#[derive(Debug, Clone)]
+pub struct RangeBody {
+    pub data: Vec<u8>,
+    pub total: u64,
+    pub start: u64,
+    pub end: u64,
+    pub chunks_fetched: usize,
+    pub bytes_fetched: u64,
+}
+
 pub trait Buckets {
     fn list_buckets(&self) -> Result<Vec<String>, FaceError>;
     fn list(&self, bucket: &str, prefix: &str) -> Result<Vec<ObjectInfo>, FaceError>;
@@ -32,6 +44,29 @@ pub trait Buckets {
     fn put(&self, bucket: &str, key: &str, body: &[u8]) -> Result<u64, FaceError>;
     fn delete(&self, bucket: &str, key: &str) -> Result<(), FaceError>;
     fn head(&self, bucket: &str, key: &str) -> Result<u64, FaceError>;
+
+    /// Default path materialises the whole object then slices. A store that
+    /// can skip chunks (the local bucket) overrides this.
+    fn get_range(
+        &self,
+        bucket: &str,
+        key: &str,
+        start: u64,
+        end: u64,
+    ) -> Result<RangeBody, FaceError> {
+        let body = self.get(bucket, key)?;
+        let total = body.len() as u64;
+        let start = start.min(total);
+        let end = end.min(total).max(start);
+        Ok(RangeBody {
+            data: body[start as usize..end as usize].to_vec(),
+            total,
+            start,
+            end,
+            chunks_fetched: 1,
+            bytes_fetched: total,
+        })
+    }
 }
 
 pub enum Route<'a> {
@@ -136,10 +171,15 @@ pub fn dispatch<B: Buckets, W: Write>(
             body.push_str("</ListBucketResult>");
             write_response(w, 200, "OK", "application/xml", body.as_bytes())?;
         }
-        ("GET", Route::Object { bucket, key }) => match buckets.get(bucket, key) {
-            Ok(body) => write_response(w, 200, "OK", "application/octet-stream", &body)?,
-            Err(e) => face_err(w, e)?,
-        },
+        ("GET", Route::Object { bucket, key }) => {
+            write_object_get(
+                buckets,
+                bucket,
+                key,
+                req.headers.get("range").map(String::as_str),
+                w,
+            )?;
+        }
         ("HEAD", Route::Object { bucket, key }) => match buckets.head(bucket, key) {
             Ok(n) => {
                 write!(
@@ -174,7 +214,61 @@ pub fn dispatch<B: Buckets, W: Write>(
     Ok(())
 }
 
-fn face_err<W: Write>(w: W, e: FaceError) -> Result<(), crate::http1::HttpError> {
+/// GET an object, honouring a single `Range` header when present.
+pub fn write_object_get<B: Buckets, W: Write>(
+    buckets: &B,
+    bucket: &str,
+    key: &str,
+    range: Option<&str>,
+    w: W,
+) -> Result<(), crate::http1::HttpError> {
+    match range {
+        None => match buckets.get(bucket, key) {
+            Ok(body) => write_response(w, 200, "OK", "application/octet-stream", &body)?,
+            Err(e) => face_err(w, e)?,
+        },
+        Some(rh) => match buckets.head(bucket, key) {
+            Err(e) => face_err(w, e)?,
+            Ok(total) => match parse_byte_range(rh, total) {
+                Some((start, end)) => match buckets.get_range(bucket, key, start, end) {
+                    Ok(rb) => {
+                        let last = rb.end.saturating_sub(1);
+                        let cr = format!("bytes {start}-{last}/{total}");
+                        let chunks = rb.chunks_fetched.to_string();
+                        let fetched = rb.bytes_fetched.to_string();
+                        write_response_with(
+                            w,
+                            206,
+                            "Partial Content",
+                            "application/octet-stream",
+                            &[
+                                ("Content-Range", &cr),
+                                ("X-Nas-Chunks-Fetched", &chunks),
+                                ("X-Nas-Bytes-Fetched", &fetched),
+                            ],
+                            &rb.data,
+                        )?;
+                    }
+                    Err(e) => face_err(w, e)?,
+                },
+                None => {
+                    let cr = format!("bytes */{total}");
+                    write_response_with(
+                        w,
+                        416,
+                        "Range Not Satisfiable",
+                        "text/plain",
+                        &[("Content-Range", cr.as_str())],
+                        b"",
+                    )?;
+                }
+            },
+        },
+    }
+    Ok(())
+}
+
+pub(crate) fn face_err<W: Write>(w: W, e: FaceError) -> Result<(), crate::http1::HttpError> {
     match e {
         FaceError::Refused(m) => write_response(
             w,

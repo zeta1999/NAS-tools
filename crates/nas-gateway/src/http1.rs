@@ -170,21 +170,88 @@ fn decode_path(p: &str) -> String {
 }
 
 pub fn write_response<W: Write>(
-    mut w: W,
+    w: W,
     status: u16,
     reason: &str,
     content_type: &str,
     body: &[u8],
 ) -> io::Result<()> {
+    write_response_with(w, status, reason, content_type, &[], body)
+}
+
+pub fn write_response_with<W: Write>(
+    mut w: W,
+    status: u16,
+    reason: &str,
+    content_type: &str,
+    extra: &[(&str, &str)],
+    body: &[u8],
+) -> io::Result<()> {
     write!(
         w,
-        "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\n"
+    )?;
+    for (k, v) in extra {
+        write!(w, "{k}: {v}\r\n")?;
+    }
+    write!(
+        w,
+        "Content-Length: {}\r\nConnection: close\r\n\r\n",
         body.len()
     )?;
     w.write_all(body)?;
     w.flush()
 }
 
+/// Parse a single `Range: bytes=…` value into an exclusive `[start, end)`.
+///
+/// Multi-range requests and unsatisfiable ranges return `None`. The HTTP
+/// layer maps that to 416; this function does not invent a status.
+pub fn parse_byte_range(header: &str, total: u64) -> Option<(u64, u64)> {
+    let spec = header.trim().strip_prefix("bytes=")?.trim();
+    if spec.contains(',') || total == 0 {
+        return None;
+    }
+    if let Some(n) = spec.strip_prefix('-') {
+        let n: u64 = n.parse().ok()?;
+        if n == 0 {
+            return None;
+        }
+        let n = n.min(total);
+        return Some((total - n, total));
+    }
+    let (a, b) = spec.split_once('-')?;
+    let start: u64 = a.parse().ok()?;
+    if start >= total {
+        return None;
+    }
+    if b.is_empty() {
+        return Some((start, total));
+    }
+    let last: u64 = b.parse().ok()?;
+    if last < start {
+        return None;
+    }
+    Some((start, last.saturating_add(1).min(total)))
+}
+
 pub fn write_empty<W: Write>(w: W, status: u16, reason: &str) -> io::Result<()> {
     write_response(w, status, reason, "text/plain", b"")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn byte_ranges() {
+        assert_eq!(parse_byte_range("bytes=0-499", 1000), Some((0, 500)));
+        assert_eq!(parse_byte_range("bytes=500-", 1000), Some((500, 1000)));
+        assert_eq!(parse_byte_range("bytes=-100", 1000), Some((900, 1000)));
+        assert_eq!(parse_byte_range("bytes=0-999", 500), Some((0, 500)));
+        assert_eq!(parse_byte_range("bytes=500-499", 1000), None);
+        assert_eq!(parse_byte_range("bytes=1000-1001", 1000), None);
+        assert_eq!(parse_byte_range("bytes=0-1,2-3", 1000), None);
+        assert_eq!(parse_byte_range("bytes=0-10", 0), None);
+    }
 }

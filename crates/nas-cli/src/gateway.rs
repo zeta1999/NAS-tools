@@ -48,10 +48,7 @@ fn load_or_create_creds() -> Result<Creds, String> {
 /// `nas gateway status --face s3`
 pub fn status(face: Option<&str>) -> i32 {
     match face.unwrap_or("s3") {
-        "s3" => {}
-        "webdav" => {
-            return crate::testcmds::unimplemented("gateway --face webdav", "M4 (§8)");
-        }
+        "s3" | "webdav" => {}
         other => {
             eprintln!("unknown face {other:?} (s3|webdav)");
             return exit::ERROR;
@@ -61,12 +58,17 @@ pub fn status(face: Option<&str>) -> i32 {
         Ok(c) => c,
         Err(e) => return err(e),
     };
-    println!("face s3");
+    let face = face.unwrap_or("s3");
+    println!("face {face}");
     println!("bind 127.0.0.1 (loopback only; SPECS §2.1)");
-    println!("auth sigv4 (TCP) / socket mode 0600 (unix)");
+    match face {
+        "webdav" => println!("auth basic (TCP) / socket mode 0600 (unix)"),
+        _ => println!("auth sigv4 (TCP) / socket mode 0600 (unix)"),
+    }
     println!("access_key_id {}", creds.access_key_id);
     println!("creds {}", creds_path().display());
     println!("socket {}", default_socket_path().display());
+    println!("mount read-only (SPECS §8)");
     println!("ready");
     exit::OK
 }
@@ -109,10 +111,10 @@ fn serve_unix_path(path: &Path, once: bool) -> i32 {
             Err(e) => return err(e),
         };
         eprintln!(
-            "gateway s3 on unix:{}  (mode 0600; SigV4 not required)",
+            "gateway s3+webdav on unix:{}  (mode 0600; SigV4/Basic not required)",
             path.display()
         );
-        if let Err(e) = nas_gateway::serve_unix(&listener, &LocalBuckets, once) {
+        if let Err(e) = nas_gateway::serve_unix(&listener, &LocalBuckets::new(), once) {
             return err(e);
         }
         exit::OK
@@ -144,10 +146,10 @@ fn serve_tcp_addr(listen: &str, once: bool) -> i32 {
         Err(e) => return err(e),
     };
     eprintln!(
-        "gateway s3 on http://{bound}  access_key_id {}  (SigV4 required)",
+        "gateway s3+webdav on http://{bound}  access_key_id {}  (SigV4 / Basic)",
         creds.access_key_id
     );
-    if let Err(e) = serve_tcp(&listener, &creds, &LocalBuckets, once) {
+    if let Err(e) = serve_tcp(&listener, &creds, &LocalBuckets::new(), once) {
         return err(e);
     }
     exit::OK
@@ -173,7 +175,7 @@ pub fn auth_required() -> i32 {
     };
     let c = creds.clone();
     let t = thread::spawn(move || {
-        let _ = serve_tcp(&listener, &c, &LocalBuckets, false);
+        let _ = serve_tcp(&listener, &c, &LocalBuckets::new(), false);
     });
     // Give the accept loop a moment. The first connect is the wait.
     thread::sleep(Duration::from_millis(20));
@@ -257,7 +259,7 @@ fn spawn_gateway() -> Result<(std::net::SocketAddr, Creds, thread::JoinHandle<()
     let addr = listener.local_addr().map_err(|e| e.to_string())?;
     let c = creds.clone();
     let t = thread::spawn(move || {
-        let _ = serve_tcp(&listener, &c, &LocalBuckets, false);
+        let _ = serve_tcp(&listener, &c, &LocalBuckets::new(), false);
     });
     thread::sleep(Duration::from_millis(20));
     Ok((addr, creds, t))
@@ -472,6 +474,292 @@ pub fn dvc_md5_not_trusted(ns: &str) -> i32 {
         return err("GET did not return the body we stored under a lying MD5 name");
     }
     println!("dvc-md5-not-trusted: MD5 in the key is a name; the body is what we stored");
+    let _ = t;
+    exit::OK
+}
+
+fn basic_exchange(
+    addr: std::net::SocketAddr,
+    creds: &Creds,
+    method: &str,
+    path: &str,
+    extra: &[(&str, &str)],
+    body: &[u8],
+) -> Result<String, String> {
+    let token = nas_gateway::hmac::b64_encode(
+        format!("{}:{}", creds.access_key_id, creds.secret_access_key).as_bytes(),
+    );
+    let host = format!("127.0.0.1:{}", addr.port());
+    let mut msg =
+        format!("{method} {path} HTTP/1.1\r\nHost: {host}\r\nAuthorization: Basic {token}\r\n");
+    for (k, v) in extra {
+        msg.push_str(&format!("{k}: {v}\r\n"));
+    }
+    if !body.is_empty() {
+        msg.push_str(&format!("Content-Length: {}\r\n", body.len()));
+    }
+    msg.push_str("\r\n");
+    let mut bytes = msg.into_bytes();
+    bytes.extend_from_slice(body);
+    exchange(addr, &bytes).map_err(|e| e.to_string())
+}
+
+fn header_value(resp: &str, name: &str) -> Option<String> {
+    let prefix = format!("{name}:");
+    for line in resp.lines() {
+        if line.len() >= prefix.len() && line[..prefix.len()].eq_ignore_ascii_case(&prefix) {
+            return Some(line[prefix.len()..].trim().to_string());
+        }
+    }
+    None
+}
+
+/// `nas test webdav-auth-required` — SPECS §2.1, §8.
+pub fn webdav_auth_required() -> i32 {
+    let (addr, creds, t) = match spawn_gateway() {
+        Ok(v) => v,
+        Err(e) => return err(e),
+    };
+    let unauth = match exchange(
+        addr,
+        b"PROPFIND / HTTP/1.1\r\nHost: 127.0.0.1\r\nDepth: 0\r\n\r\n",
+    ) {
+        Ok(s) => s,
+        Err(e) => return err(e),
+    };
+    if !unauth.starts_with("HTTP/1.1 401") {
+        return err(format!(
+            "unauthenticated PROPFIND was not 401 (got {})",
+            unauth.lines().next().unwrap_or("")
+        ));
+    }
+    if header_value(&unauth, "WWW-Authenticate")
+        .filter(|v| v.to_ascii_lowercase().contains("basic"))
+        .is_none()
+    {
+        return err("401 did not offer Basic");
+    }
+    let ok = match basic_exchange(addr, &creds, "PROPFIND", "/", &[("Depth", "0")], b"") {
+        Ok(s) => s,
+        Err(e) => return err(e),
+    };
+    if !ok.starts_with("HTTP/1.1 207") {
+        return err(format!(
+            "Basic PROPFIND failed ({})",
+            ok.lines().next().unwrap_or("")
+        ));
+    }
+    println!("webdav-auth-required: unauthenticated 401, Basic 207 on {addr}");
+    let _ = t;
+    exit::OK
+}
+
+/// `nas test webdav-roundtrip <ns>` — OPTIONS / PROPFIND / GET; PUT is 405.
+pub fn webdav_roundtrip(ns: &str) -> i32 {
+    if let Err(e) = ensure_bucket(ns) {
+        return err(e);
+    }
+    let tmp = std::env::temp_dir().join(format!("nas-dav-{}", std::process::id()));
+    if let Err(e) = fs::write(&tmp, b"dav-fixture-bytes") {
+        return err(e);
+    }
+    if crate::objectcmd::put(
+        &format!("{ns}/notes/hello.txt"),
+        tmp.to_str().unwrap(),
+        None,
+    ) != exit::OK
+    {
+        return err("put of the WebDAV fixture failed");
+    }
+    let _ = fs::remove_file(&tmp);
+    let (addr, creds, t) = match spawn_gateway() {
+        Ok(v) => v,
+        Err(e) => return err(e),
+    };
+    let options = match basic_exchange(addr, &creds, "OPTIONS", "/", &[], b"") {
+        Ok(s) => s,
+        Err(e) => return err(e),
+    };
+    if !options.starts_with("HTTP/1.1 200")
+        || header_value(&options, "DAV").is_none()
+        || !header_value(&options, "Allow")
+            .unwrap_or_default()
+            .contains("PROPFIND")
+    {
+        return err(format!("OPTIONS was not a WebDAV advertise: {options}"));
+    }
+    let list = match basic_exchange(
+        addr,
+        &creds,
+        "PROPFIND",
+        &format!("/{ns}/notes"),
+        &[("Depth", "1")],
+        b"",
+    ) {
+        Ok(s) => s,
+        Err(e) => return err(e),
+    };
+    if !list.starts_with("HTTP/1.1 207") || !list.contains("hello.txt") {
+        return err("PROPFIND did not name the key");
+    }
+    let get = match basic_exchange(
+        addr,
+        &creds,
+        "GET",
+        &format!("/{ns}/notes/hello.txt"),
+        &[],
+        b"",
+    ) {
+        Ok(s) => s,
+        Err(e) => return err(e),
+    };
+    if !get.starts_with("HTTP/1.1 200") || http_body(&get) != b"dav-fixture-bytes" {
+        return err("WebDAV GET did not return the stored bytes");
+    }
+    let put = match basic_exchange(
+        addr,
+        &creds,
+        "PUT",
+        &format!("/{ns}/notes/nope.txt"),
+        &[],
+        b"x",
+    ) {
+        Ok(s) => s,
+        Err(e) => return err(e),
+    };
+    if !put.starts_with("HTTP/1.1 405") {
+        return err("WebDAV PUT must be refused — the mount is read-only");
+    }
+    println!("webdav-roundtrip: OPTIONS/PROPFIND/GET on {addr}; PUT 405");
+    let _ = t;
+    exit::OK
+}
+
+/// `nas test ranged-read <ns>` — SPECS §12.9: a range GET fetches O(range).
+pub fn ranged_read(ns: &str) -> i32 {
+    if let Err(e) = ensure_bucket(ns) {
+        return err(e);
+    }
+    const FILE: usize = 4 * 1024 * 1024;
+    const START: u64 = 1_000_000;
+    const LEN: u64 = 4096;
+    let mut data = vec![0u8; FILE];
+    for (i, b) in data.iter_mut().enumerate() {
+        // ASCII so the HTTP exchange (UTF-8 text) does not lossy-replace the
+        // slice we later compare against.
+        *b = b'a' + (i % 26) as u8;
+    }
+    let tmp = std::env::temp_dir().join(format!("nas-range-{}", std::process::id()));
+    if let Err(e) = fs::write(&tmp, &data) {
+        return err(e);
+    }
+    if crate::objectcmd::put(&format!("{ns}/big.bin"), tmp.to_str().unwrap(), None) != exit::OK {
+        return err("put of the ranged-read fixture failed");
+    }
+    let _ = fs::remove_file(&tmp);
+    let (addr, creds, t) = match spawn_gateway() {
+        Ok(v) => v,
+        Err(e) => return err(e),
+    };
+    let last = START + LEN - 1;
+    let get = match basic_exchange(
+        addr,
+        &creds,
+        "GET",
+        &format!("/{ns}/big.bin"),
+        &[("Range", &format!("bytes={START}-{last}"))],
+        b"",
+    ) {
+        Ok(s) => s,
+        Err(e) => return err(e),
+    };
+    if !get.starts_with("HTTP/1.1 206") {
+        return err(format!(
+            "ranged GET was not 206 ({})",
+            get.lines().next().unwrap_or("")
+        ));
+    }
+    let body = http_body(&get);
+    let want = &data[START as usize..(START + LEN) as usize];
+    if body != want {
+        return err(format!(
+            "ranged GET body did not match the requested slice (got {} B, want {} B)",
+            body.len(),
+            want.len()
+        ));
+    }
+    let chunks: usize = header_value(&get, "X-Nas-Chunks-Fetched")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(usize::MAX);
+    let fetched: u64 = header_value(&get, "X-Nas-Bytes-Fetched")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(u64::MAX);
+    if chunks == 0 || chunks > 3 {
+        return err(format!(
+            "ranged GET fetched {chunks} chunks; a 4 KiB range of a 4 MiB file should be 1–3"
+        ));
+    }
+    if fetched >= FILE as u64 / 2 {
+        return err(format!(
+            "ranged GET fetched {fetched} B of a {FILE} B file — that is O(file), not O(range)"
+        ));
+    }
+    println!("ranged-read: 4 KiB of {FILE} B fetched {chunks} chunk(s), {fetched} B ciphertext");
+    let _ = t;
+    exit::OK
+}
+
+/// `nas test cache-sealed <ns>` — SPECS §8.3: cache files are not plaintext.
+pub fn cache_sealed(ns: &str) -> i32 {
+    if let Err(e) = ensure_bucket(ns) {
+        return err(e);
+    }
+    const MARKER: &[u8] = b"CACHE-PLAINTEXT-MARKER-M4";
+    let tmp = std::env::temp_dir().join(format!("nas-cache-mark-{}", std::process::id()));
+    if let Err(e) = fs::write(&tmp, MARKER) {
+        return err(e);
+    }
+    if crate::objectcmd::put(&format!("{ns}/secret.bin"), tmp.to_str().unwrap(), None) != exit::OK {
+        return err("put of the cache-sealed fixture failed");
+    }
+    let _ = fs::remove_file(&tmp);
+    let (addr, creds, t) = match spawn_gateway() {
+        Ok(v) => v,
+        Err(e) => return err(e),
+    };
+    let get = match basic_exchange(addr, &creds, "GET", &format!("/{ns}/secret.bin"), &[], b"") {
+        Ok(s) => s,
+        Err(e) => return err(e),
+    };
+    if http_body(&get) != MARKER {
+        return err("GET did not return the marker, so the cache was not exercised");
+    }
+    let dir = crate::repo::nas_home().join("state/cache");
+    let rd = match fs::read_dir(&dir) {
+        Ok(r) => r,
+        Err(_) => return err(format!("no cache directory at {}", dir.display())),
+    };
+    let mut files = 0usize;
+    for e in rd.flatten() {
+        if !e.file_type().map(|t| t.is_file()).unwrap_or(false) {
+            continue;
+        }
+        files += 1;
+        let bytes = match fs::read(e.path()) {
+            Ok(b) => b,
+            Err(eio) => return err(eio),
+        };
+        if bytes.windows(MARKER.len()).any(|w| w == MARKER) {
+            return err(format!(
+                "cache file {} contained the plaintext marker",
+                e.path().display()
+            ));
+        }
+    }
+    if files == 0 {
+        return err("cache directory is empty after a GET — nothing was sealed");
+    }
+    println!("cache-sealed: {files} file(s) under state/cache/, none hold the marker");
     let _ = t;
     exit::OK
 }

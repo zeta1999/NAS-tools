@@ -6,6 +6,7 @@
 
 pub mod blobs;
 pub mod bucket;
+pub mod cache;
 pub mod chunker;
 pub mod manifest;
 pub mod object;
@@ -15,9 +16,13 @@ pub mod tree;
 
 pub use blobs::{Addressing, BlobStore, StoreError};
 pub use bucket::{BucketError, BucketManifest, BucketStore, KeyObject, BUCKET_AAD, BUCKET_MAGIC};
+pub use cache::{CacheError, ChunkCache, CACHE_AAD, DEFAULT_CAP};
 pub use chunker::{Chunker, ChunkerConfig, ConfigError};
 pub use manifest::{ChunkRef, Kind, Manifest, ManifestError};
-pub use object::{read_object, salted_addr, ObjectError, ObjectWriter, Sealer, CHUNK_AAD};
+pub use object::{
+    read_object, read_object_range, salted_addr, ObjectError, ObjectWriter, ReadStats, Sealer,
+    CHUNK_AAD,
+};
 pub use padding::{pad, unpad, PadError, FIXED_CHUNK, FIXED_CLASS, HEADER, LADDER};
 pub use root::{root_aad, RootError, RootManifest, ROOT_AAD};
 pub use tree::{DirManifest, Entry, TreeError, TreeStore};

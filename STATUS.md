@@ -1,8 +1,9 @@
 # NAS-tools Status
 
-**Current state:** **M0–M3 are done** on the acceptance suite (74 pass, 0
-fail at `NAS_MILESTONE=M3`). `ci.sh` still gates at M1 until someone raises
-it. The onion carrier is a named `.onion` plus pin (loopback map); live
+**Current state:** **M0–M4 are done** on the acceptance suite (79 pass, 0
+fail at `NAS_MILESTONE=M4`; 74/0/26 at M3). `ci.sh` still gates at M1 until
+someone raises it.
+The onion carrier is a named `.onion` plus pin (loopback map); live
 arti circuits are still `simple-network --features tor`. All four M0 steps built, the 5 M0-tagged acceptance
 assertions pass against the real binary, and the padding measurement that M0
 gated on is complete — it **contradicted the spec by 2-3×**. The review found
@@ -139,18 +140,19 @@ listing; lease-based GC with deltas; **three confidentiality modes** (`e2ee`,
   `nas-transfer` listener; `nas peer sync` pushes a local namespace to it with
   the peer's key pinned on the command line, so a peer presenting any other key
   is refused before a single record is sent.
-- **`tests/usecases/`** — 95 acceptance assertions, milestone-gated. Measured
-  on the current binary: **5 passing, 0 failing, 90 pending** at
-  `NAS_MILESTONE=M0`; **40 passing, 0 failing, 55 pending** at
-  `NAS_MILESTONE=M1` (what `ci.sh` gates on); **62 passing, 0 failing, 33
-  pending** at `NAS_MILESTONE=M2`; **74 passing, 0 failing, 21 pending** at
-  `NAS_MILESTONE=M3`. UC07's two witness-node assertions
+- **`tests/usecases/`** — 100 acceptance assertions, milestone-gated. Measured
+  on the current binary: **5 passing, 0 failing, 95 pending** at
+  `NAS_MILESTONE=M0`; **40 passing, 0 failing, 60 pending** at
+  `NAS_MILESTONE=M1` (what `ci.sh` gates on); **62 passing, 0 failing, 38
+  pending** at `NAS_MILESTONE=M2`; **74 passing, 0 failing, 26 pending** at
+  `NAS_MILESTONE=M3`; **79 passing, 0 failing, 21 pending** at
+  `NAS_MILESTONE=M4`. UC07's two witness-node assertions
   (a fork detected by devices that never meet; the node holds no blobs and no
   slot data) pass in-process via `nas test fork-detect-via-witness` and
   `nas test witness-node-holds-nothing`. UC01 (transit-only), UC02 (passphrase)
   and UC03 (e2ee) are all green end to end; UC04 (WORM) including the object
   verbs is green at M3; UC05 (DVC/S3) is green; UC09 (hostile
-  peer) is 8 of 8 at M2. Verified to
+  peer) is 8 of 8 at M2; UC14 (WebDAV mount) is green at M4. Verified to
   bite: a stub that always exits 0 fails the refusal assertion, and one that
   always exits 1 is reported BROKEN rather than refused (MANUAL-TESTING.md §6a).
 
@@ -213,13 +215,13 @@ See `MANUAL-TESTING.md` §5 for the commands and raw output.
 
 | | count |
 |---|---|
-| Rust tests (`cargo test --workspace`, unit + integration) | 552 |
+| Rust tests (`cargo test --workspace`, unit + integration) | 604 |
 | Lean theorems (clean axiom gate) | 14 |
 | `cargo-fuzz` targets | 14 |
-| Acceptance assertions passing (≤M1) | 40 of 95 |
-| Acceptance assertions pending (M2+) | 55 |
+| Acceptance assertions passing (≤M1) | 40 of 100 |
+| Acceptance assertions pending (M2+) | 60 |
 
-**40 of 95 is a progress marker, not a verification result.** The 55 pending
+**40 of 100 is a progress marker, not a verification result.** The 60 pending
 assertions are not failures and not successes — they are unwritten code that
 `ci.sh` refuses to score. Every one of them is a claim SPECS makes that nothing
 yet demonstrates, and the four use cases with a passing score (UC01–UC03,
@@ -257,10 +259,16 @@ TLC is green with its three sanity checks still failing as required.
 ## Not built
 
 M3 is built: S3 face plus `nas peer status` (named onion carrier). **No
-assertion fails at `NAS_MILESTONE=M2`:** 62 pass, 0 fail, 33 pending. At M3:
-74 pass, 0 fail, 21 pending.
+assertion fails at `NAS_MILESTONE=M2`:** 62 pass, 0 fail, 38 pending. At M3:
+74 pass, 0 fail, 26 pending. At M4: 79 pass, 0 fail, 21 pending.
 
-M4+: WebDAV mount, git face, doc face. Live arti onion circuits.
+M4 is built: WebDAV (`OPTIONS`/`PROPFIND`/`HEAD`/`GET`) on the same gateway,
+Basic auth with the S3 secret, an encrypted per-boot LRU under `state/cache/`,
+and ranged GET that opens only overlapping chunks. NFSv3 is deferred until a
+Finder mount is measured (SPECS §8). Git face, doc face, live arti circuits
+remain.
+
+M4+: git face, doc face. Live arti onion circuits.
 
 **The single-writer handoff (§5.1) is built.** `SlotHandoff` is signed by the
 *outgoing* writer and binds slot, sequence and both writers, so it authorises

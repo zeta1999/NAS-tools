@@ -41,6 +41,7 @@
 //! independent of file size.
 
 use crate::blobs::{BlobStore, StoreError};
+use crate::cache::ChunkCache;
 use crate::chunker::{Chunker, ChunkerConfig, ConfigError};
 use crate::manifest::{ChunkRef, Kind, Manifest, ManifestError};
 use crate::padding::{self, PadError};
@@ -284,6 +285,17 @@ impl<'a> ObjectWriter<'a> {
     }
 }
 
+/// How much work a ranged read actually did (SPECS §8, §12.9).
+///
+/// `chunks_fetched` / `bytes_fetched` count blob-store hits only. A cache
+/// hit is not a fetch — that is the whole point of `state/cache/`.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct ReadStats {
+    pub chunks_fetched: usize,
+    pub bytes_fetched: u64,
+    pub cache_hits: usize,
+}
+
 /// Reconstruct an object's plaintext from its manifest.
 ///
 /// Every chunk is checked three ways: the blob store verifies the address, the
@@ -296,44 +308,99 @@ pub fn read_object<W: Write>(
     m: &Manifest,
     out: &mut W,
 ) -> Result<u64, ObjectError> {
+    let (n, _) = read_object_range(store, m, 0, u64::MAX, None, out)?;
+    Ok(n)
+}
+
+/// Byte-range read: only chunks that overlap `[start, end)` are fetched.
+///
+/// `end` is exclusive. `end == u64::MAX` means "to the end of the object".
+/// A [`ChunkCache`] is optional; a miss falls through to the blob store and
+/// a successful open is stored for the next read.
+pub fn read_object_range<W: Write>(
+    store: &BlobStore,
+    m: &Manifest,
+    start: u64,
+    end: u64,
+    cache: Option<&ChunkCache>,
+    out: &mut W,
+) -> Result<(u64, ReadStats), ObjectError> {
     if m.key_scheme == KeyScheme::IndexedRandom {
         return Err(ObjectError::UnsupportedKeyScheme {
             scheme: m.key_scheme,
         });
     }
     m.validate()?;
-    let mut written = 0u64;
-    for c in &m.chunks {
-        let stored = store.get(&c.addr)?;
-        let opened;
-        let padded: &[u8] = match m.key_scheme {
-            KeyScheme::Convergent => {
-                let key = chunk_key_from_stored(c.ck);
-                opened = open_chunk(&key, &stored, CHUNK_AAD)?;
-                &opened
-            }
-            // Nothing to decrypt. `pt_hash` below is then the whole integrity
-            // story -- there is no AEAD tag to fall back on, which is exactly
-            // why the manifest stores it.
-            KeyScheme::Plaintext => &stored,
-            KeyScheme::IndexedRandom => unreachable!("rejected above"),
-        };
-        let plain = padding::unpad(m.padding_profile, padded)?;
-
-        if plain.len() != c.len as usize {
-            return Err(ObjectError::LengthMismatch {
-                addr: c.addr,
-                want: c.len,
-                got: plain.len(),
-            });
-        }
-        if blake3::hash(plain).as_bytes() != &c.pt_hash {
-            return Err(ObjectError::PlaintextMismatch { addr: c.addr });
-        }
-        out.write_all(plain)?;
-        written += plain.len() as u64;
+    let mut stats = ReadStats::default();
+    if start >= end {
+        return Ok((0, stats));
     }
-    Ok(written)
+    let mut written = 0u64;
+    let mut offset = 0u64;
+    for c in &m.chunks {
+        let clen = u64::from(c.len);
+        let chunk_end = offset + clen;
+        if chunk_end <= start || offset >= end {
+            offset = chunk_end;
+            continue;
+        }
+        let plain = open_chunk_plain(store, m, c, cache, &mut stats)?;
+        let from = start.saturating_sub(offset) as usize;
+        let to = (end.saturating_sub(offset) as usize).min(plain.len());
+        if from < to {
+            out.write_all(&plain[from..to])?;
+            written += (to - from) as u64;
+        }
+        offset = chunk_end;
+    }
+    Ok((written, stats))
+}
+
+fn open_chunk_plain(
+    store: &BlobStore,
+    m: &Manifest,
+    c: &ChunkRef,
+    cache: Option<&ChunkCache>,
+    stats: &mut ReadStats,
+) -> Result<Vec<u8>, ObjectError> {
+    if let Some(cache) = cache {
+        if let Some(plain) = cache.get(&c.addr) {
+            stats.cache_hits += 1;
+            return Ok(plain);
+        }
+    }
+    let stored = store.get(&c.addr)?;
+    stats.chunks_fetched += 1;
+    stats.bytes_fetched += stored.len() as u64;
+    let opened;
+    let padded: &[u8] = match m.key_scheme {
+        KeyScheme::Convergent => {
+            let key = chunk_key_from_stored(c.ck);
+            opened = open_chunk(&key, &stored, CHUNK_AAD)?;
+            &opened
+        }
+        // Nothing to decrypt. `pt_hash` below is then the whole integrity
+        // story -- there is no AEAD tag to fall back on, which is exactly
+        // why the manifest stores it.
+        KeyScheme::Plaintext => &stored,
+        KeyScheme::IndexedRandom => unreachable!("rejected above"),
+    };
+    let plain = padding::unpad(m.padding_profile, padded)?;
+
+    if plain.len() != c.len as usize {
+        return Err(ObjectError::LengthMismatch {
+            addr: c.addr,
+            want: c.len,
+            got: plain.len(),
+        });
+    }
+    if blake3::hash(plain).as_bytes() != &c.pt_hash {
+        return Err(ObjectError::PlaintextMismatch { addr: c.addr });
+    }
+    if let Some(cache) = cache {
+        let _ = cache.put(&c.addr, plain);
+    }
+    Ok(plain.to_vec())
 }
 
 #[cfg(test)]
@@ -613,5 +680,73 @@ mod tests {
             "padding overhead {:.1}% is implausible",
             (classes as f64 / none as f64 - 1.0) * 100.0
         );
+    }
+
+    #[test]
+    fn a_ranged_read_fetches_only_overlapping_chunks() {
+        let s = Scratch::new("range");
+        let st = BlobStore::open(&s.0).unwrap();
+        let c = cs();
+        let data = corpus(2 << 20, 10);
+        let w = ObjectWriter::convergent(&st, &c, PaddingProfile::None).unwrap();
+        let m = w.write(Kind::File, &data[..]).unwrap();
+        assert!(
+            m.chunks.len() >= 3,
+            "need several chunks to prove a skip, got {}",
+            m.chunks.len()
+        );
+        let start = u64::from(m.chunks[0].len);
+        let end = start + 64;
+        let mut got = Vec::new();
+        let (n, stats) = read_object_range(&st, &m, start, end, None, &mut got).unwrap();
+        assert_eq!(n, 64);
+        assert_eq!(got, &data[start as usize..end as usize]);
+        assert_eq!(
+            stats.chunks_fetched, 1,
+            "a 64-byte range inside one chunk must not open the file"
+        );
+        assert!(
+            stats.bytes_fetched < data.len() as u64 / 2,
+            "fetched {} B of a {} B object",
+            stats.bytes_fetched,
+            data.len()
+        );
+    }
+
+    #[test]
+    fn a_full_range_matches_read_object() {
+        let s = Scratch::new("range-full");
+        let st = BlobStore::open(&s.0).unwrap();
+        let c = cs();
+        let data = corpus(200 << 10, 11);
+        let w = ObjectWriter::convergent(&st, &c, PaddingProfile::None).unwrap();
+        let m = w.write(Kind::File, &data[..]).unwrap();
+        let mut a = Vec::new();
+        let mut b = Vec::new();
+        read_object(&st, &m, &mut a).unwrap();
+        read_object_range(&st, &m, 0, u64::MAX, None, &mut b).unwrap();
+        assert_eq!(a, data);
+        assert_eq!(b, data);
+    }
+
+    #[test]
+    fn a_cached_ranged_read_does_not_refetch() {
+        let s = Scratch::new("range-cache");
+        let st = BlobStore::open(&s.0).unwrap();
+        let cache_dir = s.0.join("cache");
+        let cache = crate::cache::ChunkCache::open(&cache_dir, 8).unwrap();
+        let c = cs();
+        let data = corpus(512 << 10, 12);
+        let w = ObjectWriter::convergent(&st, &c, PaddingProfile::None).unwrap();
+        let m = w.write(Kind::File, &data[..]).unwrap();
+        let end = 128u64.min(m.size);
+        let mut got = Vec::new();
+        let (_, first) = read_object_range(&st, &m, 0, end, Some(&cache), &mut got).unwrap();
+        assert!(first.chunks_fetched >= 1);
+        got.clear();
+        let (_, second) = read_object_range(&st, &m, 0, end, Some(&cache), &mut got).unwrap();
+        assert_eq!(second.chunks_fetched, 0, "second read must hit the cache");
+        assert!(second.cache_hits >= 1);
+        assert_eq!(got, &data[..end as usize]);
     }
 }

@@ -50,7 +50,7 @@ nas — NAS-tools command line
   nas get <ns>/<key> <out>
   nas rm  <ns>/<key> [--subject <s>]
   nas ls  <ns>[/<prefix>]
-  nas gateway status [--face s3]
+  nas gateway status [--face s3|webdav]
   nas gateway serve [--listen 127.0.0.1:<port>|/path.sock] [--once]
   nas test roundtrip <ns> <path>
   nas test dedup-ratio <ns> --shared <pct> --max-transfer <pct>
@@ -217,7 +217,7 @@ fn gateway_cmd(args: &[String]) -> i32 {
         Some("serve") => gateway::serve(opt(args, "--listen"), flag(args, "--once")),
         _ => {
             eprintln!(
-                "usage: nas gateway status [--face s3]\n       nas gateway serve [--listen 127.0.0.1:<port>|/path.sock] [--once]"
+                "usage: nas gateway status [--face s3|webdav]\n       nas gateway serve [--listen 127.0.0.1:<port>|/path.sock] [--once]"
             );
             exit::ERROR
         }
@@ -776,6 +776,10 @@ fn test(args: &[String]) -> i32 {
             }
         },
         Some("dvc-md5-not-trusted") => one_ns(&pos, gateway::dvc_md5_not_trusted),
+        Some("webdav-auth-required") => gateway::webdav_auth_required(),
+        Some("webdav-roundtrip") => one_ns(&pos, gateway::webdav_roundtrip),
+        Some("ranged-read") => one_ns(&pos, gateway::ranged_read),
+        Some("cache-sealed") => one_ns(&pos, gateway::cache_sealed),
         Some("cross-tenant-dedup") => match (pos.get(1), pos.get(2)) {
             (Some(ns), Some(other)) => testcmds::cross_tenant_dedup(ns, other),
             _ => {

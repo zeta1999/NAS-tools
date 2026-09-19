@@ -461,10 +461,14 @@ settled and the work that follows from them.
 
 ## M4 — read-only mount
 
-- [ ] WebDAV on the same gateway (`OPTIONS` / `PROPFIND` / `HEAD` / `GET`)
-- [ ] Encrypted chunk cache under a per-boot key, bounded LRU
-- [ ] Ranged read of a 1 GB file fetches O(range), not O(file)
-- [ ] Decide whether macOS WebDAV performance forces the NFSv3 path
+- [x] WebDAV on the same gateway (`OPTIONS` / `PROPFIND` / `HEAD` / `GET`)
+- [x] Encrypted chunk cache under a per-boot key, bounded LRU
+- [x] Ranged GET fetches O(range), not O(file) (`X-Nas-Chunks-Fetched`)
+- [ ] Decide whether macOS WebDAV performance forces the NFSv3 path.
+      WebDAV is what ships; the read path is unchanged if the shim moves
+      (SPECS §8). The decision waits on a Finder mount measurement — unit
+      tests cannot make it. POSIX mode is invisible through WebDAV (§15.2),
+      which is a second argument for NFSv3 later, not a reason to block M4.
 
 ## M5 — git face
 

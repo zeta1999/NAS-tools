@@ -8,6 +8,7 @@
 //! user can read the socket or `gateway.json` and is inside the boundary.
 
 pub mod creds;
+pub mod dav;
 pub mod hmac;
 pub mod http1;
 pub mod s3;
@@ -71,6 +72,15 @@ where
         }
         Err(e) => return Err(e),
     };
+    if dav::wants_dav(&req) {
+        if let Some(creds) = creds {
+            if dav::check_basic(creds, &req).is_err() {
+                dav::write_unauthorized(&mut stream)?;
+                return Ok(());
+            }
+        }
+        return dav::dispatch(buckets, &req, &mut stream);
+    }
     if let Some(creds) = creds {
         let signed = SignedRequest {
             method: &req.method,
@@ -356,6 +366,118 @@ mod tests {
         // The server thread is looping; drop by connecting nothing — just
         // abandon it. The process ends with the test.
         let _ = t;
+    }
+
+    fn basic_get(creds: &Creds, host: &str, path: &str) -> Vec<u8> {
+        let token = crate::hmac::b64_encode(
+            format!("{}:{}", creds.access_key_id, creds.secret_access_key).as_bytes(),
+        );
+        format!("GET {path} HTTP/1.1\r\nHost: {host}\r\nAuthorization: Basic {token}\r\n\r\n")
+            .into_bytes()
+    }
+
+    #[test]
+    fn webdav_without_basic_is_401() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let c = creds();
+        let store = mem::Memory::with_bucket("photos");
+        let t = thread::spawn(move || {
+            serve_tcp(&listener, &c, &store, true).unwrap();
+        });
+        let resp = exchange(addr, b"PROPFIND / HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n");
+        assert!(
+            resp.starts_with("HTTP/1.1 401"),
+            "unauthenticated WebDAV was not challenged: {resp}"
+        );
+        assert!(resp.contains("WWW-Authenticate: Basic"), "{resp}");
+        t.join().unwrap();
+    }
+
+    #[test]
+    fn webdav_basic_propfind_lists_the_bucket() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let c = creds();
+        let store = mem::Memory::with_bucket("photos");
+        let host = format!("127.0.0.1:{}", addr.port());
+        let token = crate::hmac::b64_encode(
+            format!("{}:{}", c.access_key_id, c.secret_access_key).as_bytes(),
+        );
+        let req = format!(
+            "PROPFIND / HTTP/1.1\r\nHost: {host}\r\nAuthorization: Basic {token}\r\nDepth: 1\r\n\r\n"
+        );
+        let t = thread::spawn(move || {
+            serve_tcp(&listener, &c, &store, true).unwrap();
+        });
+        let resp = exchange(addr, req.as_bytes());
+        assert!(resp.starts_with("HTTP/1.1 207"), "{resp}");
+        assert!(resp.contains("/photos/"), "{resp}");
+        t.join().unwrap();
+    }
+
+    #[test]
+    fn webdav_get_round_trips_and_put_is_405() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let c = creds();
+        let store = mem::Memory::with_bucket("photos");
+        store
+            .buckets
+            .lock()
+            .unwrap()
+            .get_mut("photos")
+            .unwrap()
+            .insert("a.bin".into(), b"hello-dav".to_vec());
+        let host = format!("127.0.0.1:{}", addr.port());
+        let get = basic_get(&c, &host, "/photos/a.bin");
+        let token = crate::hmac::b64_encode(
+            format!("{}:{}", c.access_key_id, c.secret_access_key).as_bytes(),
+        );
+        let put = format!(
+            "PUT /photos/b.bin HTTP/1.1\r\nHost: {host}\r\nAuthorization: Basic {token}\r\nContent-Length: 1\r\n\r\nx"
+        );
+        let t = thread::spawn(move || {
+            serve_tcp(&listener, &c, &store, false).unwrap();
+        });
+        let get_resp = exchange(addr, &get);
+        assert!(get_resp.contains("hello-dav"), "{get_resp}");
+        let put_resp = exchange(addr, put.as_bytes());
+        assert!(
+            put_resp.starts_with("HTTP/1.1 405"),
+            "WebDAV must stay read-only: {put_resp}"
+        );
+        let _ = t;
+    }
+
+    #[test]
+    fn a_ranged_get_is_206() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let c = creds();
+        let store = mem::Memory::with_bucket("photos");
+        store
+            .buckets
+            .lock()
+            .unwrap()
+            .get_mut("photos")
+            .unwrap()
+            .insert("a.bin".into(), b"0123456789".to_vec());
+        let host = format!("127.0.0.1:{}", addr.port());
+        let token = crate::hmac::b64_encode(
+            format!("{}:{}", c.access_key_id, c.secret_access_key).as_bytes(),
+        );
+        let req = format!(
+            "GET /photos/a.bin HTTP/1.1\r\nHost: {host}\r\nAuthorization: Basic {token}\r\nRange: bytes=2-5\r\n\r\n"
+        );
+        let t = thread::spawn(move || {
+            serve_tcp(&listener, &c, &store, true).unwrap();
+        });
+        let resp = exchange(addr, req.as_bytes());
+        assert!(resp.starts_with("HTTP/1.1 206"), "{resp}");
+        assert!(resp.contains("Content-Range: bytes 2-5/10"), "{resp}");
+        assert!(resp.contains("2345"), "{resp}");
+        t.join().unwrap();
     }
 
     #[test]

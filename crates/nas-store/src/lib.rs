@@ -8,6 +8,7 @@ pub mod blobs;
 pub mod bucket;
 pub mod cache;
 pub mod chunker;
+pub mod git;
 pub mod manifest;
 pub mod object;
 pub mod padding;
@@ -18,6 +19,10 @@ pub use blobs::{Addressing, BlobStore, StoreError};
 pub use bucket::{BucketError, BucketManifest, BucketStore, KeyObject, BUCKET_AAD, BUCKET_MAGIC};
 pub use cache::{CacheError, ChunkCache, CACHE_AAD, DEFAULT_CAP};
 pub use chunker::{Chunker, ChunkerConfig, ConfigError};
+pub use git::{
+    oid_from_hex, oid_to_hex, GitError, GitKind, GitOid, GitStore, OidEntry, OidMap, GIT_AAD,
+    GIT_MAGIC, GIT_OID_LEN,
+};
 pub use manifest::{ChunkRef, Kind, Manifest, ManifestError};
 pub use object::{
     read_object, read_object_range, salted_addr, ObjectError, ObjectWriter, ReadStats, Sealer,

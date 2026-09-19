@@ -9,6 +9,9 @@ mod aclcmd;
 mod attack;
 mod exit;
 mod gateway;
+mod gitcmd;
+mod gitremote;
+mod mirror;
 mod objectcmd;
 mod outbox;
 mod peercmd;
@@ -52,6 +55,8 @@ nas — NAS-tools command line
   nas ls  <ns>[/<prefix>]
   nas gateway status [--face s3|webdav]
   nas gateway serve [--listen 127.0.0.1:<port>|/path.sock] [--once]
+  nas mirror dry-run <ns>
+  nas mirror publish <ns>
   nas test roundtrip <ns> <path>
   nas test dedup-ratio <ns> --shared <pct> --max-transfer <pct>
   nas test confirmation-attack <ns> --with-cs|--without-cs
@@ -132,6 +137,10 @@ fn pct(args: &[String], name: &str, default: u32) -> Result<u32, String> {
 }
 
 fn main() {
+    let argv0 = std::env::args().next().unwrap_or_default();
+    if argv0.ends_with("git-remote-nas") {
+        std::process::exit(gitremote::run());
+    }
     let argv: Vec<String> = std::env::args().skip(1).collect();
     std::process::exit(run(&argv));
 }
@@ -154,7 +163,7 @@ fn run(argv: &[String]) -> i32 {
         "acl" => acl(rest),
         "peer" => peer(rest),
         "gateway" => gateway_cmd(rest),
-        "mirror" => testcmds::unimplemented("mirror", "M5 (§7.6)"),
+        "mirror" => mirror_cmd(rest),
         "delete-request" => match (positional(rest).first().copied(), positional(rest).get(1)) {
             (Some("execute"), Some(target)) => worm::delete_request_execute(target),
             _ => {
@@ -591,6 +600,30 @@ fn ns(args: &[String]) -> i32 {
 }
 
 /// Every `nas test <check> <ns>` command has the same shape.
+fn mirror_cmd(args: &[String]) -> i32 {
+    let pos = positional(args);
+    match pos.first().copied() {
+        Some("dry-run") => match pos.get(1) {
+            Some(ns) => mirror::dry_run(ns),
+            None => {
+                eprintln!("usage: nas mirror dry-run <ns>");
+                exit::ERROR
+            }
+        },
+        Some("publish") => match pos.get(1) {
+            Some(ns) => mirror::publish(ns),
+            None => {
+                eprintln!("usage: nas mirror publish <ns>");
+                exit::ERROR
+            }
+        },
+        _ => {
+            eprintln!("usage: nas mirror dry-run|publish <ns>");
+            exit::ERROR
+        }
+    }
+}
+
 fn one_ns(pos: &[&str], f: impl Fn(&str) -> i32) -> i32 {
     match pos.get(1) {
         Some(ns) => f(ns),
@@ -776,6 +809,41 @@ fn test(args: &[String]) -> i32 {
             }
         },
         Some("dvc-md5-not-trusted") => one_ns(&pos, gateway::dvc_md5_not_trusted),
+        Some("git-helper-present") => gitcmd::helper_present(),
+        Some("git-roundtrip") => one_ns(&pos, gitcmd::git_roundtrip),
+        Some("git-oidmap-encrypted") => one_ns(&pos, gitcmd::git_oidmap_encrypted),
+        Some("git-loose-objects") => one_ns(&pos, gitcmd::git_loose_objects),
+        Some("git-parallel-worktrees") => match pos.get(1) {
+            Some(ns) => {
+                let n = opt(args, "--agents")
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(4);
+                gitcmd::git_parallel_worktrees(ns, n)
+            }
+            None => {
+                eprintln!("usage: nas test git-parallel-worktrees <ns> --agents <n>");
+                exit::ERROR
+            }
+        },
+        Some("git-same-branch-collision") => one_ns(&pos, gitcmd::git_same_branch_collision),
+        Some("git-worktree-gitfile") => one_ns(&pos, gitcmd::git_worktree_gitfile),
+        Some("patch-roundtrip") => one_ns(&pos, gitcmd::patch_roundtrip),
+        Some("patch-queue-append-only") => one_ns(&pos, gitcmd::patch_queue_append_only),
+        Some("patch-unrostered") => one_ns(&pos, gitcmd::patch_unrostered),
+        Some("mirror-publish-without-dryrun") => one_ns(&pos, mirror::publish_without_dryrun),
+        Some("mirror-excludes") => match (pos.get(1), pos.get(2)) {
+            (Some(ns), Some(glob)) => mirror::excludes(ns, glob),
+            _ => {
+                eprintln!("usage: nas test mirror-excludes <ns> <glob>");
+                exit::ERROR
+            }
+        },
+        Some("mirror-no-empty-commits") => one_ns(&pos, mirror::no_empty_commits),
+        Some("mirror-shamap-exists") => one_ns(&pos, mirror::shamap_exists),
+        Some("mirror-shamap-stable") => one_ns(&pos, mirror::shamap_stable),
+        Some("mirror-shamap-encrypted") => one_ns(&pos, mirror::shamap_encrypted),
+        Some("mirror-failclosed") => one_ns(&pos, mirror::failclosed),
+        Some("mirror-secret-scan") => one_ns(&pos, mirror::secret_scan),
         Some("webdav-auth-required") => gateway::webdav_auth_required(),
         Some("webdav-roundtrip") => one_ns(&pos, gateway::webdav_roundtrip),
         Some("ranged-read") => one_ns(&pos, gateway::ranged_read),

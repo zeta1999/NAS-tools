@@ -10,7 +10,11 @@ networked peer protocol (M1): encrypted chunk storage, a peer you do not have to
 trust, slot consistency with fork detection, lease-based garbage collection and
 the deletion approval loop, and a localhost S3 face (`nas gateway`, `nas put`).
 A read-only WebDAV face rides the same localhost gateway as S3 (`nas gateway
-status --face webdav`). The git face and the doc face (M5–M6) do not exist yet.
+status --face webdav`). The git face is a `git-remote-nas` helper (`nas://`
+push/clone, inflated objects, encrypted OID map). `nas mirror dry-run` /
+`nas mirror publish` derive a filtered public history (path excludes,
+dropped empty commits, sealed SHA map; SPECS §7.6). The doc face (M6) is
+not built.
 Treat every command below as a building block,
 not a product. `STATUS.md` is the current state; `MANUAL-TESTING.md` records what
 has actually been exercised against real processes and containers.

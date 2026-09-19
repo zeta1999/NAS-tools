@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 . "$(dirname "$0")/lib.sh"
 uc_begin UC08 "Several coding agents at once" "SPECS §19.8, §7.4, §7.5" "M5"
-check         "git remote helper is discoverable as git-remote-nas" command -v git-remote-nas
+check         "git remote helper is discoverable as git-remote-nas" $NAS test git-helper-present
 check         "clone and push round-trip through nas://"         $NAS test git-roundtrip work
 check         "the OID map never leaves the encrypted manifest"  $NAS test git-oidmap-encrypted work
 check         "objects are stored inflated, not as packfiles"    $NAS test git-loose-objects work

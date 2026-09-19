@@ -1,8 +1,8 @@
 # NAS-tools Status
 
-**Current state:** **M0–M4 are done** on the acceptance suite (79 pass, 0
-fail at `NAS_MILESTONE=M4`; 74/0/26 at M3). `ci.sh` still gates at M1 until
-someone raises it.
+**Current state:** **M0–M5 are done** (99 pass, 0 fail, 1 pending at
+`NAS_MILESTONE=M5`). The leftover pending assertion is the M6 thumbnail
+permit in UC01. `ci.sh` still gates at M1.
 The onion carrier is a named `.onion` plus pin (loopback map); live
 arti circuits are still `simple-network --features tor`. All four M0 steps built, the 5 M0-tagged acceptance
 assertions pass against the real binary, and the padding measurement that M0
@@ -260,15 +260,22 @@ TLC is green with its three sanity checks still failing as required.
 
 M3 is built: S3 face plus `nas peer status` (named onion carrier). **No
 assertion fails at `NAS_MILESTONE=M2`:** 62 pass, 0 fail, 38 pending. At M3:
-74 pass, 0 fail, 26 pending. At M4: 79 pass, 0 fail, 21 pending.
+74 pass, 0 fail, 26 pending. At M4: 79 pass, 0 fail, 21 pending. At M5:
+99 pass, 0 fail, 1 pending.
 
 M4 is built: WebDAV (`OPTIONS`/`PROPFIND`/`HEAD`/`GET`) on the same gateway,
 Basic auth with the S3 secret, an encrypted per-boot LRU under `state/cache/`,
 and ranged GET that opens only overlapping chunks. NFSv3 is deferred until a
-Finder mount is measured (SPECS §8). Git face, doc face, live arti circuits
-remain.
+Finder mount is measured (SPECS §8).
 
-M4+: git face, doc face. Live arti onion circuits.
+M5 is built: `git-remote-nas` (same binary as `nas`, argv0 dispatch)
+speaks fetch/push over `nas://`; objects are stored inflated; the OID map
+is sealed; refs use client-side fast-forward; patches are signed under
+`SigContext::Patch`. The §7.6 filtered mirror is a derived repo with a
+sealed `private_sha → public_sha` map, mandatory dry-run, secret scan,
+`SigContext::MirrorPublish` approval, and fail-closed rules (UC06).
+
+M6: doc face. Live arti onion circuits.
 
 **The single-writer handoff (§5.1) is built.** `SlotHandoff` is signed by the
 *outgoing* writer and binds slot, sequence and both writers, so it authorises

@@ -472,7 +472,12 @@ settled and the work that follows from them.
 
 ## M5 — git face
 
-- [ ] Remote helper; refs as `single-writer` slots; signed ownership handoff
+- [x] Remote helper (`git-remote-nas`, argv0 dispatch); inflated loose objects;
+      encrypted OID map; refs as `cas-merge` with a client fast-forward check
+      (SPECS §7.3, §7.4). UC08 is green.
+- [x] Patch export/import + append-only queue; unrostered author refused (§7.5)
+- [x] Filtered public mirror (§7.6 / UC06) — derived repo, sealed SHA map,
+      dry-run + secret-scan + signed publish, fail-closed rules. UC06 is green.
 
 ## M6 — doc face
 

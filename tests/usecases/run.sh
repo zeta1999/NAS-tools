@@ -33,6 +33,15 @@ fi
 # that refused.
 export NAS_PASSPHRASE="${NAS_PASSPHRASE:-acceptance suite five diceware words}"
 
+# git-remote-nas is the same binary as `nas` (argv0 dispatch). Put it next
+# to NAS_BIN so `command -v git-remote-nas` and `git push nas://…` resolve.
+if [ -n "${NAS_BIN:-}" ] && [ -x "$NAS_BIN" ]; then
+  _bindir=$(cd "$(dirname "$NAS_BIN")" && pwd)
+  ln -sfn "$(basename "$NAS_BIN")" "$_bindir/git-remote-nas"
+  export PATH="$_bindir:$PATH"
+  NAS="$_bindir/$(basename "$NAS_BIN")"
+fi
+
 tp=0; tf=0; tpend=0; rc=0
 for f in uc*.sh; do
   # The manual drills (uc10+: fixed ports, a release binary, docker) print no

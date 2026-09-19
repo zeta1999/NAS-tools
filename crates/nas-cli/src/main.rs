@@ -41,6 +41,7 @@ nas — NAS-tools command line
   nas peer writer <dir> <slot.pub>
   nas peer grant <dir> <subject> <right>
   nas peer show <dir>
+  nas peer status <name>             onion reachability (SPECS §5.6)
   nas peer serve <dir> --listen <host:port> [--hostile <spec>] [--mode <m>]
                        [--salt <tenant.salt>] [--once] [--witness]
   nas peer sync <ns> --peer <host:port> --peer-pub <transport.pub>
@@ -229,6 +230,7 @@ fn peer(args: &[String]) -> i32 {
         eprintln!(
             "usage: nas peer init|show <dir>\n       nas peer allow <dir> <subject> <transport.pub>\n       \
              nas peer writer <dir> <slot.pub>\n       nas peer grant <dir> <subject> <right>\n       \
+             nas peer status <name>\n       \
              nas peer serve <dir> --listen <host:port> [--hostile <spec>] [--once] [--witness]\n       \
              nas peer sync <ns> --peer <host:port> --peer-pub <transport.pub>\n       \
              [--witness <host:port> --witness-pub <transport.pub>]"
@@ -241,6 +243,7 @@ fn peer(args: &[String]) -> i32 {
     match verb {
         "init" => peercmd::init(target),
         "show" => peercmd::show(target),
+        "status" => peercmd::status(target),
         "allow" => match (pos.get(2), pos.get(3)) {
             (Some(subject), Some(file)) => peercmd::allow(target, subject, file),
             _ => usage(),

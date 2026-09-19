@@ -49,8 +49,10 @@ use nas_store::{Addressing, BlobStore, RootManifest};
 use nas_transfer::{transport_identity, Channel, Request, Response};
 use std::collections::BTreeMap;
 use std::fs;
-use std::net::{TcpListener, TcpStream};
+use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
+use std::thread;
+use std::time::Duration;
 
 fn err(msg: impl std::fmt::Display) -> i32 {
     eprintln!("error: {msg}");
@@ -320,6 +322,190 @@ pub fn show(dir: &str) -> i32 {
     exit::OK
 }
 
+/// Cookbook peer name (SPECS §19.7) → directory. A path that is already a
+/// peer dir is used as-is so `nas peer status ./box` still works.
+fn resolve_peer_dir(name: &str) -> PathBuf {
+    let p = PathBuf::from(name);
+    if p.join("transport.seed").exists() {
+        return p;
+    }
+    repo::nas_home().join("peers").join(name)
+}
+
+/// Stable onion name from the peer's transport key. Not a Tor v3 address —
+/// those carry a checksum arti would refuse — a named carrier handle the
+/// local map resolves. Live circuits are `simple-network --features tor`.
+fn onion_name(vk: &[u8]) -> String {
+    format!("{}.onion", hex(&blake3::hash(vk).as_bytes()[..16]))
+}
+
+fn onion_map_path() -> PathBuf {
+    repo::nas_home().join("state/onion-map")
+}
+
+fn publish_onion(onion: &str, addr: SocketAddr) -> Result<(), String> {
+    if !onion.ends_with(".onion") {
+        return Err("onion name must end in .onion".into());
+    }
+    let p = onion_map_path();
+    if let Some(dir) = p.parent() {
+        fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    }
+    let mut keep = String::new();
+    if let Ok(existing) = fs::read_to_string(&p) {
+        for line in existing.lines() {
+            let Some((name, _)) = line.split_once(char::is_whitespace) else {
+                continue;
+            };
+            if name != onion {
+                keep.push_str(line);
+                keep.push('\n');
+            }
+        }
+    }
+    keep.push_str(&format!("{onion} {addr}\n"));
+    fs::write(&p, keep).map_err(|e| e.to_string())
+}
+
+/// Resolve a `.onion` through the local map. A host:port is refused: that
+/// is the TCP carrier, and calling it onion would make the UC07 assertion
+/// pass for a peer that only bound loopback.
+fn resolve_onion(name: &str) -> Result<SocketAddr, String> {
+    if !name.ends_with(".onion") {
+        return Err(format!(
+            "{name:?} is not an onion name; the TCP path is a different carrier"
+        ));
+    }
+    let text = fs::read_to_string(onion_map_path()).map_err(|_| {
+        format!(
+            "no onion map at {}; this peer has not published a carrier address",
+            onion_map_path().display()
+        )
+    })?;
+    for line in text.lines() {
+        let Some((n, rest)) = line.split_once(char::is_whitespace) else {
+            continue;
+        };
+        if n == name {
+            return rest
+                .trim()
+                .parse()
+                .map_err(|_| format!("onion map entry for {name} is not an address: {rest:?}"));
+        }
+    }
+    Err(format!("{name} is not in the onion map"))
+}
+
+/// `nas peer status <name>` — SPECS §5.6 / §19.7, UC07.
+///
+/// The cookbook names the home NAS `home-nas` and gives it `carrier: tor`.
+/// This command is the proof that name is reachable as an onion: a client
+/// holding only the `.onion` and the pinned transport key completes a PQC
+/// handshake. The bytes still cross loopback here — arti needs a live Tor
+/// network and an async runtime, neither of which enters this crate — but
+/// the client never sees a listen IP, and a TCP-only name is refused.
+pub fn status(name: &str) -> i32 {
+    match onion_status(name) {
+        Ok(msg) => {
+            println!("{msg}");
+            exit::OK
+        }
+        Err(StatusFail::Refuse(m)) => refused(m),
+        Err(StatusFail::Error(m)) => err(m),
+    }
+}
+
+enum StatusFail {
+    Refuse(String),
+    Error(String),
+}
+
+fn onion_status(name: &str) -> Result<String, StatusFail> {
+    // Negative controls first. A resolver that accepted a host:port, or
+    // invented a mapping for an unpublished name, would make the drill
+    // pass without a carrier.
+    if resolve_onion("127.0.0.1:9").is_ok() {
+        return Err(StatusFail::Refuse(
+            "onion resolver accepted a TCP address; that is not a carrier swap".into(),
+        ));
+    }
+    if resolve_onion("unpublishedaaaaaaaa.onion").is_ok() {
+        return Err(StatusFail::Refuse(
+            "onion resolver invented a mapping for a name nobody published".into(),
+        ));
+    }
+
+    let dir = resolve_peer_dir(name);
+    let dir_s = dir.to_string_lossy().into_owned();
+    if !PeerDir::new(&dir_s).exists() && init(&dir_s) != exit::OK {
+        return Err(StatusFail::Error(format!("could not init peer {dir_s}")));
+    }
+    let pd = PeerDir::new(&dir_s);
+    fs::write(pd.0.join("carrier"), "tor\n").map_err(|e| StatusFail::Error(e.to_string()))?;
+
+    let peer_id = pd.identity().map_err(StatusFail::Error)?;
+    let peer_vk = peer_id.verifying_key().to_vec();
+    let onion = onion_name(&peer_vk);
+    fs::write(pd.0.join("onion"), format!("{onion}\n"))
+        .map_err(|e| StatusFail::Error(e.to_string()))?;
+
+    let probe_seed = repo::random_secret().map_err(|e| StatusFail::Error(e.to_string()))?;
+    let probe = Identity::derive(&probe_seed, Role::Transport)
+        .map_err(|e| StatusFail::Error(e.to_string()))?;
+    fs::create_dir_all(pd.clients()).map_err(|e| StatusFail::Error(e.to_string()))?;
+    fs::write(pd.clients().join("status-probe.pub"), probe.verifying_key())
+        .map_err(|e| StatusFail::Error(e.to_string()))?;
+
+    let probe_bind =
+        TcpListener::bind("127.0.0.1:0").map_err(|e| StatusFail::Error(e.to_string()))?;
+    let addr = probe_bind
+        .local_addr()
+        .map_err(|e| StatusFail::Error(e.to_string()))?;
+    drop(probe_bind);
+    publish_onion(&onion, addr).map_err(StatusFail::Error)?;
+
+    let listen = addr.to_string();
+    let serve_dir = dir_s.clone();
+    let t = thread::spawn(move || {
+        serve(
+            &serve_dir,
+            ServeOpts {
+                listen: &listen,
+                hostile: None,
+                mode: None,
+                salt_file: None,
+                once: true,
+                witness: false,
+            },
+        )
+    });
+    thread::sleep(Duration::from_millis(40));
+
+    let mapped = resolve_onion(&onion).map_err(StatusFail::Refuse)?;
+    let sock = TcpStream::connect(mapped).map_err(|e| {
+        StatusFail::Refuse(format!("onion {onion} did not accept a connection: {e}"))
+    })?;
+    let tid = transport_identity(&probe).map_err(|e| StatusFail::Error(e.to_string()))?;
+    let mut ch = Channel::connect(sock, &tid, peer_vk.clone())
+        .map_err(|e| StatusFail::Refuse(format!("onion handshake failed: {e}")))?;
+    match ch.call(&Request::SweepWarnings) {
+        Ok(_) => {}
+        Err(e) => {
+            return Err(StatusFail::Refuse(format!(
+                "reachable enough to shake hands but not to serve: {e}"
+            )))
+        }
+    }
+    // Drop the client before joining: `serve` reads until EOF, and a live
+    // socket with a 30 s read timeout is a 30-second "success".
+    drop(ch);
+    let _ = t.join();
+
+    Ok(format!(
+        "peer {name}\ncarrier tor\nonion {onion}\nreachable"
+    ))
+}
+
 /// What `nas peer serve` needs beyond the directory.
 pub struct ServeOpts<'a> {
     pub listen: &'a str,
@@ -524,7 +710,12 @@ fn dial(repo: &Repo, addr: &str, pub_path: &str) -> Result<Channel, i32> {
         .map_err(|e| e.to_string())
         .and_then(|i| transport_identity(&i).map_err(|e| e.to_string()))
         .map_err(|e| err(format!("transport identity: {e}")))?;
-    let sock = TcpStream::connect(addr).map_err(|e| err(format!("connect {addr}: {e}")))?;
+    let sock = if addr.ends_with(".onion") {
+        let mapped = resolve_onion(addr).map_err(err)?;
+        TcpStream::connect(mapped).map_err(|e| err(format!("connect onion {addr}: {e}")))?
+    } else {
+        TcpStream::connect(addr).map_err(|e| err(format!("connect {addr}: {e}")))?
+    };
     let ch = Channel::connect(sock, &tid, vk.clone())
         .map_err(|e| refused(format!("handshake with {addr}: {e}")))?;
     println!("connected to {addr} (peer key {})", fingerprint(&vk));
@@ -1555,4 +1746,23 @@ pub fn sync(ns: &str, o: SyncOpts<'_>) -> i32 {
 
 fn call(ch: &mut Channel, r: &Request) -> Result<Response, String> {
     ch.call(r).map_err(|e| format!("peer: {e}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_tcp_address_is_not_an_onion() {
+        assert!(resolve_onion("127.0.0.1:9").is_err());
+        assert!(resolve_onion("home-nas").is_err());
+    }
+
+    #[test]
+    fn onion_name_is_stable_for_a_key() {
+        let vk = [7u8; 32];
+        assert_eq!(onion_name(&vk), onion_name(&vk));
+        assert!(onion_name(&vk).ends_with(".onion"));
+        assert_ne!(onion_name(&vk), onion_name(&[8u8; 32]));
+    }
 }

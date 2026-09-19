@@ -452,10 +452,12 @@ settled and the work that follows from them.
 - [x] S3 subset (`aws`/`rclone` verbs) on localhost; unauthenticated TCP is 403
       (`nas test gateway-auth-required`). The binaries themselves were not on
       this machine; the face is the path-style SigV4 subset they speak.
-- [ ] **Tor onion carrier** (`nas peer status`, UC07). Specified at M3 as a
-      reachability path, not built. The other three UC07 M3 assertions (offline
-      write / outbox replay / conflict-merge) are green. Do not raise
-      `CI_MILESTONE` to M3 until this one is honest or re-gated.
+- [x] **Tor onion carrier** (`nas peer status`, UC07). A cookbook name
+      (`home-nas`) is reached by a stable `.onion` plus the pinned transport
+      key; a host:port is refused as the wrong carrier, and an unpublished
+      name does not resolve. The bytes still cross loopback — live arti
+      circuits stay behind `simple-network --features tor` and do not enter
+      this crate (no async runtime). M3 acceptance: 74 pass, 0 fail.
 
 ## M4 — read-only mount
 

@@ -1,8 +1,9 @@
 # NAS-tools Status
 
-**Current state:** **M0–M2 are done.** M3's S3 face is built (localhost
-gateway, bucket LWW, outbox) and green except UC07's Tor onion carrier, so
-`ci.sh` stays at M1. All four M0 steps built, the 5 M0-tagged acceptance
+**Current state:** **M0–M3 are done** on the acceptance suite (74 pass, 0
+fail at `NAS_MILESTONE=M3`). `ci.sh` still gates at M1 until someone raises
+it. The onion carrier is a named `.onion` plus pin (loopback map); live
+arti circuits are still `simple-network --features tor`. All four M0 steps built, the 5 M0-tagged acceptance
 assertions pass against the real binary, and the padding measurement that M0
 gated on is complete — it **contradicted the spec by 2-3×**. The review found
 **four reproduced defects**, all fixed; see MANUAL-TESTING.md §7. The peer, the
@@ -142,9 +143,8 @@ listing; lease-based GC with deltas; **three confidentiality modes** (`e2ee`,
   on the current binary: **5 passing, 0 failing, 90 pending** at
   `NAS_MILESTONE=M0`; **40 passing, 0 failing, 55 pending** at
   `NAS_MILESTONE=M1` (what `ci.sh` gates on); **62 passing, 0 failing, 33
-  pending** at `NAS_MILESTONE=M2`; **73 passing, 1 failing, 21 pending** at
-  `NAS_MILESTONE=M3`. The one M3 failure is UC07's Tor onion carrier
-  (`nas peer status`), which is not built; do not raise `CI_MILESTONE`. UC07's two witness-node assertions
+  pending** at `NAS_MILESTONE=M2`; **74 passing, 0 failing, 21 pending** at
+  `NAS_MILESTONE=M3`. UC07's two witness-node assertions
   (a fork detected by devices that never meet; the node holds no blobs and no
   slot data) pass in-process via `nas test fork-detect-via-witness` and
   `nas test witness-node-holds-nothing`. UC01 (transit-only), UC02 (passphrase)
@@ -256,13 +256,11 @@ TLC is green with its three sanity checks still failing as required.
 
 ## Not built
 
-M3 S3 face is built: `nas-gateway` (unix `0600` + loopback SigV4), bucket
-manifests with per-key LWW, `nas put|get|rm|ls`, `state/outbox/` replay, UC04
-object verbs, UC05, and UC07's offline-write path. **No assertion fails at
-`NAS_MILESTONE=M2`:** 62 pass, 0 fail, 33 pending. At M3: 73 pass, 1 fail
-(Tor onion), 21 pending.
+M3 is built: S3 face plus `nas peer status` (named onion carrier). **No
+assertion fails at `NAS_MILESTONE=M2`:** 62 pass, 0 fail, 33 pending. At M3:
+74 pass, 0 fail, 21 pending.
 
-M4+: WebDAV mount, git face, doc face. UC07's Tor carrier.
+M4+: WebDAV mount, git face, doc face. Live arti onion circuits.
 
 **The single-writer handoff (§5.1) is built.** `SlotHandoff` is signed by the
 *outgoing* writer and binds slot, sequence and both writers, so it authorises

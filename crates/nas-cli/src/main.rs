@@ -7,6 +7,7 @@
 
 mod aclcmd;
 mod attack;
+mod doccmd;
 mod exit;
 mod gateway;
 mod gitcmd;
@@ -57,6 +58,7 @@ nas — NAS-tools command line
   nas gateway serve [--listen 127.0.0.1:<port>|/path.sock] [--once]
   nas mirror dry-run <ns>
   nas mirror publish <ns>
+  nas doc get <ns>/<name>
   nas test roundtrip <ns> <path>
   nas test dedup-ratio <ns> --shared <pct> --max-transfer <pct>
   nas test confirmation-attack <ns> --with-cs|--without-cs
@@ -164,6 +166,7 @@ fn run(argv: &[String]) -> i32 {
         "peer" => peer(rest),
         "gateway" => gateway_cmd(rest),
         "mirror" => mirror_cmd(rest),
+        "doc" => doc_cmd(rest),
         "delete-request" => match (positional(rest).first().copied(), positional(rest).get(1)) {
             (Some("execute"), Some(target)) => worm::delete_request_execute(target),
             _ => {
@@ -240,6 +243,7 @@ fn peer(args: &[String]) -> i32 {
             "usage: nas peer init|show <dir>\n       nas peer allow <dir> <subject> <transport.pub>\n       \
              nas peer writer <dir> <slot.pub>\n       nas peer grant <dir> <subject> <right>\n       \
              nas peer status <name>\n       \
+             nas peer feature-permitted <ns> <feature>\n       \
              nas peer serve <dir> --listen <host:port> [--hostile <spec>] [--once] [--witness]\n       \
              nas peer sync <ns> --peer <host:port> --peer-pub <transport.pub>\n       \
              [--witness <host:port> --witness-pub <transport.pub>]"
@@ -282,6 +286,13 @@ fn peer(args: &[String]) -> i32 {
                 },
             )
         }
+        "feature-permitted" => match pos.get(2) {
+            Some(feature) => peercmd::feature_permitted(target, feature),
+            None => {
+                eprintln!("usage: nas peer feature-permitted <ns> <feature>");
+                exit::ERROR
+            }
+        },
         "sync" => {
             let (Some(peer), Some(peer_pub)) = (opt(args, "--peer"), opt(args, "--peer-pub"))
             else {
@@ -600,6 +611,23 @@ fn ns(args: &[String]) -> i32 {
 }
 
 /// Every `nas test <check> <ns>` command has the same shape.
+fn doc_cmd(args: &[String]) -> i32 {
+    let pos = positional(args);
+    match pos.first().copied() {
+        Some("get") => match pos.get(1) {
+            Some(target) => doccmd::get(target),
+            None => {
+                eprintln!("usage: nas doc get <ns>/<name>");
+                exit::ERROR
+            }
+        },
+        _ => {
+            eprintln!("usage: nas doc get <ns>/<name>");
+            exit::ERROR
+        }
+    }
+}
+
 fn mirror_cmd(args: &[String]) -> i32 {
     let pos = positional(args);
     match pos.first().copied() {
@@ -844,6 +872,12 @@ fn test(args: &[String]) -> i32 {
         Some("mirror-shamap-encrypted") => one_ns(&pos, mirror::shamap_encrypted),
         Some("mirror-failclosed") => one_ns(&pos, mirror::failclosed),
         Some("mirror-secret-scan") => one_ns(&pos, mirror::secret_scan),
+        Some("doc-roundtrip") => one_ns(&pos, doccmd::roundtrip),
+        Some("doc-concurrent-merge") => one_ns(&pos, doccmd::concurrent_merge),
+        Some("doc-oplog-encrypted") => one_ns(&pos, doccmd::oplog_encrypted),
+        Some("doc-compact") => one_ns(&pos, doccmd::compact),
+        Some("doc-poll-active") => one_ns(&pos, doccmd::poll_active),
+        Some("doc-poll-idle") => one_ns(&pos, doccmd::poll_idle),
         Some("webdav-auth-required") => gateway::webdav_auth_required(),
         Some("webdav-roundtrip") => one_ns(&pos, gateway::webdav_roundtrip),
         Some("ranged-read") => one_ns(&pos, gateway::ranged_read),

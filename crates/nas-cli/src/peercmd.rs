@@ -404,6 +404,34 @@ fn resolve_onion(name: &str) -> Result<SocketAddr, String> {
 /// handshake. The bytes still cross loopback here — arti needs a live Tor
 /// network and an async runtime, neither of which enters this crate — but
 /// the client never sees a listen IP, and a TCP-only name is refused.
+/// `nas peer feature-permitted <ns> <feature>` — SPECS §19.1 / §2.2.
+///
+/// Thumbnails, index and gallery need the peer to *read*. That is permitted
+/// only in `transit-only`. The features themselves are still not built; this
+/// command is the mode permit, not the feature.
+pub fn feature_permitted(ns: &str, feature: &str) -> i32 {
+    match feature {
+        "thumbnails" | "index" | "gallery" => {}
+        other => {
+            eprintln!("error: unknown peer feature {other:?}");
+            return exit::ERROR;
+        }
+    }
+    let repo = match Repo::open_with(ns, repo::passphrase_from(None)) {
+        Ok(r) => r,
+        Err(e) => return err(e),
+    };
+    match repo.mode {
+        Mode::TransitOnly => {
+            println!("permitted: {feature} in transit-only (SPECS §19.1)");
+            exit::OK
+        }
+        other => refused(format!(
+            "{feature} needs the peer to read; {other:?} does not allow that (SPECS §2.2)"
+        )),
+    }
+}
+
 pub fn status(name: &str) -> i32 {
     match onion_status(name) {
         Ok(msg) => {

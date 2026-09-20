@@ -13,8 +13,9 @@ A read-only WebDAV face rides the same localhost gateway as S3 (`nas gateway
 status --face webdav`). The git face is a `git-remote-nas` helper (`nas://`
 push/clone, inflated objects, encrypted OID map). `nas mirror dry-run` /
 `nas mirror publish` derive a filtered public history (path excludes,
-dropped empty commits, sealed SHA map; SPECS §7.6). The doc face (M6) is
-not built.
+dropped empty commits, sealed SHA map; SPECS §7.6). Documents are a
+per-doc CRDT op-log (`nas doc get`, `nas test doc-*`) with adaptive
+polling; pubsub is not used for correctness (SPECS §7.2).
 Treat every command below as a building block,
 not a product. `STATUS.md` is the current state; `MANUAL-TESTING.md` records what
 has actually been exercised against real processes and containers.

@@ -8,6 +8,7 @@ pub mod blobs;
 pub mod bucket;
 pub mod cache;
 pub mod chunker;
+pub mod doc;
 pub mod git;
 pub mod manifest;
 pub mod object;
@@ -19,6 +20,10 @@ pub use blobs::{Addressing, BlobStore, StoreError};
 pub use bucket::{BucketError, BucketManifest, BucketStore, KeyObject, BUCKET_AAD, BUCKET_MAGIC};
 pub use cache::{CacheError, ChunkCache, CACHE_AAD, DEFAULT_CAP};
 pub use chunker::{Chunker, ChunkerConfig, ConfigError};
+pub use doc::{
+    poll_interval_ms, DocError, DocLog, DocStore, OpId, OpKind, DOC_AAD, DOC_MAGIC, POLL_ACTIVE_MS,
+    POLL_IDLE_MS, ROOT,
+};
 pub use git::{
     oid_from_hex, oid_to_hex, GitError, GitKind, GitOid, GitStore, OidEntry, OidMap, GIT_AAD,
     GIT_MAGIC, GIT_OID_LEN,

@@ -481,8 +481,9 @@ settled and the work that follows from them.
 
 ## M6 — doc face
 
-- [ ] CRDT engine, op-log blobs, compaction
-- [ ] Adaptive polling; pubsub only if latency demands it
+- [x] CRDT engine, op-log blobs, compaction (UC15)
+- [x] Adaptive polling (sub-second active, minutes idle). Pubsub remains
+      post-M6 — it cannot be load-bearing against an untrusted peer (§7.2).
 
 ## Cross-cutting
 

@@ -1,8 +1,7 @@
 # NAS-tools Status
 
-**Current state:** **M0–M5 are done** (99 pass, 0 fail, 1 pending at
-`NAS_MILESTONE=M5`). The leftover pending assertion is the M6 thumbnail
-permit in UC01. `ci.sh` still gates at M1.
+**Current state:** **M0–M6 are done** (106 pass, 0 fail at `NAS_MILESTONE=M6`).
+`ci.sh` still gates at M1.
 The onion carrier is a named `.onion` plus pin (loopback map); live
 arti circuits are still `simple-network --features tor`. All four M0 steps built, the 5 M0-tagged acceptance
 assertions pass against the real binary, and the padding measurement that M0
@@ -261,7 +260,7 @@ TLC is green with its three sanity checks still failing as required.
 M3 is built: S3 face plus `nas peer status` (named onion carrier). **No
 assertion fails at `NAS_MILESTONE=M2`:** 62 pass, 0 fail, 38 pending. At M3:
 74 pass, 0 fail, 26 pending. At M4: 79 pass, 0 fail, 21 pending. At M5:
-99 pass, 0 fail, 1 pending.
+99 pass, 0 fail, 1 pending. At M6: 106 pass, 0 fail.
 
 M4 is built: WebDAV (`OPTIONS`/`PROPFIND`/`HEAD`/`GET`) on the same gateway,
 Basic auth with the S3 secret, an encrypted per-boot LRU under `state/cache/`,
@@ -275,7 +274,13 @@ is sealed; refs use client-side fast-forward; patches are signed under
 sealed `private_sha → public_sha` map, mandatory dry-run, secret scan,
 `SigContext::MirrorPublish` approval, and fail-closed rules (UC06).
 
-M6: doc face. Live arti onion circuits.
+M6 is built: per-doc CRDT op-log (`cas-merge` is set-union), compaction
+drops tombstones, adaptive poll is sub-second while editing and minutes
+when idle (SPECS §7.2). Pubsub is still a post-M6 latency optimisation.
+`nas peer feature-permitted` records that transit-only may run peer-side
+thumbnails (SPECS §19.1); the feature itself is not built.
+
+Live arti onion circuits remain.
 
 **The single-writer handoff (§5.1) is built.** `SlotHandoff` is signed by the
 *outgoing* writer and binds slot, sequence and both writers, so it authorises

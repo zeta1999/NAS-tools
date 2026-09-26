@@ -248,6 +248,72 @@ fn write_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
     fs::write(path, bytes)
 }
 
+/// Create a new `0600` file. Fails if `path` already exists, including when
+/// the last component is a symlink: `O_EXCL` does not follow one.
+fn open_exclusive(path: &Path) -> io::Result<fs::File> {
+    let mut opts = fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    opts.open(path)
+}
+
+/// Sibling used to replace `path`. Same directory, so the rename is atomic.
+/// The name is stable — `vault.bin` becomes `.vault.bin.tmp` — and tests
+/// occupy that exact name to simulate a replace that must not start.
+fn replace_tmp(path: &Path) -> PathBuf {
+    let mut name = std::ffi::OsString::from(".");
+    name.push(path.file_name().unwrap_or_default());
+    name.push(".tmp");
+    path.with_file_name(name)
+}
+
+fn parent_dir(path: &Path) -> &Path {
+    match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    }
+}
+
+fn sync_dir(dir: &Path) -> io::Result<()> {
+    fs::File::open(dir)?.sync_all()
+}
+
+/// Replace `path` by writing a sibling, fsyncing it, and renaming over the
+/// target. Returns the parent directory, which the caller still has to fsync.
+///
+/// `Err` means `path` was not replaced: the previous inode is still that name.
+///
+/// This is for `vault.bin` only. That file is the only copy of every
+/// convergence-secret generation, the identity seed, and the pinned peers.
+/// [`write_private`] truncates in place, so a crash or `ENOSPC` between the
+/// truncate and the write leaves it empty or torn and every stored chunk
+/// underivable. The other callers of `write_private` create a path that did
+/// not hold history (`vault.key` and wrap `0` at create, a peer seed, a
+/// roster file) or write `gateway.json` only when it is absent. None of them
+/// replaces the sole record of secrets a rotation replaces. Export is the
+/// other exception, and it must fail with `O_EXCL` rather than replace.
+fn write_vault_replace(path: &Path, bytes: &[u8]) -> io::Result<PathBuf> {
+    use std::io::Write;
+    let tmp = replace_tmp(path);
+    {
+        let mut file = open_exclusive(&tmp)?;
+        if let Err(e) = file.write_all(bytes).and_then(|_| file.sync_all()) {
+            drop(file);
+            let _ = fs::remove_file(&tmp);
+            return Err(e);
+        }
+    }
+    if let Err(e) = fs::rename(&tmp, path) {
+        let _ = fs::remove_file(&tmp);
+        return Err(e);
+    }
+    Ok(parent_dir(path).to_path_buf())
+}
+
 /// What a namespace declares about itself, readable **without any secret**.
 ///
 /// Listing namespaces must not require unlocking them: a passphrase namespace
@@ -593,20 +659,49 @@ impl Repo {
                 "passphrase mode has no convergence generation to rotate",
             ));
         };
-        let number = v
-            .rotate_convergence()
-            .map_err(|e| io::Error::other(e.to_string()))?;
-        let ns = self
-            .root
-            .file_name()
-            .and_then(|s| s.to_str())
-            .ok_or_else(|| io::Error::other("namespace path has no name"))?;
-        let vault_key = Self::load_vault_key(ns, &self.root)?;
-        let sealed = v
-            .seal_with(vault_key)
-            .map_err(|e| io::Error::other(e.to_string()))?;
-        write_private(&self.root.join("vault.bin"), &sealed)?;
+        // Snapshot before the append. `load_vault_key` fails when the key
+        // file is gone and the keychain has no item; `seal_with` fails when
+        // the container cannot be sealed; the replace fails when the sibling
+        // temp cannot be created. Any of those is reachable, and any of them
+        // would leave an unpersisted generation in `v` while `cs_holder`
+        // still holds the old secret: `generation()` and `sealer()` would
+        // disagree, and a retry would skip a number.
+        let prior = v.clone();
+        let number = match v.rotate_convergence() {
+            Ok(n) => n,
+            Err(e) => return Err(io::Error::other(e.to_string())),
+        };
+        let Some(ns) = self.root.file_name().and_then(|s| s.to_str()) else {
+            *v = prior;
+            return Err(io::Error::other("namespace path has no name"));
+        };
+        let vault_key = match Self::load_vault_key(ns, &self.root) {
+            Ok(k) => k,
+            Err(e) => {
+                *v = prior;
+                return Err(e);
+            }
+        };
+        let sealed = match v.seal_with(vault_key) {
+            Ok(s) => s,
+            Err(e) => {
+                *v = prior;
+                return Err(io::Error::other(e.to_string()));
+            }
+        };
+        let dir = match write_vault_replace(&self.root.join("vault.bin"), &sealed) {
+            Ok(dir) => dir,
+            Err(e) => {
+                *v = prior;
+                return Err(e);
+            }
+        };
+        // The rename is the commit. Point `cs_holder` at the new generation
+        // before the directory fsync: a failure there must not roll `v` back,
+        // because the file already contains this generation and rolling back
+        // would describe a `vault.bin` that is gone.
         self.cs_holder = v.current_generation().convergence_secret();
+        sync_dir(&dir)?;
         Ok(number)
     }
 
@@ -895,6 +990,97 @@ mod tests {
             assert_eq!(fs::read(&dest).unwrap().len(), 32);
             let err = again.export_vault_key(&dest).unwrap_err();
             assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+            crate::keychain::delete(ns);
+        });
+    }
+
+    /// A rotation that cannot persist must leave the previous `vault.bin`
+    /// byte-for-byte, and must not consume a generation number.
+    ///
+    /// Two injections, both before the rename. Pointing `root` at a directory
+    /// that has no vault key makes `load_vault_key` fail after the in-memory
+    /// append. Occupying `.vault.bin.tmp` (the sibling `write_vault_replace`
+    /// creates with `O_EXCL`) makes the replace fail the same way. An in-place
+    /// truncate ignores that sibling and destroys the only copy; a missing
+    /// rollback leaves `generation()` ahead of the file, so the rotate that
+    /// then succeeds returns 2 or 3 rather than 1.
+    #[test]
+    fn a_failed_rotate_keeps_vault_bin_and_does_not_skip_a_generation() {
+        with_temp_home(|_| {
+            let ns = "rot-durable";
+            crate::keychain::delete(ns);
+            let mut repo = Repo::create(
+                ns,
+                Mode::E2ee,
+                KeyScheme::Convergent,
+                PaddingProfile::None,
+                None,
+                None,
+                None,
+            )
+            .expect("create");
+            let root = repo.root.clone();
+            let vault = root.join("vault.bin");
+            let original = fs::read(&vault).expect("vault.bin");
+            let fp = repo.convergence_secret_fingerprint();
+
+            let unique = format!("no-key-{}", std::process::id());
+            repo.root = root.join(&unique);
+            let err = repo.rotate_convergence().expect_err("no key to seal with");
+            assert_eq!(
+                err.kind(),
+                io::ErrorKind::NotFound,
+                "load_vault_key must be what failed, not a later replace"
+            );
+            repo.root = root.clone();
+            assert_eq!(repo.generation(), 0, "unpersisted generation was kept");
+            assert_eq!(
+                repo.convergence_secret_fingerprint(),
+                fp,
+                "sealer() moved while generation() did not, or the reverse"
+            );
+            assert_eq!(
+                fs::read(&vault).expect("vault.bin after a failed seal"),
+                original,
+                "a failed seal rewrote vault.bin"
+            );
+
+            // The sibling name `write_vault_replace` uses for `vault.bin`.
+            let tmp = root.join(".vault.bin.tmp");
+            fs::write(&tmp, b"occupied").unwrap();
+            let err = repo
+                .rotate_convergence()
+                .expect_err("replace must refuse an occupied sibling");
+            assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
+            assert_eq!(fs::read(&tmp).unwrap(), b"occupied");
+            assert_eq!(fs::read(&vault).unwrap(), original);
+            assert_eq!(repo.generation(), 0);
+            assert_eq!(repo.convergence_secret_fingerprint(), fp);
+            let opened = Repo::open_with(ns, None).expect("original vault.bin still opens");
+            assert_eq!(opened.generation(), 0);
+
+            fs::remove_file(&tmp).unwrap();
+            let n = repo.rotate_convergence().expect("rotate");
+            assert_eq!(n, 1, "the two failures consumed a generation number");
+            assert_eq!(repo.generation(), 1);
+            assert_ne!(fs::read(&vault).unwrap(), original);
+            assert!(
+                !tmp.exists(),
+                "the sibling temp survived a successful replace"
+            );
+            let leftovers: Vec<String> = fs::read_dir(&root)
+                .unwrap()
+                .filter_map(|e| {
+                    let name = e.ok()?.file_name().to_string_lossy().into_owned();
+                    name.contains(".tmp").then_some(name)
+                })
+                .collect();
+            assert!(
+                leftovers.is_empty(),
+                "temp survived a successful replace: {leftovers:?}"
+            );
+            let again = Repo::open_with(ns, None).expect("replaced vault.bin opens");
+            assert_eq!(again.generation(), 1);
             crate::keychain::delete(ns);
         });
     }

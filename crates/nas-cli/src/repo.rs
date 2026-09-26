@@ -261,6 +261,25 @@ fn open_exclusive(path: &Path) -> io::Result<fs::File> {
     opts.open(path)
 }
 
+/// New file only. `O_EXCL` is the refusal: a path that already exists,
+/// symlink included, is not opened and not followed. `.mode` is applied
+/// only when the inode is created, so this is also what makes the file 0600.
+fn write_private_new(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    use std::io::Write;
+    let mut file = open_exclusive(path).map_err(|e| {
+        if e.kind() == io::ErrorKind::AlreadyExists {
+            io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "destination exists; refusing to overwrite a vault key",
+            )
+        } else {
+            e
+        }
+    })?;
+    file.write_all(bytes)?;
+    file.sync_all()
+}
+
 /// Sibling used to replace `path`. Same directory, so the rename is atomic.
 /// The name is stable — `vault.bin` becomes `.vault.bin.tmp` — and tests
 /// occupy that exact name to simulate a replace that must not start.
@@ -707,6 +726,10 @@ impl Repo {
 
     /// Write the 32-byte vault key to a new `0600` file. Never prints it.
     /// Refuses if `dest` already exists. Passphrase mode has no such key.
+    ///
+    /// The refusal is `O_EXCL`, not a prior `exists` check. Between the check
+    /// and the open a symlink can be planted at `dest`, and a pre-created
+    /// `0644` file keeps its mode because `.mode` applies only at creation.
     pub fn export_vault_key(&self, dest: &Path) -> io::Result<()> {
         if self.mode == Mode::Passphrase {
             return Err(io::Error::new(
@@ -714,19 +737,16 @@ impl Repo {
                 "passphrase mode has no vault key to export",
             ));
         }
-        if dest.exists() {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "destination exists; refusing to overwrite a vault key",
-            ));
-        }
         let ns = self
             .root
             .file_name()
             .and_then(|s| s.to_str())
             .ok_or_else(|| io::Error::other("namespace path has no name"))?;
-        let key = Self::load_vault_key(ns, &self.root)?;
-        write_private(dest, &key)
+        // Zeroize on every return, including the write failing. The rest of
+        // the vault path does this; leaving the exported copy on the stack
+        // was the exception.
+        let key = zeroize::Zeroizing::new(Self::load_vault_key(ns, &self.root)?);
+        write_private_new(dest, &*key)
     }
 
     /// A hash of the convergence secret, for comparing two namespaces without
@@ -990,6 +1010,66 @@ mod tests {
             assert_eq!(fs::read(&dest).unwrap().len(), 32);
             let err = again.export_vault_key(&dest).unwrap_err();
             assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+            crate::keychain::delete(ns);
+        });
+    }
+
+    /// A path that already exists is not a place the vault key may be written,
+    /// and a path this call creates is mode 0600.
+    ///
+    /// The pre-created file is the obvious case. The dangling symlink is the
+    /// one `exists` misses: it reports false, and `create` without `O_EXCL`
+    /// follows the link and writes the 32-byte key wherever it points. A
+    /// pre-created 0644 file would also keep that mode, because `.mode` does
+    /// not change an existing inode.
+    #[cfg(unix)]
+    #[test]
+    fn export_refuses_an_existing_path_and_creates_mode_0600() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        with_temp_home(|_| {
+            let ns = "export-excl";
+            crate::keychain::delete(ns);
+            let repo = Repo::create(
+                ns,
+                Mode::E2ee,
+                KeyScheme::Convergent,
+                PaddingProfile::None,
+                None,
+                None,
+                None,
+            )
+            .expect("create");
+
+            let dest = repo.root.join("preexisting.key");
+            fs::write(&dest, b"not-the-key").unwrap();
+            let mut perms = fs::metadata(&dest).unwrap().permissions();
+            perms.set_mode(0o644);
+            fs::set_permissions(&dest, perms).unwrap();
+            let err = repo.export_vault_key(&dest).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+            assert!(err.to_string().contains("destination exists"), "{err}");
+            assert_eq!(fs::read(&dest).unwrap(), b"not-the-key");
+            assert_eq!(
+                fs::metadata(&dest).unwrap().permissions().mode() & 0o777,
+                0o644,
+                "a refused export changed the existing file's mode"
+            );
+
+            let target = repo.root.join("leaked.key");
+            let link = repo.root.join("via-symlink.key");
+            symlink(&target, &link).unwrap();
+            let err = repo.export_vault_key(&link).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+            assert!(
+                !target.exists(),
+                "export followed a dangling symlink and wrote the vault key"
+            );
+
+            let fresh = repo.root.join("fresh.key");
+            repo.export_vault_key(&fresh).expect("export");
+            let mode = fs::metadata(&fresh).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "exported vault key mode is {mode:o}");
+            assert_eq!(fs::read(&fresh).unwrap().len(), 32);
             crate::keychain::delete(ns);
         });
     }

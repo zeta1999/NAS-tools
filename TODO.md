@@ -3,6 +3,42 @@
 Honest status. **M0 is complete**; this tracks the design decisions that are
 settled and the work that follows from them.
 
+## For zeta1999 — needs a human, not an agent
+
+- [ ] **Check the test NAS configuration and deploy.** Nobody can do this for
+      you: it needs the physical box, its network position, and a judgement
+      about which namespace modes the real hardware should carry. Worth doing
+      against `USE-CASES.md` — the mode choice per namespace (`transit-only`
+      vs `passphrase` vs `e2ee`) is the decision the whole design turns on, and
+      it is not reversible by editing YAML after the data is in.
+      - **Blocked today by a build failure** (see below). Deploying needs a
+        binary, and there is not one.
+      - When it does build, the acceptance suite is the deployment check:
+        `NAS_MILESTONE=M6 ./tests/usecases/run.sh` against the real peer rather
+        than a fixture. `run.sh` defaults to `M0` and skips everything above
+        it, so a bare run on a fresh box reports `0 passed, 0 failed, 106
+        pending` and looks the same as a working deployment. Set the milestone.
+
+- [ ] **Unblock the build — three functions missing from `secure-memory`.**
+      Verified on andromeda 2026-09-26, `cargo build --release -p nas-crypto`:
+
+          error[E0432] unresolved imports `secure_memory::open_with_nonce`,
+                       `secure_memory::seal_with_nonce`  (nas-crypto/src/keys.rs:21)
+          error[E0599] no associated item `from_seed` for `SigKeyPair`
+                       (nas-crypto/src/sign.rs:137)
+
+      `nas-crypto` depends on `../../../rust-secure-memory`
+      (`zeta1999/rust-secure-memory`, clean at `7786c46`); none of the three
+      exist there and `SigKeyPair` offers only `generate` and `from_bytes`.
+      Note `STATUS.md:3` claims "M0–M6 are done (106 pass, 0 fail at
+      `NAS_MILESTONE=M6`)" — that is **not reproducible here**, because the
+      workspace does not compile. Either it was true against an older
+      `secure-memory` and broke when that repo moved, or it was never
+      reproduced. Whichever it is, the compiler is the one to believe.
+      Related: `~/work/rust-secure-memory-public` has two uncommitted files
+      (`hybrid_kem.rs`, `kem.rs` — `export_secret`/`from_secret`/`from_parts`)
+      that nobody has claimed; possibly the same work, possibly not.
+
 ## Done (design)
 
 - [x] Trust model fixed: peers untrusted, ciphertext only, PQC throughout

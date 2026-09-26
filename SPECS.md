@@ -601,12 +601,14 @@ originally made against a 20–35% premium; the real premium is 56–97%, agains
 threat (an adversary holding a candidate file and wanting confirmation) that
 remains low-probability unless the user is individually targeted.
 
-> **Open question (M2), not an assumption.** A denser ladder — 1.25× or 1.5×
-> steps rather than ×2 — would cut the premium substantially in exchange for a
-> finer length fingerprint, and a floor below 32 KiB would help the small-file
-> case specifically. Neither is decided here. What is decided is that the
-> trade-off must be argued against measurements, since the last estimate made
-> without them was off by 3×.
+> **Decision (post-M6), not a retune.** Keep the ×2 ladder `{32, 64, 128, 256}`
+> KiB. Keep the default `none`. A denser ladder — 1.25× or 1.5× steps, or a
+> floor below 32 KiB — would cut the premium in exchange for a finer length
+> fingerprint, but changing `LADDER` would force a Lean `Padding.lean` and
+> format discussion for no production traffic: nothing is stored under
+> `classes` today. Do not retune until a mode that actually uses `classes` is
+> the common path. The last estimate made without measurements was off by 3×;
+> the next change, if any, is argued against a corpus that is actually padded.
 
 The `padding_profile` field is written into every manifest from M0 regardless, so
 enabling it later is a configuration change and never a format break.

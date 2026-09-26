@@ -193,10 +193,9 @@ as the `TouchOnDedup` constant: `TRUE` in every gated windowing, where
 states — so the green run is attributable to the touch, and the finding stays
 reproducible rather than becoming folklore.
 
-One further place where code and spec disagree is recorded in the module
-header and modelled as the code has it: there is no authenticated `forget`
-path at all (`publish_retention` refuses *every* shrink, so the model's
-`Forget` is more permissive than the peer). A stale doc comment in
+`publish_retention` still refuses every shrink. The authenticated `forget`
+the model already named is now `Peer::forget_retention` (a recorded
+`DeleteExecution` whose `decide` passed). A stale doc comment in
 `crates/nas-cli/src/roaming.rs` that said `expiry + grace` where §6.3 and that
 function's own code both say `expiry + notice` has been corrected.
 

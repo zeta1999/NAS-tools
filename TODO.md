@@ -114,12 +114,13 @@ settled and the work that follows from them.
       `TouchOnDedup` constant: the invariant holds at every gated windowing and
       the old code is the `FALSE` negative control, so the finding stays
       reproducible. Tests at both layers back-date the mtime and re-plan.
-- [ ] **No authenticated `forget` for the retention floor (SPECS §6.3, §16.3).**
-      §16.3's table routes a shrink through the offline delete authority;
-      `Peer::publish_retention` implements no such path and refuses *every*
-      shrink, so the only way an address leaves the floor is a peer running
-      `--hostile ignore-retention`. Safe, but not what the spec describes.
-      `LeaseGC.tla`'s `Forget` models the spec's act, not the code's absence.
+- [x] **Authenticated `forget` for the retention floor (SPECS §6.3, §16.3).**
+      `Peer::forget_retention(addrs, proof)` shrinks only when `proof` is a
+      recorded `DeleteExecution` whose `decide` already passed; `new ⊆ old`
+      by dropping those addresses. Shrink without proof stays refused (exit 2).
+      Wired as `ForgetRetention` (tag 22). The client maps `Scope` via the
+      object map, releases leases, then forgets. The e2ee peer still never
+      names the file. `nas test retention-forget`.
 - [x] `DeleteQuorum.tla` — quorum, approval replay, cooling-off bypass.
       A hostile executor assembles the `DeleteExecution` bundle out of every
       approval that exists, in any multiplicity: replay and re-targeting are
@@ -155,10 +156,10 @@ settled and the work that follows from them.
 - [x] Blob store, manifests, proof-of-possession, object write/read pipeline
 - [x] **Measure padding overhead** against the real CDC distribution — done, and
       the spec's estimate was wrong by 2–3× (MANUAL-TESTING.md §5, SPECS rev 6)
-- [ ] **Retune the ladder** in light of the measurement, or record the decision
-      not to. Deferred to M2 as an open question, *not* silently dropped: the
-      premium is 56–97%, the default is `none`, so nothing is stored under a bad
-      ladder in the meantime.
+- [x] **Retune the ladder** in light of the measurement, or record the decision
+      not to. **Keep the ×2 ladder; keep default `none`.** Do not retune until
+      a mode that actually uses `classes` is the common path (SPECS §4.2.1).
+      `LADDER` is unchanged.
 - [x] Per-directory key derivation (impossible to retrofit — see SPECS §15.3)
 - [x] Round-trip test: bytes in, byte-identical bytes out, every profile
 - [x] Dedup test: 54.1% recovered on a corpus of split binaries
@@ -176,10 +177,12 @@ settled and the work that follows from them.
 - [x] **`nas-vault` replaces the M0 plaintext vault.** `vault.bin` is sealed and
       authenticated; the seed derives every role identity; `CS` generations are
       kept on rotation so revocation is not a data-loss event.
-- [ ] **The vault key still sits beside the vault** in `vault.key` (0600), which
-      relocates the secret rather than protecting it. Needs an OS keychain
-      (Keychain / Secret Service) or a passphrase-derived vault key. Until then
-      `e2ee` at rest is only as strong as the local disk.
+- [x] **Vault key off `vault.key` when a keychain is available.** macOS
+      Keychain (`security`) and Linux Secret Service (`secret-tool`); open
+      tries the keychain first, then `vault.key` for migration. New e2ee
+      namespaces do not write `vault.key` after a successful keychain store.
+      Passphrase mode unchanged. Linux CI without Secret Service keeps the
+      file fallback (documented in `VAULT_WARNING`).
 - [x] Wire `--mode passphrase` through the CLI. **UC02 is green end to end**:
       all 9 assertions pass, including the Argon2id floor read from the *stored*
       record rather than from a constant in the binary, the wrong-passphrase
@@ -260,14 +263,12 @@ settled and the work that follows from them.
       two handoffs across a restart. A witness-only node still refuses both.
       `nas peer sync` fetches them, verifies them and walks with them, and
       reports any handoff claiming *this* namespace signed its slot away.
-- [ ] Give the client roster a source other than its own key. `nas peer sync`
-      deliberately does not add a handoff's `from_pk` to its roster — that
-      would let the peer decide who may have written this namespace's history
-      — so a chain crossing an authorised change still stops at
-      `UnknownWriter`. Until a device can be told about another writer
-      (a repo-side roster, `nas ns roster add`), the handoff path is correct
-      and unreachable from the CLI: every device of a namespace derives the
-      same `Role::Slot` key, so there is only ever one writer.
+- [x] Give the client roster a source other than its own key.
+      `$NAS_HOME/<ns>/roster/*.pub`, `nas ns roster add <ns> <file>` / `list`
+      (local files only; never auto-import from the wire). `nas peer sync`
+      loads that set plus the local writer and still does **not** add a
+      handoff's `from_pk`. `nas test roster-handoff`: two distinct slot keys,
+      a signed handoff, the walk succeeds only after `roster add`.
 - [x] `nas-peer` core: blob store, slot ordering + history, CAS enforcement,
       roster checks, retention holds, PoP responder, the rights vocabulary and
       a peer-evaluated ACL, and **all six `--hostile` behaviours as branches in
@@ -407,13 +408,11 @@ settled and the work that follows from them.
       §16.1 describes and relayed by whatever machine has a connection, so
       gating the relay would make the air gap unusable — what bounds them is
       authority membership, which is cryptographic.
-- [ ] **Execution does not delete data, and cannot yet.** In an encrypted
-      namespace the peer cannot resolve `Scope::Object("2024/scan.pdf")` to an
-      address (SPECS §2.2): it holds ciphertext under content addresses and no
-      mapping. So the peer records the authorisation and the client — which
-      holds the mapping — must release the leases and let the sweep run. That
-      client half is unbuilt, and needs the key→object mapping the S3 face
-      brings (§7.1), same as `put`/`rm`.
+- [x] **Client half of delete execution.** After a recorded Execute the client
+      maps `Scope::{Object,Prefix,Namespace}` via the S3/object map
+      (`objectcmd::addrs_for_scope`), releases leases, and calls
+      `forget_retention`. The peer still does not delete ciphertext it cannot
+      name. `nas test retention-forget`.
 - [x] **Object Lock establishes the append-only posture** (SPECS §16), decided
       with the user: `ns create --object-lock … --device <subject>` seeds that
       subject **append and nothing else**. §16's whole ransomware defence is
@@ -466,9 +465,10 @@ settled and the work that follows from them.
 - [x] Ranged GET fetches O(range), not O(file) (`X-Nas-Chunks-Fetched`)
 - [ ] Decide whether macOS WebDAV performance forces the NFSv3 path.
       WebDAV is what ships; the read path is unchanged if the shim moves
-      (SPECS §8). The decision waits on a Finder mount measurement — unit
-      tests cannot make it. POSIX mode is invisible through WebDAV (§15.2),
-      which is a second argument for NFSv3 later, not a reason to block M4.
+      (SPECS §8). Playbook in `MANUAL-TESTING.md` §16 (Finder mount vs
+      `nas get`). Box stays unchecked until that measurement exists. No NFS
+      code. POSIX mode is invisible through WebDAV (§15.2), which is a second
+      argument for NFSv3 later, not a reason to start it now.
 
 ## M5 — git face
 
@@ -489,7 +489,7 @@ settled and the work that follows from them.
 
 - [x] `ci.sh`: fmt (not `--all` — see the comment there), clippy `-D warnings`,
       workspace tests, `formal/check.sh`, release `nas`, and the acceptance
-      suite at `CI_MILESTONE` (default M1).
+      suite at `CI_MILESTONE` (default M6).
 - [ ] **CI on linux.** `docker/build.sh` builds a static arm64 musl `nas` in a
       `rust:alpine` container and bakes the `nas-node` image, but nothing runs
       the tests or the acceptance suite under linux, and amd64 is not built at
@@ -509,6 +509,8 @@ settled and the work that follows from them.
       re-check once `nas peer` grows a rotation subcommand; and §6 deletion prose
       needs the M6 quorum flow filled in when it exists
 - [ ] `MANUAL.md` §4: no `nas vault export` / secret-mode command yet; the manual
-      names the path (`vault.key`) rather than a command — update when one exists
-- [ ] Propose CDC + at-rest encryption upstream to `simple-backups` rather than
-      maintaining two stores
+      names the OS keychain (and the `vault.key` fallback) rather than a
+      `nas vault export` command — still no export subcommand
+- [x] Propose CDC + at-rest encryption upstream to `simple-backups` rather than
+      maintaining two stores — `docs/upstream-cdc.md`. Open as a discussion on
+      that repo if writable; NAS-tools does not merge a second store.

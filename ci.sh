@@ -2,7 +2,7 @@
 # Full gate. Matches the sibling repos' ci.sh convention.
 set -uo pipefail
 cd "$(dirname "$0")"
-CI_MILESTONE="${CI_MILESTONE:-M1}"
+CI_MILESTONE="${CI_MILESTONE:-M6}"
 CI_MILESTONE_N="${CI_MILESTONE#M}"
 fail=0
 step() { printf '\n\033[1m── %s ──\033[0m\n' "$1"; }

@@ -19,6 +19,7 @@ use crate::outbox::{self, Outbox};
 use crate::repo::Repo;
 use nas_core::Addr;
 use nas_crypto::Role;
+use nas_delete::Scope;
 use nas_gateway::s3::{Buckets, FaceError, ObjectInfo, RangeBody};
 use nas_peer::{Decision, Right};
 use nas_store::{
@@ -133,6 +134,36 @@ impl std::fmt::Display for LoadError {
             Self::Other(s) => write!(f, "{s}"),
         }
     }
+}
+
+/// Addresses a delete `Scope` names, via the S3/object map the peer cannot
+/// read in `e2ee`. Tombstones contribute nothing.
+pub fn addrs_for_scope(repo: &Repo, scope: &Scope) -> Result<Vec<Addr>, String> {
+    let blobs = repo.blobs().map_err(|e| e.to_string())?;
+    let store = BucketStore::new(&blobs, repo.sealer());
+    let bucket = match load_published_head(&store, repo) {
+        Ok(b) => b,
+        Err(LoadError::NotABucket) => return Ok(Vec::new()),
+        Err(e) => return Err(e.to_string()),
+    };
+    let mut out = Vec::new();
+    for (key, obj) in &bucket.entries {
+        let name = String::from_utf8_lossy(key);
+        let keep = match scope {
+            Scope::Namespace => true,
+            Scope::Prefix(p) => name.starts_with(p.as_str()),
+            Scope::Object(p) => name == p.as_str(),
+        };
+        if !keep {
+            continue;
+        }
+        if let Some(m) = &obj.object {
+            for c in &m.chunks {
+                out.push(c.addr);
+            }
+        }
+    }
+    Ok(out)
 }
 
 pub fn load_published_head(

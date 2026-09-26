@@ -1,9 +1,10 @@
 # NAS-tools Status
 
 **Current state:** **M0–M6 are done** (106 pass, 0 fail at `NAS_MILESTONE=M6`).
-`ci.sh` still gates at M1.
-The onion carrier is a named `.onion` plus pin (loopback map); live
-arti circuits are still `simple-network --features tor`. All four M0 steps built, the 5 M0-tagged acceptance
+`ci.sh` gates at M6.
+The onion carrier is a named `.onion` plus pin (loopback map). Live
+arti circuits are a `tor-bridge` sidecar in `simple-network --features tor`
+(not in NAS-tools). All four M0 steps built, the 5 M0-tagged acceptance
 assertions pass against the real binary, and the padding measurement that M0
 gated on is complete — it **contradicted the spec by 2-3×**. The review found
 **four reproduced defects**, all fixed; see MANUAL-TESTING.md §7. The peer, the
@@ -190,13 +191,11 @@ See `MANUAL-TESTING.md` §5 for the commands and raw output.
 
 ## Known weaknesses, stated rather than discovered later
 
-- **The vault key sits beside the vault.** `vault.bin` is now sealed and
-  authenticated (that was the M0 weakness, and it is closed), but `vault.key` is
-  written next to it at 0600. That *relocates* the secret rather than protecting
-  it. An OS keychain or a passphrase-derived key is what makes it real; both are
-  in TODO. `--mode passphrase` still exits 3 rather than creating a namespace
-  whose config claims a protection it does not have — **passphrase mode is now
-  wired through the CLI** and stores *nothing* locally that opens a namespace.
+- **The vault key is in the OS keychain when a helper is available**
+  (`security` / `secret-tool`). New e2ee namespaces then have no `vault.key`.
+  Linux CI without Secret Service still writes `vault.key` (0600) — that
+  fallback relocates the secret rather than protecting it. Passphrase mode
+  stores nothing that opens a namespace.
 - **Names are not separately encrypted.** SPECS §4.4 specifies Cryptomator-style
   per-segment encryption; that design exists because Cryptomator maps segments
   onto *server filenames*. Here the peer sees `blobs/<ab>/<hex>` and names live
@@ -210,22 +209,24 @@ See `MANUAL-TESTING.md` §5 for the commands and raw output.
 
 ## Where the numbers stand
 
-`ci.sh` is green end to end today, at `CI_MILESTONE=M1`:
+`.github/workflows/ci.yml` runs `ci.sh` on macos-latest and ubuntu-latest
+after checking out `simple-network` and `rust-secure-memory` as siblings.
+linux arm64 is a musl *compile* job (`docker/build.sh ARCH=arm64`), not a
+substitute for `ci.sh`. uc11 stays manual.
+
+`ci.sh` is green end to end today, at `CI_MILESTONE=M6`:
 
 | | count |
 |---|---|
-| Rust tests (`cargo test --workspace`, unit + integration) | 604 |
+| Rust tests (`cargo test --workspace`, unit + integration) | 618 |
 | Lean theorems (clean axiom gate) | 14 |
 | `cargo-fuzz` targets | 14 |
-| Acceptance assertions passing (≤M1) | 40 of 100 |
-| Acceptance assertions pending (M2+) | 60 |
+| Acceptance assertions passing (≤M6) | 106 of 106 |
+| Acceptance assertions pending | 0 |
 
-**40 of 100 is a progress marker, not a verification result.** The 60 pending
-assertions are not failures and not successes — they are unwritten code that
-`ci.sh` refuses to score. Every one of them is a claim SPECS makes that nothing
-yet demonstrates, and the four use cases with a passing score (UC01–UC03,
-UC09) are the ones whose milestones have arrived. UC04 and UC07 — deletion
-resistance and roaming — are at zero.
+**106 of 106 is the M6 gate.** Pending is not success; at M6 there is nothing
+left pending in `run.sh`. Manual drills (uc10–uc13, uc11 containers) stay
+outside the harness.
 
 The UC09 drills (`nas test attack <kind>`) run the server's own dispatch
 against a peer opened with one hostility flag, after first proving the same
@@ -280,7 +281,8 @@ when idle (SPECS §7.2). Pubsub is still a post-M6 latency optimisation.
 `nas peer feature-permitted` records that transit-only may run peer-side
 thumbnails (SPECS §19.1); the feature itself is not built.
 
-Live arti onion circuits remain.
+Live arti onion circuits are the `tor-bridge` sidecar in simple-network
+(`--features tor`). NAS-tools still dials TCP after `resolve_onion`.
 
 **The single-writer handoff (§5.1) is built.** `SlotHandoff` is signed by the
 *outgoing* writer and binds slot, sequence and both writers, so it authorises
@@ -305,11 +307,11 @@ authorisation, not an observation, and §5.3 says that node holds no caps.
 Sync deliberately does **not** add a handoff's `from_pk` to its roster, though
 the record carries the key in full and it would be easy. That would let the
 peer decide who may have written this namespace's history, which is the one
-thing a roster exists to say. The consequence is stated rather than hidden: a
-chain crossing an authorised change still stops at `UnknownWriter` until a
-device can be told about another writer by something other than the peer. It
-changes no outcome today either way — every device of a namespace derives the
-same `Role::Slot` key, so the CLI has only ever had one writer per slot.
+thing a roster exists to say. The operator-curated set is
+`$NAS_HOME/<ns>/roster/` via `nas ns roster add` / `list` (local files only).
+`nas peer sync` loads that set plus the local writer. A chain crossing an
+authorised change still stops at `UnknownWriter` until the other writer is
+rostered. `nas test roster-handoff`.
 
 **Skip-chain checkpoints (§5.5) are built.** A `Checkpoint` is the writer's
 signed assertion that the record at some sequence is a given hash and that the

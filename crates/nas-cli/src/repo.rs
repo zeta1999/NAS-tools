@@ -17,11 +17,11 @@
 //!
 //! Where the vault key comes from is the mode's business (SPECS §2.2). `e2ee`
 //! takes a high-entropy key the user holds; `passphrase` derives one with
-//! Argon2id. M1 stores the `e2ee` key in `vault.key` beside the vault, which is
-//! **not yet meaningful protection** — it moves the secret rather than
-//! protecting it — and that is stated in [`VAULT_WARNING`] rather than left to
-//! be discovered. An OS keychain or a passphrase-derived key is what makes it
-//! real, and both are recorded in TODO.md.
+//! Argon2id. Vault-backed modes store the key in the OS keychain when a helper
+//! is available (`security` / `secret-tool`); otherwise they still write
+//! `vault.key` beside the vault (0600). That file fallback relocates the secret
+//! rather than protecting it, and is stated in [`VAULT_WARNING`]. Passphrase
+//! mode already has no `vault.key` — leave it alone.
 //!
 //! What *has* changed since M0 is that the convergence secret and the namespace
 //! root are no longer on disk in the clear, the identity is derived from a seed
@@ -40,9 +40,10 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-pub const VAULT_WARNING: &str = "M1: the vault is sealed, but its key sits beside it in vault.key \
-     (0600). That relocates the secret rather than protecting it — an OS keychain \
-     or a passphrase-derived key is what makes it real.";
+pub const VAULT_WARNING: &str = "the vault is sealed; its key is in the OS keychain when \
+     available, else vault.key (0600) as a file fallback. The file relocates \
+     the secret rather than protecting it — Linux CI without Secret Service \
+     uses that fallback.";
 
 /// Where a namespace's secrets come from.
 ///
@@ -399,7 +400,12 @@ impl Repo {
                     .seal_with(vault_key)
                     .map_err(|e| io::Error::other(e.to_string()))?;
                 write_private(&root.join("vault.bin"), &sealed)?;
-                write_private(&root.join("vault.key"), &vault_key)?;
+                // Keychain first. A successful write is the only reason we
+                // skip vault.key on a *new* namespace. Migration of an
+                // existing vault.key is open_with's job.
+                if crate::keychain::store(ns, &vault_key).is_err() {
+                    write_private(&root.join("vault.key"), &vault_key)?;
+                }
                 Secrets::Vault(Box::new(vault))
             }
         };
@@ -500,11 +506,7 @@ impl Repo {
             }
             Mode::E2ee | Mode::TransitOnly => {
                 let sealed = fs::read(root.join("vault.bin"))?;
-                let key_bytes = fs::read(root.join("vault.key"))?;
-                let vault_key: [u8; KEY_LEN] = key_bytes
-                    .as_slice()
-                    .try_into()
-                    .map_err(|_| io::Error::other("vault.key is not 32 bytes"))?;
+                let vault_key = Self::load_vault_key(ns, &root)?;
                 let vault = Vault::open_with(&sealed, vault_key)
                     .map_err(|e| io::Error::other(e.to_string()))?;
                 Secrets::Vault(Box::new(vault))
@@ -520,6 +522,22 @@ impl Repo {
             cs_holder,
             tenant_salt,
         })
+    }
+
+    /// Keychain first, then `vault.key` for migration. A successful keychain
+    /// write after a file read does not delete the file — that is the
+    /// operator's copy until they choose to remove it.
+    fn load_vault_key(ns: &str, root: &Path) -> io::Result<[u8; KEY_LEN]> {
+        if let Ok(Some(k)) = crate::keychain::load(ns) {
+            return Ok(k);
+        }
+        let key_bytes = fs::read(root.join("vault.key"))?;
+        let vault_key: [u8; KEY_LEN] = key_bytes
+            .as_slice()
+            .try_into()
+            .map_err(|_| io::Error::other("vault.key is not 32 bytes"))?;
+        let _ = crate::keychain::store(ns, &vault_key);
+        Ok(vault_key)
     }
 
     /// The freshness anchor a passphrase recovery yields (SPECS §2.2.2).
@@ -711,6 +729,33 @@ fn secrets_convergence(s: &Secrets) -> ConvergenceSecret {
     }
 }
 
+/// Serialize tests that mutate `$NAS_HOME`. The process has one env.
+#[cfg(test)]
+pub(crate) fn with_temp_home<R>(f: impl FnOnce(&Path) -> R) -> R {
+    use std::sync::Mutex;
+    static LOCK: Mutex<()> = Mutex::new(());
+    let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let home = std::env::temp_dir().join(format!(
+        "nas-home-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let _ = fs::remove_dir_all(&home);
+    fs::create_dir_all(&home).unwrap();
+    let prev = std::env::var_os("NAS_HOME");
+    std::env::set_var("NAS_HOME", &home);
+    let out = f(&home);
+    match prev {
+        Some(p) => std::env::set_var("NAS_HOME", p),
+        None => std::env::remove_var("NAS_HOME"),
+    }
+    let _ = fs::remove_dir_all(&home);
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -739,5 +784,38 @@ mod tests {
             *blake3::hash(b"").as_bytes(),
             "degraded to a constant"
         );
+    }
+
+    #[test]
+    fn new_e2ee_skips_vault_key_when_keychain_holds_it() {
+        with_temp_home(|_| {
+            let ns = "kc-e2ee";
+            crate::keychain::delete(ns);
+            let repo = Repo::create(
+                ns,
+                Mode::E2ee,
+                KeyScheme::Convergent,
+                PaddingProfile::None,
+                None,
+                None,
+                None,
+            )
+            .expect("create e2ee");
+            let key_file = repo.root.join("vault.key");
+            if crate::keychain::available() && crate::keychain::load(ns).ok().flatten().is_some() {
+                assert!(
+                    !key_file.exists(),
+                    "keychain held the key; vault.key must not be created on a new namespace"
+                );
+                Repo::open_with(ns, None).expect("open from keychain");
+            } else {
+                assert!(
+                    key_file.exists(),
+                    "no Secret Service / keychain: file fallback is the documented CI path"
+                );
+                Repo::open_with(ns, None).expect("open from vault.key");
+            }
+            crate::keychain::delete(ns);
+        });
     }
 }

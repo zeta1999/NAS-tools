@@ -40,9 +40,13 @@ house serving your own family (SPECS §19.1); it is the wrong mode for anything
 you would mind the NAS operator reading.
 
 Key material lives in `~/.local/share/nas/<namespace>/` (`$NAS_HOME` overrides
-the base). In `e2ee` mode the vault key currently sits beside the sealed vault
-in `vault.key` (mode 0600) — that relocates the secret rather than protecting
-it, so `e2ee` at rest is exactly as strong as your local disk (TODO.md, M0).
+the base). In `e2ee` the vault key is stored in the OS keychain (macOS
+Keychain via `security`; Linux Secret Service via `secret-tool`) when that
+helper is available. New namespaces then have no sibling `vault.key`. If the
+helper is missing — Linux CI without Secret Service is the documented case —
+the key is still written beside the vault as `vault.key` (mode 0600). That
+file fallback relocates the secret rather than protecting it. Passphrase mode
+already stores nothing that opens the namespace.
 
 ## 2. Commands
 
@@ -54,6 +58,8 @@ nas ns create <name> [--mode e2ee|passphrase|transit-only]
 nas ns list
 nas ns open <name> [--passphrase <pw>] open a namespace another device created (§2, second device)
 nas ns export-pub <ns> <out-dir>       keys a peer operator needs to admit <ns>
+nas ns roster add <ns> <file>          local writer pub; never imported from the wire
+nas ns roster list <ns>
 nas acl grant|revoke|check <ns> --subject <s> --right <r>
 nas acl list <ns>
 nas peer init <dir>

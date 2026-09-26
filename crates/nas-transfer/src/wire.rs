@@ -164,6 +164,12 @@ pub enum Request {
     /// Every approval the peer has recorded for a request, so a device can
     /// collect a quorum it did not gather itself.
     DeleteApprovals([u8; 32]),
+    /// Drop these addresses from the retention floor. `proof` is an encoded
+    /// `DeleteExecution` that the peer must already have recorded as decided.
+    ForgetRetention {
+        addrs: Vec<Addr>,
+        proof: Vec<u8>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -209,6 +215,7 @@ const REQ_PUBLISH_DELETE_APPROVAL: u8 = 18;
 const REQ_EXECUTE_DELETE: u8 = 19;
 const REQ_DELETE_REQUEST_RECORD: u8 = 20;
 const REQ_DELETE_APPROVALS: u8 = 21;
+const REQ_FORGET_RETENTION: u8 = 22;
 
 const RSP_BLOB: u8 = 0;
 const RSP_BOOL: u8 = 1;
@@ -257,6 +264,9 @@ impl Request {
             Self::ExecuteDelete(e) => encode_fields(&[&[REQ_EXECUTE_DELETE], e])?,
             Self::DeleteRequestRecord(h) => encode_fields(&[&[REQ_DELETE_REQUEST_RECORD], h])?,
             Self::DeleteApprovals(h) => encode_fields(&[&[REQ_DELETE_APPROVALS], h])?,
+            Self::ForgetRetention { addrs, proof } => {
+                encode_forget(REQ_FORGET_RETENTION, proof, addrs)?
+            }
         };
         check_size(out)
     }
@@ -369,6 +379,16 @@ impl Request {
                 want(2)?;
                 Self::DeleteApprovals(fixed::<32>("request", f[1])?)
             }
+            REQ_FORGET_RETENTION => Self::ForgetRetention {
+                proof: f
+                    .get(1)
+                    .ok_or(WireError::FieldCount {
+                        want: 2,
+                        got: f.len(),
+                    })?
+                    .to_vec(),
+                addrs: decode_forget_addrs(&f)?,
+            },
             other => return Err(WireError::UnknownTag { tag: other }),
         })
     }
@@ -483,6 +503,31 @@ impl Response {
 ///
 /// Bounded by [`MAX_RECORDS`] like every other list on this protocol: a peer —
 /// or a client — sending ten million addresses is not helping.
+fn encode_forget(tag: u8, proof: &[u8], addrs: &[Addr]) -> Result<Vec<u8>, WireError> {
+    if addrs.len() > MAX_RECORDS {
+        return Err(WireError::TooManyRecords { got: addrs.len() });
+    }
+    let mut fields: Vec<&[u8]> = vec![std::slice::from_ref(&tag), proof];
+    fields.extend(addrs.iter().map(|a| a.as_bytes() as &[u8]));
+    encode_fields(&fields).map_err(WireError::from)
+}
+
+fn decode_forget_addrs(f: &[&[u8]]) -> Result<Vec<Addr>, WireError> {
+    if f.len() < 2 {
+        return Err(WireError::FieldCount {
+            want: 2,
+            got: f.len(),
+        });
+    }
+    if f.len() - 2 > MAX_RECORDS {
+        return Err(WireError::TooManyRecords { got: f.len() - 2 });
+    }
+    f[2..]
+        .iter()
+        .map(|b| Ok(Addr::from_bytes(fixed::<ADDR_LEN>("addr", b)?)))
+        .collect()
+}
+
 fn encode_addrs(tag: u8, addrs: &[Addr]) -> Result<Vec<u8>, WireError> {
     if addrs.len() > MAX_RECORDS {
         return Err(WireError::TooManyRecords { got: addrs.len() });
@@ -577,6 +622,10 @@ mod tests {
             Request::ExecuteDelete(vec![7u8; 200]),
             Request::DeleteRequestRecord([8u8; 32]),
             Request::DeleteApprovals([9u8; 32]),
+            Request::ForgetRetention {
+                addrs: vec![addr(10)],
+                proof: vec![11u8; 80],
+            },
         ]
     }
 
@@ -622,6 +671,7 @@ mod tests {
             Request::ExecuteDelete(_) => "ExecuteDelete",
             Request::DeleteRequestRecord(_) => "DeleteRequestRecord",
             Request::DeleteApprovals(_) => "DeleteApprovals",
+            Request::ForgetRetention { .. } => "ForgetRetention",
         }
     }
 
@@ -653,6 +703,7 @@ mod tests {
             "ExecuteDelete",
             "DeleteRequestRecord",
             "DeleteApprovals",
+            "ForgetRetention",
         ];
         let have: std::collections::BTreeSet<&str> = requests().iter().map(name).collect();
         for n in ALL {

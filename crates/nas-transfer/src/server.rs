@@ -208,6 +208,13 @@ pub fn handle_at(peer: &mut Peer, subject: &str, req: Request, now: &dyn Clock) 
             Response::Record(peer.delete_request(&h).and_then(|r| r.encode().ok()))
         }
         Request::DeleteApprovals(h) => bounded(peer.delete_approvals_for(&h), |a| a.encode()),
+        Request::ForgetRetention { addrs, proof } => match DeleteExecution::decode(&proof) {
+            Ok(e) => match peer.forget_retention(&addrs, &e) {
+                Ok(()) => Response::Ok,
+                Err(e) => Response::Error(e.to_string()),
+            },
+            Err(e) => Response::Error(format!("{e}")),
+        },
     }
 }
 

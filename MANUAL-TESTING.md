@@ -690,8 +690,8 @@ assertion and the transit-only ACL were ungated: a regression in any of them
 could not turn CI red. §6b of this file congratulates itself for making a
 failing assertion turn CI red — true, but only for the five that ran.
 
-`ci.sh` now runs at `CI_MILESTONE` (M1), and raising it is a one-line change as
-milestones land.
+`ci.sh` now runs at `CI_MILESTONE` (M6). Raising it was a one-line change as
+milestones landed; M0–M6 acceptance is 106/0/0.
 
 ### 9c. An 8-line stub scored 25 out of 25
 
@@ -1070,3 +1070,45 @@ No defects found by this drill. Two were found while building it, both by
 running it rather than by the unit tests: the ladder was fetched but a device
 that verified one never pinned it (so it would have accepted the same peer
 dropping to genesis the next day), and the report said "1 rungs".
+
+---
+
+## 16. Finder WebDAV measurement (no NFS code)
+
+SPECS §8 keeps the read path; only the shim moves, and **only when macOS
+WebDAV is the limit**. Unit tests cannot decide this. Do not implement NFSv3
+until this playbook has been run and the numbers say Finder is unacceptable.
+
+POSIX mode/uid/gid remaining invisible through WebDAV (§15.2) is a second
+argument, not a reason to start NFS now.
+
+### Playbook
+
+1. Create a namespace and put a **known tree** (the acceptance fixture, or a
+   checkout you already time with `nas get`):
+   ```sh
+   nas ns create share --mode transit-only
+   # put the tree via nas put / the S3 face / test roundtrip
+   nas gateway serve --listen 127.0.0.1:47480
+   ```
+2. In Finder: Go → Connect to Server → `http://127.0.0.1:47480/` (or the
+   WebDAV path the gateway prints). Authenticate with the gateway creds.
+3. Copy the same tree **out** of the mount (Finder drag) and record:
+   - wall time (`time` around the copy, or a stopwatch if Finder does not
+     return a status),
+   - Finder stalls (spinning wait, beachball, "preparing to copy"),
+   - `._` AppleDouble litter left on the mount or in the destination,
+   - whether a second copy of the same tree is faster (chunk cache).
+4. Baseline the **same tree** with the CLI:
+   ```sh
+   time nas get share/<key> /tmp/nas-get-out
+   # or a recursive get / checkout of the fixture
+   ```
+5. Write the four numbers (Finder wall, stalls, `._` count, `nas get` wall)
+   here or in the operator notes. Compare. If Finder is within a small
+   factor of `nas get` and does not stall, WebDAV stays. If it is the limit,
+   the next piece of work is an NFSv3 shim (XDR/RPC on the same gateway,
+   reuse ranged GET) — a new plan, not this leftover.
+
+This section is a playbook, not an observed run. The M4 NFS box in TODO.md
+stays unchecked until someone fills in the numbers.

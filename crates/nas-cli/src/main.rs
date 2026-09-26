@@ -12,6 +12,7 @@ mod exit;
 mod gateway;
 mod gitcmd;
 mod gitremote;
+mod keychain;
 mod mirror;
 mod objectcmd;
 mod outbox;
@@ -38,6 +39,8 @@ nas — NAS-tools command line
   nas ns list
   nas ns open <ns> [--passphrase <pw>]
   nas ns export-pub <ns> <out-dir>       keys a peer operator needs to admit <ns>
+  nas ns roster add <ns> <file>          operator-curated writer pub (local only)
+  nas ns roster list <ns>
   nas acl grant|revoke|check <ns> --subject <s> --right <r>
   nas acl list <ns>
   nas peer init <dir>
@@ -603,8 +606,16 @@ fn ns(args: &[String]) -> i32 {
                 exit::ERROR
             }
         },
+        Some("roster") => match (pos.get(1).copied(), pos.get(2), pos.get(3)) {
+            (Some("add"), Some(ns), Some(file)) => peercmd::roster_add(ns, file),
+            (Some("list"), Some(ns), None) => peercmd::roster_list(ns),
+            _ => {
+                eprintln!("usage: nas ns roster add <ns> <file>\n       nas ns roster list <ns>");
+                exit::ERROR
+            }
+        },
         _ => {
-            eprintln!("usage: nas ns create|list|open|export-pub");
+            eprintln!("usage: nas ns create|list|open|export-pub|roster");
             exit::ERROR
         }
     }
@@ -796,6 +807,8 @@ fn test(args: &[String]) -> i32 {
                 exit::ERROR
             }
         },
+        Some("retention-forget") => one_ns(&pos, worm::retention_forget),
+        Some("roster-handoff") => one_ns(&pos, peercmd::roster_handoff),
         Some("lease-cycle") => one_ns(&pos, worm::lease_cycle),
         Some("delete-quorum") => match pos.get(1) {
             Some(ns) => {

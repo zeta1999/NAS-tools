@@ -42,8 +42,9 @@ use nas_core::{Addr, Mode};
 use nas_crypto::{Identity, Role};
 use nas_peer::{Acl, Hostility, Peer, Right, MAX_CHECKPOINTS_PER_SLOT};
 use nas_slots::{
-    is_checkpoint_seq, plan_walk, verify_chain_with_handoffs, verify_skip_chain, Checkpoint,
-    Regime, Roster, SlotHandoff, SlotId, SlotRecord, Walk, WalkPlan, Witness, RETAIN_N,
+    is_checkpoint_seq, plan_walk, verify_chain_with_handoffs, verify_skip_chain, ChainError,
+    Checkpoint, Regime, Roster, RosterError, SlotHandoff, SlotId, SlotRecord, Walk, WalkPlan,
+    Witness, WriterId, RETAIN_N, ROOT_NONCE_LEN,
 };
 use nas_store::{Addressing, BlobStore, RootManifest};
 use nas_transfer::{transport_identity, Channel, Request, Response};
@@ -716,6 +717,98 @@ pub fn export_pub(ns: &str, out: &str, passphrase: Option<Vec<u8>>) -> i32 {
     exit::OK
 }
 
+/// Operator-curated writers for this namespace. Never populated from the wire.
+fn client_roster_dir(ns: &str) -> PathBuf {
+    repo::path_of(ns).join("roster")
+}
+
+/// `nas ns roster add <ns> <file>` — local file only; never auto-import.
+pub fn roster_add(ns: &str, file: &str) -> i32 {
+    if !Repo::exists(ns) {
+        return err(format!("no namespace {ns}"));
+    }
+    let bytes = match fs::read(file) {
+        Ok(b) => b,
+        Err(e) => return err(format!("{file}: {e}")),
+    };
+    let mut probe = Roster::new();
+    let id = match probe.add(&bytes) {
+        Ok(id) => id,
+        Err(e) => return err(format!("roster add: {e}")),
+    };
+    let dir = client_roster_dir(ns);
+    if let Err(e) = fs::create_dir_all(&dir) {
+        return err(format!("{}: {e}", dir.display()));
+    }
+    let id_hex = id.to_hex();
+    let dest = dir.join(format!("{id_hex}.pub"));
+    if let Err(e) = repo::write_private_pub(&dest, &bytes) {
+        return err(format!("{}: {e}", dest.display()));
+    }
+    println!("roster add {ns}\t{id_hex}\t{}", fingerprint(&bytes));
+    exit::OK
+}
+
+/// `nas ns roster list <ns>`
+pub fn roster_list(ns: &str) -> i32 {
+    if !Repo::exists(ns) {
+        return err(format!("no namespace {ns}"));
+    }
+    let dir = client_roster_dir(ns);
+    let rd = match fs::read_dir(&dir) {
+        Ok(rd) => rd,
+        Err(_) => return exit::OK,
+    };
+    let mut names: Vec<PathBuf> = rd.flatten().map(|e| e.path()).collect();
+    names.sort();
+    for p in names {
+        if p.extension().and_then(|e| e.to_str()) != Some("pub") {
+            continue;
+        }
+        let bytes = match fs::read(&p) {
+            Ok(b) => b,
+            Err(e) => {
+                println!("{}\tUNREADABLE: {e}", p.display());
+                continue;
+            }
+        };
+        let id = WriterId::of_key(&bytes);
+        println!("{}\t{}", id.to_hex(), fingerprint(&bytes));
+    }
+    exit::OK
+}
+
+/// Local writer plus every `roster/*.pub`. Duplicate of the local key is
+/// ignored. A bad file is an error — silently skipping one would hide the
+/// writer the operator thought they had added.
+pub fn load_client_roster(repo: &Repo) -> Result<Roster, String> {
+    let writer = repo
+        .identity(Role::Slot)
+        .map_err(|e| format!("slot identity: {e}"))?;
+    let mut roster = Roster::new();
+    roster
+        .add(writer.verifying_key())
+        .map_err(|e| format!("roster: {e}"))?;
+    let dir = repo.root.join("roster");
+    let rd = match fs::read_dir(&dir) {
+        Ok(rd) => rd,
+        Err(_) => return Ok(roster),
+    };
+    for e in rd.flatten() {
+        let p = e.path();
+        if p.extension().and_then(|x| x.to_str()) != Some("pub") {
+            continue;
+        }
+        let bytes = fs::read(&p).map_err(|e| format!("{}: {e}", p.display()))?;
+        match roster.add(&bytes) {
+            Ok(_) => {}
+            Err(RosterError::Duplicate { .. }) => {}
+            Err(e) => return Err(format!("{}: {e}", p.display())),
+        }
+    }
+    Ok(roster)
+}
+
 pub struct SyncOpts<'a> {
     pub peer: &'a str,
     pub peer_pub: &'a str,
@@ -1029,10 +1122,14 @@ pub fn sync(ns: &str, o: SyncOpts<'_>) -> i32 {
     // record at the pinned sequence is forking — and since the pin is one
     // point, the chain from it to the served head is walked below so that
     // nothing between them was swapped either.
-    let mut roster = Roster::new();
-    if let Err(e) = roster.add(writer.verifying_key()) {
-        return err(format!("roster: {e}"));
-    }
+    //
+    // The roster is this namespace's own writer plus operator-curated pubs
+    // under `$NAS_HOME/<ns>/roster/`. Never extended from the wire — a
+    // handoff's `from_pk` would let the peer choose writers.
+    let roster = match load_client_roster(&repo) {
+        Ok(r) => r,
+        Err(e) => return err(format!("roster: {e}")),
+    };
     match (&served, pinned) {
         (None, Some(p)) => {
             return refused(format!(
@@ -1145,10 +1242,9 @@ pub fn sync(ns: &str, o: SyncOpts<'_>) -> i32 {
     // namespace's history, which is the one thing the roster exists to say.
     // A chain by a writer this device does not know still refuses.
     //
-    // Today every device of a namespace derives the same `Role::Slot` key, so
-    // there is only ever one writer and this changes no outcome. It is here
-    // so that a chain which does cross an authorised change is refused for a
-    // reason, rather than because nobody asked.
+    // A second writer is reachable only after `nas ns roster add`. Until
+    // then a chain that crosses an authorised change still stops at
+    // `UnknownWriter` — correct, and now exercisable from the CLI.
     let handoffs = match call(&mut ch, &Request::Handoffs(slot)) {
         Ok(Response::Records(rs)) => rs,
         Ok(Response::Error(m)) => return refused(format!("handoffs: {m}")),
@@ -1776,6 +1872,107 @@ fn call(ch: &mut Channel, r: &Request) -> Result<Response, String> {
     ch.call(r).map_err(|e| format!("peer: {e}"))
 }
 
+/// `nas test roster-handoff <ns>` — two distinct slot keys, a signed handoff,
+/// verify succeeds only after `roster add`. The second key is not derived from
+/// this namespace; that is the whole point.
+pub fn roster_handoff(ns: &str) -> i32 {
+    let repo = match Repo::open_with(ns, repo::passphrase_from(None)) {
+        Ok(r) => r,
+        Err(e) => return err(format!("namespace {ns}: {e}")),
+    };
+    let writer = match repo.identity(Role::Slot) {
+        Ok(i) => i,
+        Err(e) => return err(format!("slot identity: {e}")),
+    };
+    let other = match Identity::derive(&[0xB2; 32], Role::Slot) {
+        Ok(i) => i,
+        Err(e) => return err(format!("other writer: {e}")),
+    };
+    if writer.verifying_key() == other.verifying_key() {
+        return err("the drill failed to mint a second writer");
+    }
+    let slot = SlotId::new(writer.verifying_key(), ns.as_bytes());
+    let r0 = match SlotRecord::sign(
+        &writer,
+        slot,
+        0,
+        Addr::of_ciphertext(&[1]),
+        [0u8; ROOT_NONCE_LEN],
+        [0u8; 32],
+        Regime::SingleWriter,
+    ) {
+        Ok(r) => r,
+        Err(e) => return err(format!("sign seq 0: {e}")),
+    };
+    let handoff = match SlotHandoff::sign(&writer, slot, 1, WriterId::of_key(other.verifying_key()))
+    {
+        Ok(h) => h,
+        Err(e) => return err(format!("handoff: {e}")),
+    };
+    let r1 = match SlotRecord::sign(
+        &other,
+        slot,
+        1,
+        Addr::of_ciphertext(&[2]),
+        [0u8; ROOT_NONCE_LEN],
+        r0.record_hash(),
+        Regime::SingleWriter,
+    ) {
+        Ok(r) => r,
+        Err(e) => return err(format!("sign seq 1: {e}")),
+    };
+
+    let only_local = match load_client_roster(&repo) {
+        Ok(r) => r,
+        Err(e) => return err(e),
+    };
+    match verify_chain_with_handoffs(
+        &[r0.clone(), r1.clone()],
+        slot,
+        &only_local,
+        None,
+        std::slice::from_ref(&handoff),
+    ) {
+        Err(ChainError::UnknownWriter { seq: 1, .. }) => {}
+        other => {
+            return err(format!(
+                "without roster add, expected UnknownWriter at seq 1, got {other:?}"
+            ))
+        }
+    }
+
+    let pub_path = repo.root.join("state/other-writer.pub");
+    if let Err(e) = fs::create_dir_all(pub_path.parent().unwrap()) {
+        return err(e);
+    }
+    if let Err(e) = fs::write(&pub_path, other.verifying_key()) {
+        return err(e);
+    }
+    if roster_add(ns, &pub_path.to_string_lossy()) != exit::OK {
+        return err("roster add of the second writer failed");
+    }
+
+    let with = match load_client_roster(&repo) {
+        Ok(r) => r,
+        Err(e) => return err(e),
+    };
+    if with.len() < 2 {
+        return err(format!(
+            "roster add did not load the second writer (len {})",
+            with.len()
+        ));
+    }
+    match verify_chain_with_handoffs(&[r0, r1], slot, &with, None, &[handoff]) {
+        Ok(_) => {
+            println!(
+                "roster-handoff: two writers, signed handoff; sync walk refused until roster add"
+            );
+            exit::OK
+        }
+        Err(e) => err(format!("after roster add the walk still failed: {e}")),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1792,5 +1989,29 @@ mod tests {
         assert_eq!(onion_name(&vk), onion_name(&vk));
         assert!(onion_name(&vk).ends_with(".onion"));
         assert_ne!(onion_name(&vk), onion_name(&[8u8; 32]));
+    }
+
+    #[test]
+    fn client_roster_ignores_duplicate_of_local_writer() {
+        crate::repo::with_temp_home(|_| {
+            let ns = "roster-dup";
+            let repo = Repo::create(
+                ns,
+                Mode::E2ee,
+                nas_core::KeyScheme::Convergent,
+                nas_core::PaddingProfile::None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+            let vk = repo.identity(Role::Slot).unwrap().verifying_key().to_vec();
+            let dir = client_roster_dir(ns);
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join("self.pub"), &vk).unwrap();
+            let loaded = load_client_roster(&repo).unwrap();
+            assert_eq!(loaded.len(), 1, "own writer counted once");
+            crate::keychain::delete(ns);
+        });
     }
 }

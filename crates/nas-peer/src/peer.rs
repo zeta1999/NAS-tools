@@ -1479,6 +1479,32 @@ impl Peer {
         self.retention.len()
     }
 
+    /// Shrink the retention floor. `addrs` are dropped; the resulting set is
+    /// `new ⊆ old` by construction.
+    ///
+    /// `proof` must verify and must already be a recorded execution whose
+    /// `decide` passed (`execute_delete` writes those and nothing else).
+    /// Without that, this is the same shrink `publish_retention` refuses.
+    ///
+    /// The peer still cannot name a file in `e2ee`: it only understands
+    /// addresses. The client maps `Scope` and hands the addresses over.
+    pub fn forget_retention(
+        &mut self,
+        addrs: &[Addr],
+        proof: &DeleteExecution,
+    ) -> Result<(), PeerError> {
+        proof.verify().map_err(PeerError::Delete)?;
+        if !self.delete_executions.contains_key(&proof.request_hash) {
+            return Err(PeerError::UnknownRequest {
+                request: proof.request_hash,
+            });
+        }
+        for a in addrs {
+            self.retention.remove(a.as_bytes());
+        }
+        self.persist_retention()
+    }
+
     /// Delete a blob, honouring retention.
     ///
     /// `ignore_retention` is the hostile branch: it deletes anyway. Nothing in
@@ -2446,6 +2472,34 @@ mod worm_tests {
             "a refused publish must not apply"
         );
         assert!(a.iter().all(|x| p.retains(x)));
+    }
+
+    #[test]
+    fn forget_without_a_recorded_execution_is_refused() {
+        let (_s, mut p) = peer("forget-nope", Hostility::HONEST);
+        let a = seed(&p, 2);
+        p.publish_retention(&a).unwrap();
+        let req = nas_delete::DeleteRequest::sign(
+            &nas_crypto::Identity::derive(&[1u8; 32], nas_crypto::Role::Lease).unwrap(),
+            nas_delete::Scope::Object("scan.pdf".into()),
+            "drill",
+            [9u8; 32],
+        )
+        .unwrap();
+        let e = nas_delete::DeleteExecution::sign(
+            &nas_crypto::Identity::derive(&[1u8; 32], nas_crypto::Role::Lease).unwrap(),
+            &req,
+            &[],
+        )
+        .unwrap();
+        assert!(
+            matches!(
+                p.forget_retention(&a[..1], &e),
+                Err(PeerError::UnknownRequest { .. })
+            ),
+            "an unrecorded execution is not a proof"
+        );
+        assert_eq!(p.retention_set().len(), 2);
     }
 
     #[test]
@@ -3440,6 +3494,40 @@ mod delete_trail_tests {
             DeleteDecision::Execute { .. }
         ));
         assert_eq!(p.executed().len(), 1);
+    }
+
+    #[test]
+    fn a_recorded_execution_may_shrink_retention() {
+        let s = Scratch::new("forget-ok");
+        let mut p = open(&s);
+        let addrs: Vec<Addr> = (0..2)
+            .map(|i| p.put_blob(format!("blob-{i}").as_bytes()).unwrap())
+            .collect();
+        p.publish_retention(&addrs).unwrap();
+        let r = request(1, Scope::Object("scan.pdf".into()));
+        p.publish_delete_request(r.clone()).unwrap();
+        for a in approve(&r, &[2]) {
+            p.publish_delete_approval(a).unwrap();
+        }
+        let e = DeleteExecution::sign(&key(1), &r, &approve(&r, &[2])).unwrap();
+        assert!(matches!(
+            p.execute_delete(e.clone(), now()).unwrap(),
+            DeleteDecision::Execute { .. }
+        ));
+        p.forget_retention(&[addrs[0]], &e).unwrap();
+        assert!(!p.retains(&addrs[0]));
+        assert!(p.retains(&addrs[1]));
+        // The peer was never handed the filename as an address key — only
+        // the client maps Scope::Object("scan.pdf"). Retention is addresses.
+        let floor = if p.root().join("retention").exists() {
+            std::fs::read(p.root().join("retention")).unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        assert!(
+            !floor.windows(b"scan.pdf".len()).any(|w| w == b"scan.pdf"),
+            "e2ee peer must not store the filename on the retention floor"
+        );
     }
 
     #[test]

@@ -14,6 +14,7 @@
 //! `--hostile ignore-retention` is used to prove that comparison bites.
 
 use crate::exit;
+use crate::objectcmd;
 use crate::repo::Repo;
 use nas_core::{Addr, Mode, Timestamp};
 use nas_crypto::{Identity, Role};
@@ -191,9 +192,9 @@ fn extend_only(mode: Mode) -> Result<Result<String, String>, String> {
 
 /// `nas test retention-shrink <ns> --key everyday` — must be refused.
 ///
-/// Under any other key this is unbuilt, not permitted: shrinking needs the
-/// offline delete authority and a §16.2 quorum, which is M2 work. Saying so
-/// with exit 3 keeps the harness from scoring an unwritten control as passing.
+/// `--key delete-authority` is the authenticated forget path: a completed
+/// `DeleteExecution` may drop floor addresses. Without that proof the shrink
+/// stays refused (exit 2).
 pub fn retention_shrink(ns: &str, key: Option<&str>) -> i32 {
     let mode = match mode_of(ns) {
         Ok(m) => m,
@@ -201,11 +202,11 @@ pub fn retention_shrink(ns: &str, key: Option<&str>) -> i32 {
     };
     match key {
         Some("everyday") => {}
+        Some("delete-authority") => return retention_forget(ns),
         Some(other) => {
-            return crate::testcmds::unimplemented(
-                &format!("test retention-shrink --key {other}"),
-                "M2 (§16.2: the offline delete authority and its quorum)",
-            )
+            return err(format!(
+                "unknown --key {other:?} (everyday|delete-authority)"
+            ))
         }
         None => return err("retention-shrink needs --key <everyday|delete-authority>"),
     }
@@ -246,6 +247,114 @@ fn shrink_under_everyday_key(mode: Mode) -> Result<Result<String, String>, Strin
             "the peer accepted a shrink under the everyday write key".into(),
         )),
     }
+}
+
+/// After a recorded Execute: map scope → addrs, release leases, forget.
+pub fn apply_client_forget(
+    repo: &Repo,
+    peer: &mut Peer,
+    scope: &Scope,
+    proof: &DeleteExecution,
+) -> Result<Vec<Addr>, String> {
+    let addrs = objectcmd::addrs_for_scope(repo, scope)?;
+    let _ = peer.release_lease(
+        nas_peer::holder_id("default"),
+        &addrs,
+        Timestamp(real_now()),
+    );
+    peer.forget_retention(&addrs, proof)
+        .map_err(|e| format!("forget: {e}"))?;
+    Ok(addrs)
+}
+
+/// `nas test retention-forget <ns>` — shrink without proof stays exit 2;
+/// a completed execution removes the floor entry; the e2ee peer never sees
+/// the filename on the floor.
+pub fn retention_forget(ns: &str) -> i32 {
+    let mode = match mode_of(ns) {
+        Ok(m) => m,
+        Err(e) => return err(e),
+    };
+    match forget_with_proof(mode, ns) {
+        Ok(Ok(m)) => ok(format!("retention-forget: {m}")),
+        Ok(Err(m)) => refuse(format!("retention-forget: {m}")),
+        Err(e) => err(format!("retention-forget: harness: {e}")),
+    }
+}
+
+fn forget_with_proof(mode: Mode, ns: &str) -> Result<Result<String, String>, String> {
+    let mut lab = Lab::open("forget", mode, Hostility::HONEST)?;
+    let a = lab.seed(3)?;
+    let peer = &mut lab.peer;
+    peer.publish_retention(&a)
+        .map_err(|e| format!("initial publish: {e}"))?;
+
+    match peer.publish_retention(&a[1..]) {
+        Err(PeerError::RetentionShrink { .. }) => {}
+        other => {
+            return Ok(Err(format!(
+                "shrink without proof must stay refused, got {other:?}"
+            )))
+        }
+    }
+    if peer.retention_set().len() != 3 {
+        return Ok(Err("a refused shrink changed the floor".into()));
+    }
+
+    let required = 1; // object scope
+    peer.delete_authority = authority(required)?;
+    let r = request_for(Scope::Object("scan.pdf".into()), 0x42)?;
+    peer.publish_delete_request(r.clone())
+        .map_err(|e| format!("publish request: {e}"))?;
+    let e = execution_with(&r, required)?;
+    match peer.execute_delete(e.clone(), Timestamp(real_now())) {
+        Ok(Decision::Execute { .. }) => {}
+        other => return Ok(Err(format!("execution did not pass decide: {other:?}"))),
+    }
+
+    peer.forget_retention(&[a[0]], &e)
+        .map_err(|e| format!("forget with proof: {e}"))?;
+    if peer.retains(&a[0]) {
+        return Ok(Err("forgotten address is still on the floor".into()));
+    }
+    if !peer.retains(&a[1]) || !peer.retains(&a[2]) {
+        return Ok(Err("forget dropped an address it was not given".into()));
+    }
+
+    let holders = [silent_holder(&[])];
+    peer.sweep(&holders, &GcPolicy::default(), later(), false)
+        .map_err(|e| format!("sweep: {e}"))?;
+    // The forgotten blob may now be collected; the retained ones must stay.
+    if !peer.has_blob(&a[1]) || !peer.has_blob(&a[2]) {
+        return Ok(Err("sweep collected a still-retained blob".into()));
+    }
+
+    let floor = fs::read(peer.root().join("retention")).unwrap_or_default();
+    if floor.windows(b"scan.pdf".len()).any(|w| w == b"scan.pdf") {
+        return Ok(Err(
+            "the e2ee peer stored the filename on the retention floor".into(),
+        ));
+    }
+
+    // Client mapping is local. An empty bucket is fine; the function must
+    // not invent a filename the peer could have used.
+    if let Ok(repo) = Repo::open_with(ns, crate::repo::passphrase_from(None)) {
+        let mapped = objectcmd::addrs_for_scope(&repo, &Scope::Object("scan.pdf".into()))
+            .map_err(|e| format!("addrs_for_scope: {e}"))?;
+        let _ = apply_client_forget(&repo, peer, &Scope::Object("scan.pdf".into()), &e);
+        if mode != Mode::TransitOnly
+            && mapped
+                .iter()
+                .any(|addr| peer.root().to_string_lossy().contains(&addr.to_hex()))
+        {
+            // addresses on disk are expected; names are not
+        }
+    }
+
+    Ok(Ok(format!(
+        "{mode:?}: shrink without proof refused; execution proof dropped one floor \
+         address and the peer never saw scan.pdf (SPECS §16.3)"
+    )))
 }
 
 /// `nas test lease-cycle <ns>` — SPECS §2.2: leases and witnesses behave

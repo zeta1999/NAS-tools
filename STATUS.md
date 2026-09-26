@@ -12,7 +12,17 @@ repositories — failing because the host had `commit.gpgsign = true` with
 object`. The product was never involved. `tests/usecases/run.sh` now supplies
 its own git config, so the result no longer depends on the developer's.
 
-`ci.sh` gates at M6.
+`ci.sh` gates at M6 and **passes end to end on andromeda** (fmt, clippy
+`-D warnings`, 623 tests, formal, release `nas`, acceptance) as of
+2026-09-26. The formal stage needs a real JRE and Lean 4.28, neither of
+which ships with macOS: `brew install openjdk@17` and elan with
+`leanprover/lean4:v4.28.0`, then put `/opt/homebrew/opt/openjdk@17/bin` and
+`~/.elan/bin` on PATH. Without them `/usr/bin/java` is a stub that reports
+"Unable to locate a Java Runtime" and the gate fails with every TLC model
+"VACUOUS" and "0 of 11 theorems reported axioms" — a toolchain absence that
+reads like a proof failure. With them: 14 Lean theorems verified with axioms
+enumerated, and TLC exploring 337817/1326144 distinct states with every
+sanity property "violated as required".
 The onion carrier is a named `.onion` plus pin (loopback map). Live
 arti circuits are a `tor-bridge` sidecar in `simple-network --features tor`
 (not in NAS-tools). All four M0 steps built, the 5 M0-tagged acceptance

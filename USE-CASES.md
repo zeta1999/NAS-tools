@@ -175,26 +175,48 @@ Build first, then set the milestone.
 
 ## Current state, measured 2026-09-26
 
-`STATUS.md` opens with "M0–M6 are done (106 pass, 0 fail at `NAS_MILESTONE=M6`)".
-**That could not be reproduced on andromeda: the workspace does not compile.**
+Run it yourself before believing any number here:
 
-    cargo build --release -p nas-crypto
-    error[E0432]: unresolved imports `secure_memory::open_with_nonce`,
-                                     `secure_memory::seal_with_nonce`
-      --> crates/nas-crypto/src/keys.rs:21
-    error[E0599]: no function or associated item named `from_seed`
-                  found for struct `SigKeyPair`
-      --> crates/nas-crypto/src/sign.rs:137
+    cargo build --release -p nas-cli
+    NAS_BIN="$PWD/target/release/nas" NAS_MILESTONE=M6 ./tests/usecases/run.sh
 
-On that date `nas-crypto` depended on `../../../rust-secure-memory` (the private
-repo `zeta1999/rust-secure-memory`, clean at `7786c46`), and none of those three
-items existed there — `SigKeyPair` offered only `generate` and `from_bytes`.
-The dependency now points at `../../../rust-secure-memory-public`, which has
-`seal_with_nonce`, `open_with_nonce`, and `SigKeyPair::from_seed`.
+**Measured today: 89 passed, 17 failed, 0 pending.** `STATUS.md` opened with
+"M0–M6 are done (106 pass, 0 fail)". That is not reproducible on andromeda.
 
-So the acceptance suite cannot run at any milestone above M0 until three
-functions are added to `secure-memory`: `seal_with_nonce`, `open_with_nonce`,
-and `SigKeyPair::from_seed`. Whether the STATUS claim was true against an
-older `secure-memory` and broke when that repo moved, or was never reproduced,
-is not established here — but the two files disagree today, and the compiler is
-the one to believe.
+Two things had to be fixed before the suite could run at all, and both are
+worth knowing because each produced a *confident wrong answer* rather than an
+error:
+
+1. **The workspace did not compile.** `nas-crypto` and `nas-vault` were
+   repointed at `rust-secure-memory-public` while `nas-transfer` still reached
+   the private `rust-secure-memory` through `simple-network`. Two different
+   `secure-memory v0.1.0` in one graph, and cargo refuses to resolve — so not
+   one crate built. Fixed by depending on `simple-network-public`, which is
+   what every other `-public` mirror already does.
+
+2. **`NAS_BIN` must be set.** The harness reads `$NAS_BIN` or `nas` on `PATH`
+   (`tests/usecases/lib.sh:20`); it does *not* look in `target/release/`.
+   Without it every check reports `no nas binary` and the run prints
+   **0 passed, 0 failed, 106 pending** — which is exactly what a finished
+   project and an empty one both look like. `ci.sh:38` sets it; a hand-run
+   does not.
+
+### The 17 failures, which are not scattered
+
+Every one is in **UC06** (public mirror) or **UC08** (several coding agents),
+and both are the git face added in `2b6e29f`:
+
+* `nas git` **is not a command** — the binary's help lists no `git`
+  subcommand, so all nine UC08 checks fail. The git face exists in the crates
+  and in `SPECS.md` §7.3–§7.6; it is not wired to the CLI.
+* `nas mirror publish` without a dry run exits **1, not 2**. Under this
+  project's own refusal contract exit 2 means "refused by policy" and anything
+  else means broken — the harness reports it as `BROKEN, not refused`. The
+  remaining UC06 checks depend on a publish having happened, so they fall with
+  it.
+
+So the honest summary is: **the storage, crypto, lease, delete, vault, peer,
+WebDAV and doc faces pass their acceptance checks at M6; the git face does
+not run.** 619 unit tests pass, `clippy -D warnings` is clean, and those
+numbers are real — they simply never covered the CLI wiring the acceptance
+suite exercises.

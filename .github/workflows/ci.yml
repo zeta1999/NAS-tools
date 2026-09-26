@@ -1,0 +1,120 @@
+# CI for NAS-tools.
+#
+# Path dependencies live *outside* this repository:
+#   crates/nas-transfer        → ../../../simple-network-public
+#   crates/nas-{crypto,vault}  → ../../../rust-secure-memory-public/crates/secure-memory
+# so the checkout layout is
+# work/{NAS-tools,simple-network-public,rust-secure-memory-public}.
+#
+# All three are public, so github.token reads them and no SIBLING_PAT is
+# needed. That is the point of the -public mirrors: a public repo whose
+# dependencies are private cannot be built by anyone who clones it, CI
+# included. Keep it that way -- a private path dep here means either a token
+# in CI or a broken build for every reader.
+#
+# linux arm64 is a *compile* job (docker/build.sh), not a substitute for ci.sh.
+# uc11 (container drill) stays manual: run.sh skips scripts without uc_summary.
+
+name: ci
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  ci:
+    name: ci.sh (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest]
+    defaults:
+      run:
+        working-directory: work/NAS-tools
+    steps:
+      - name: Checkout NAS-tools
+        uses: actions/checkout@v4
+        with:
+          path: work/NAS-tools
+
+      - name: Checkout simple-network-public
+        uses: actions/checkout@v4
+        with:
+          repository: zeta1999/simple-network-public
+          path: work/simple-network-public
+
+      - name: Checkout rust-secure-memory-public
+        uses: actions/checkout@v4
+        with:
+          repository: zeta1999/rust-secure-memory-public
+          path: work/rust-secure-memory-public
+
+      - name: Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Java (TLC)
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Lean 4.28 (elan; no lake — NasVerify is standalone .lean)
+        run: |
+          curl -sSf https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh \
+            | sh -s -- -y --default-toolchain leanprover/lean4:v4.28.0
+          echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
+
+      - name: Run ci.sh (CI_MILESTONE defaults to M6)
+        run: ./ci.sh
+
+  # Static musl `nas` for the container image. This compiles; it does not run
+  # the acceptance suite. ci.sh above is the gate.
+  musl:
+    name: musl nas (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+          # Compile-only. Not a substitute for ci.sh. Uses the arm runner when
+          # the org has ubuntu-24.04-arm; otherwise this job is the documented
+          # arm64 compile path via docker/build.sh ARCH=arm64.
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    defaults:
+      run:
+        working-directory: work/NAS-tools
+    steps:
+      - name: Checkout NAS-tools
+        uses: actions/checkout@v4
+        with:
+          path: work/NAS-tools
+
+      - name: Checkout simple-network-public
+        uses: actions/checkout@v4
+        with:
+          repository: zeta1999/simple-network-public
+          path: work/simple-network-public
+
+      - name: Checkout rust-secure-memory-public
+        uses: actions/checkout@v4
+        with:
+          repository: zeta1999/rust-secure-memory-public
+          path: work/rust-secure-memory-public
+
+      - name: Compile static musl nas (not ci.sh)
+        env:
+          ARCH: ${{ matrix.arch }}
+        run: ./docker/build.sh

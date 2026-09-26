@@ -528,7 +528,14 @@ settled and the work that follows from them.
 - [x] `ci.sh`: fmt (not `--all` — see the comment there), clippy `-D warnings`,
       workspace tests, `formal/check.sh`, release `nas`, and the acceptance
       suite at `CI_MILESTONE` (default M6).
-- [x] **CI on linux.** `docker/ci-linux.sh` runs `./ci.sh` inside
+- [x] **CI on linux.** `.github/workflows/ci.yml` runs `./ci.sh` on
+      `ubuntu-latest` and `macos-latest` on every push and PR, checking out
+      the two public sibling mirrors (no token needed, which is why the
+      `-public` deps matter). It was deleted in 5827799 and restored here:
+      the deletion removed the only *automatic* Linux CI, so ticking this box
+      for that commit was backwards. Its real blocker had been that it checked
+      out the private `rust-secure-memory`; after the repoint that is a
+      one-line change. Additionally `docker/ci-linux.sh` runs `./ci.sh` inside
       `rust:1-bookworm` (`ARCH=amd64` by default, `ARCH=arm64` selects the
       platform) with the parent work tree mounted so `rust-secure-memory-public`
       and `simple-network` resolve. Host `./ci.sh` remains the macOS gate.

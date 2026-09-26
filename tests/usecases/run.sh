@@ -33,6 +33,40 @@ fi
 # that refused.
 export NAS_PASSPHRASE="${NAS_PASSPHRASE:-acceptance suite five diceware words}"
 
+# The git-face and mirror checks build throwaway repositories and commit into
+# them. Those commits must not depend on the developer's git configuration,
+# so the harness supplies its own and ignores both the user and system files.
+#
+# Measured, not hypothetical: on a machine with `commit.gpgsign = true` and
+# `gpg.format = ssh`, every one of those commits dies with "failed to write
+# commit object" and the suite reports 89 passed / 17 failed. The same tree
+# with signing off reports 106 / 0. A suite whose result depends on whether
+# the developer signs commits is measuring the laptop, not the product -- and
+# it is how a green 106/0 came to be recorded while other machines saw 17
+# failures.
+#
+# An identity is set for the opposite reason: a fresh CI image has none, and
+# `git commit` there fails with "Please tell me who you are". Setting both
+# here makes the run identical on a developer box and in a container.
+if [ -z "${NAS_KEEP_GIT_CONFIG:-}" ]; then
+  _gitcfg="$NAS_HOME/.gitconfig-acceptance"
+  cat > "$_gitcfg" <<'GITCFG'
+[user]
+	name = NAS acceptance suite
+	email = acceptance@nas-tools.invalid
+[commit]
+	gpgsign = false
+[tag]
+	gpgSign = false
+[init]
+	defaultBranch = main
+[gc]
+	auto = 0
+GITCFG
+  export GIT_CONFIG_GLOBAL="$_gitcfg"
+  export GIT_CONFIG_SYSTEM=/dev/null
+fi
+
 # git-remote-nas is the same binary as `nas` (argv0 dispatch). Put it next
 # to NAS_BIN so `command -v git-remote-nas` and `git push nas://…` resolve.
 if [ -n "${NAS_BIN:-}" ] && [ -x "$NAS_BIN" ]; then

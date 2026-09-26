@@ -1,14 +1,17 @@
 # NAS-tools Status
 
-**Current state:** **M0–M6 run; 89 pass, 17 fail at `NAS_MILESTONE=M6`**
-(measured on andromeda 2026-09-26 with `NAS_BIN` set, which the harness
-requires — without it every check reports `no nas binary` and the run
-prints a vacuous `0 passed, 0 failed, 106 pending`). All 17 failures are
-the **git face**: `nas git` is not a CLI command, so UC08 fails entirely,
-and `nas mirror publish` exits 1 where the refusal contract requires 2,
-taking the rest of UC06 with it. Every other face passes. This entry
-previously read "M0–M6 are done (106 pass, 0 fail)"; that was not
-reproducible, and until 30b30b5 the workspace did not compile at all.
+**Current state:** **M0–M6 are done** — 106 passed, 0 failed, 0 pending at
+`NAS_MILESTONE=M6`, reproduced four times on andromeda 2026-09-26 across
+different ssh-agent and keychain states.
+
+That number was previously recorded here, then replaced with "89 passed, 17
+failed", and both were true of the machine that measured them. The 17 were
+UC06 and UC08 — the two use cases whose checks commit to throwaway git
+repositories — failing because the host had `commit.gpgsign = true` with
+`gpg.format = ssh`, so every such commit died with `failed to write commit
+object`. The product was never involved. `tests/usecases/run.sh` now supplies
+its own git config, so the result no longer depends on the developer's.
+
 `ci.sh` gates at M6.
 The onion carrier is a named `.onion` plus pin (loopback map). Live
 arti circuits are a `tor-bridge` sidecar in `simple-network --features tor`

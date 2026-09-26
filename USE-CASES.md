@@ -175,48 +175,41 @@ Build first, then set the milestone.
 
 ## Current state, measured 2026-09-26
 
-Run it yourself before believing any number here:
-
     cargo build --release -p nas-cli
     NAS_BIN="$PWD/target/release/nas" NAS_MILESTONE=M6 ./tests/usecases/run.sh
 
-**Measured today: 89 passed, 17 failed, 0 pending.** `STATUS.md` opened with
-"M0–M6 are done (106 pass, 0 fail)". That is not reproducible on andromeda.
+**106 passed, 0 failed, 0 pending.** Reproduced four times across different
+environments — with and without an ssh-agent, with and without leftover
+keychain items — because the harness no longer inherits any of that.
 
-Two things had to be fixed before the suite could run at all, and both are
-worth knowing because each produced a *confident wrong answer* rather than an
-error:
+Two things had to be fixed first, and both are worth knowing because each
+produced a *confident wrong answer* rather than an error.
 
-1. **The workspace did not compile.** `nas-crypto` and `nas-vault` were
-   repointed at `rust-secure-memory-public` while `nas-transfer` still reached
-   the private `rust-secure-memory` through `simple-network`. Two different
-   `secure-memory v0.1.0` in one graph, and cargo refuses to resolve — so not
-   one crate built. Fixed by depending on `simple-network-public`, which is
-   what every other `-public` mirror already does.
+**1. The workspace did not compile.** `nas-crypto` and `nas-vault` were
+repointed at `rust-secure-memory-public` while `nas-transfer` still reached
+the private `rust-secure-memory` through `simple-network`. Two different
+`secure-memory v0.1.0` in one graph, and cargo refuses to resolve it, so not
+one crate built. Fixed by depending on `simple-network-public`, which is what
+every other `-public` mirror already does.
 
-2. **`NAS_BIN` must be set.** The harness reads `$NAS_BIN` or `nas` on `PATH`
-   (`tests/usecases/lib.sh:20`); it does *not* look in `target/release/`.
-   Without it every check reports `no nas binary` and the run prints
-   **0 passed, 0 failed, 106 pending** — which is exactly what a finished
-   project and an empty one both look like. `ci.sh:38` sets it; a hand-run
-   does not.
+**2. The suite measured the developer's laptop.** The git-face and mirror
+checks build throwaway repositories and commit into them. On a machine with
+`commit.gpgsign = true` and `gpg.format = ssh` every one of those commits
+dies with `failed to write commit object`, and the suite reports **89 passed,
+17 failed** — all 17 in UC06 and UC08, which are precisely the two use cases
+that commit. Nothing was wrong with the product. `run.sh` now writes its own
+git config and exports `GIT_CONFIG_GLOBAL`/`GIT_CONFIG_SYSTEM`, so signing is
+off and an identity exists whatever the host is configured to do. Set
+`NAS_KEEP_GIT_CONFIG=1` to opt out.
 
-### The 17 failures, which are not scattered
+That second one is the more instructive failure. A green 106/0 had been
+recorded in `STATUS.md` and was not reproducible elsewhere; the number was
+real, but it was a property of the machine that produced it. So was the 89/17
+that briefly replaced it. Both are now the same number everywhere.
 
-Every one is in **UC06** (public mirror) or **UC08** (several coding agents),
-and both are the git face added in `2b6e29f`:
-
-* `nas git` **is not a command** — the binary's help lists no `git`
-  subcommand, so all nine UC08 checks fail. The git face exists in the crates
-  and in `SPECS.md` §7.3–§7.6; it is not wired to the CLI.
-* `nas mirror publish` without a dry run exits **1, not 2**. Under this
-  project's own refusal contract exit 2 means "refused by policy" and anything
-  else means broken — the harness reports it as `BROKEN, not refused`. The
-  remaining UC06 checks depend on a publish having happened, so they fall with
-  it.
-
-So the honest summary is: **the storage, crypto, lease, delete, vault, peer,
-WebDAV and doc faces pass their acceptance checks at M6; the git face does
-not run.** 619 unit tests pass, `clippy -D warnings` is clean, and those
-numbers are real — they simply never covered the CLI wiring the acceptance
-suite exercises.
+**Read the run, not the summary line.** `NAS_BIN` must be set: the harness
+takes `$NAS_BIN` or `nas` on `PATH` (`tests/usecases/lib.sh:20`) and does not
+look in `target/release/`. Without it every check reports `no nas binary` and
+the run prints `0 passed, 0 failed, 106 pending` — which is exactly what a
+finished project and an empty one both look like. `ci.sh:38` sets it; a
+hand-run does not.

@@ -268,10 +268,7 @@ fn write_private_new(path: &Path, bytes: &[u8]) -> io::Result<()> {
     use std::io::Write;
     let mut file = open_exclusive(path).map_err(|e| {
         if e.kind() == io::ErrorKind::AlreadyExists {
-            io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "destination exists; refusing to overwrite a vault key",
-            )
+            policy_refusal("destination exists; refusing to overwrite a vault key")
         } else {
             e
         }
@@ -299,6 +296,32 @@ fn parent_dir(path: &Path) -> &Path {
 
 fn sync_dir(dir: &Path) -> io::Result<()> {
     fs::File::open(dir)?.sync_all()
+}
+
+/// A policy decision that went against the caller.
+///
+/// `ErrorKind::PermissionDenied` is also what the OS returns for `EACCES`.
+/// Exit code 2 is this type and nothing else (`exit`). The kind stays
+/// `PermissionDenied` so callers that branch on kind still see a refusal;
+/// [`is_policy_refusal`] is what the process exit uses.
+#[derive(Debug)]
+struct PolicyRefusal(&'static str);
+
+impl std::fmt::Display for PolicyRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0)
+    }
+}
+
+impl std::error::Error for PolicyRefusal {}
+
+fn policy_refusal(msg: &'static str) -> io::Error {
+    io::Error::new(io::ErrorKind::PermissionDenied, PolicyRefusal(msg))
+}
+
+pub(crate) fn is_policy_refusal(err: &io::Error) -> bool {
+    err.get_ref()
+        .is_some_and(|inner| inner.is::<PolicyRefusal>())
 }
 
 /// Replace `path` by writing a sibling, fsyncing it, and renaming over the
@@ -673,8 +696,7 @@ impl Repo {
     /// no generation table.
     pub fn rotate_convergence(&mut self) -> io::Result<u32> {
         let Secrets::Vault(v) = &mut self.secrets else {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
+            return Err(policy_refusal(
                 "passphrase mode has no convergence generation to rotate",
             ));
         };
@@ -732,10 +754,7 @@ impl Repo {
     /// `0644` file keeps its mode because `.mode` applies only at creation.
     pub fn export_vault_key(&self, dest: &Path) -> io::Result<()> {
         if self.mode == Mode::Passphrase {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "passphrase mode has no vault key to export",
-            ));
+            return Err(policy_refusal("passphrase mode has no vault key to export"));
         }
         let ns = self
             .root

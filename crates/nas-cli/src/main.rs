@@ -352,7 +352,9 @@ fn acl(args: &[String]) -> i32 {
 }
 
 fn policy_or_error(e: std::io::Error) -> i32 {
-    if e.kind() == std::io::ErrorKind::PermissionDenied {
+    // Kind is not enough: an OS EACCES reading vault.key is also
+    // PermissionDenied, and exit 2 is reserved for a policy refusal.
+    if repo::is_policy_refusal(&e) {
         eprintln!("refused: {e}");
         exit::REFUSED
     } else {
@@ -361,7 +363,27 @@ fn policy_or_error(e: std::io::Error) -> i32 {
     }
 }
 
+/// The mode is in the plaintext config. Opening a passphrase namespace to
+/// learn that these commands do not apply prompts and runs Argon2id, then
+/// refuses; with no terminal the prompt fails and the process exits 1, which
+/// a harness cannot tell from a broken command (MANUAL §4.3, §4.4).
+fn refuse_passphrase_namespace(name: &str, why: &'static str) -> Option<i32> {
+    match Repo::describe(name) {
+        Ok(d) if d.mode == Mode::Passphrase => {
+            eprintln!("refused: {why}");
+            Some(exit::REFUSED)
+        }
+        Ok(_) => None,
+        Err(e) => Some(policy_or_error(e)),
+    }
+}
+
 fn export_key(name: &str, out: &str) -> i32 {
+    if let Some(code) =
+        refuse_passphrase_namespace(name, "passphrase mode has no vault key to export")
+    {
+        return code;
+    }
     match Repo::open_with(name, None) {
         Ok(r) => match r.export_vault_key(std::path::Path::new(out)) {
             Ok(()) => {
@@ -375,6 +397,12 @@ fn export_key(name: &str, out: &str) -> i32 {
 }
 
 fn rotate_ns(name: &str) -> i32 {
+    if let Some(code) = refuse_passphrase_namespace(
+        name,
+        "passphrase mode has no convergence generation to rotate",
+    ) {
+        return code;
+    }
     match Repo::open_with(name, None) {
         Ok(mut r) => match r.rotate_convergence() {
             Ok(n) => {

@@ -583,6 +583,57 @@ impl Repo {
         }
     }
 
+    /// Append a convergence-secret generation and seal the vault again
+    /// (SPECS §3.9c). Does not rewrite existing chunks. Passphrase mode has
+    /// no generation table.
+    pub fn rotate_convergence(&mut self) -> io::Result<u32> {
+        let Secrets::Vault(v) = &mut self.secrets else {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "passphrase mode has no convergence generation to rotate",
+            ));
+        };
+        let number = v
+            .rotate_convergence()
+            .map_err(|e| io::Error::other(e.to_string()))?;
+        let ns = self
+            .root
+            .file_name()
+            .and_then(|s| s.to_str())
+            .ok_or_else(|| io::Error::other("namespace path has no name"))?;
+        let vault_key = Self::load_vault_key(ns, &self.root)?;
+        let sealed = v
+            .seal_with(vault_key)
+            .map_err(|e| io::Error::other(e.to_string()))?;
+        write_private(&self.root.join("vault.bin"), &sealed)?;
+        self.cs_holder = v.current_generation().convergence_secret();
+        Ok(number)
+    }
+
+    /// Write the 32-byte vault key to a new `0600` file. Never prints it.
+    /// Refuses if `dest` already exists. Passphrase mode has no such key.
+    pub fn export_vault_key(&self, dest: &Path) -> io::Result<()> {
+        if self.mode == Mode::Passphrase {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "passphrase mode has no vault key to export",
+            ));
+        }
+        if dest.exists() {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "destination exists; refusing to overwrite a vault key",
+            ));
+        }
+        let ns = self
+            .root
+            .file_name()
+            .and_then(|s| s.to_str())
+            .ok_or_else(|| io::Error::other("namespace path has no name"))?;
+        let key = Self::load_vault_key(ns, &self.root)?;
+        write_private(dest, &key)
+    }
+
     /// A hash of the convergence secret, for comparing two namespaces without
     /// exposing the secret itself.
     pub fn convergence_secret_fingerprint(&self) -> [u8; 32] {
@@ -815,6 +866,35 @@ mod tests {
                 );
                 Repo::open_with(ns, None).expect("open from vault.key");
             }
+            crate::keychain::delete(ns);
+        });
+    }
+
+    #[test]
+    fn rotate_keeps_the_old_generation_and_export_refuses_to_clobber() {
+        with_temp_home(|_| {
+            let ns = "rot-e2ee";
+            crate::keychain::delete(ns);
+            let mut repo = Repo::create(
+                ns,
+                Mode::E2ee,
+                KeyScheme::Convergent,
+                PaddingProfile::None,
+                None,
+                None,
+                None,
+            )
+            .expect("create");
+            assert_eq!(repo.generation(), 0);
+            let next = repo.rotate_convergence().expect("rotate");
+            assert_eq!(next, 1);
+            let again = Repo::open_with(ns, None).expect("reopen");
+            assert_eq!(again.generation(), 1);
+            let dest = again.root.join("exported.key");
+            again.export_vault_key(&dest).expect("export");
+            assert_eq!(fs::read(&dest).unwrap().len(), 32);
+            let err = again.export_vault_key(&dest).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
             crate::keychain::delete(ns);
         });
     }

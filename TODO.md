@@ -77,11 +77,14 @@ settled and the work that follows from them.
       Closes unknown-key-share and cross-protocol signature reuse.
 - [x] **Constant-time `check_pin`** (`ct_eq`, no early exit)
 - [x] 15 tests green (4 new), clippy clean, fmt clean
-- [ ] **Wire-breaking — coordinate the rollout.** v0 peers are refused with an
+- [x] **Wire-breaking — coordinate the rollout.** v0 peers are refused with an
       explicit version error. `../simple-backups` push/pull rides this channel, so
-      both ends of any paired deployment must upgrade together.
-- [ ] *(only if the doc face later wants pubsub)* topic filtering; route pubsub over
-      `SecureConnection` rather than raw TCP; durable subscriptions with reconnect
+      both ends of any paired deployment must upgrade together. Documented in
+      that repo's SPECS and README. There is no downgrade.
+- [x] **Pubsub stays off.** Adaptive polling is the correctness path (M6). Topic
+      filtering, routing pubsub over `SecureConnection`, and durable
+      subscriptions are not built: a pubsub channel cannot be load-bearing
+      against an untrusted peer.
 
 ## Formal
 
@@ -201,11 +204,10 @@ settled and the work that follows from them.
 - [x] Dedup test: 54.1% recovered on a corpus of split binaries
 - [x] `nas-cli` + the `nas test` substrate, honouring the exit-2 refusal contract
 - [x] The 5 M0-tagged acceptance assertions pass against the real binary
-- [ ] **Per-segment name encryption — reconsider, do not just implement.**
-      Names already live inside the sealed directory manifest and the peer never
-      sees a filename, so §4.4's Cryptomator-style second layer buys nothing in
-      `e2ee`. The case that actually needs a decision is `transit-only`, where
-      the peer legitimately reads plaintext and names must be *visible*. M1.
+- [x] **Per-segment name encryption — decided: do not implement.**
+      In `e2ee` the filename lives inside the sealed directory manifest and the
+      peer never sees it, so a Cryptomator-style second layer buys nothing. In
+      `transit-only` names are visible on purpose (SPECS §4.4). No new crypto.
 - [x] **Store symlinks.** Entry kind `2`, target bytes; never followed on
       store, re-created as a link on restore, and a stale link at a restored
       name is replaced rather than written through. Mode bits, uid/gid, mtime,
@@ -526,11 +528,12 @@ settled and the work that follows from them.
 - [x] `ci.sh`: fmt (not `--all` — see the comment there), clippy `-D warnings`,
       workspace tests, `formal/check.sh`, release `nas`, and the acceptance
       suite at `CI_MILESTONE` (default M6).
-- [ ] **CI on linux.** `docker/build.sh` builds a static arm64 musl `nas` in a
-      `rust:alpine` container and bakes the `nas-node` image, but nothing runs
-      the tests or the acceptance suite under linux, and amd64 is not built at
-      all. Needs a matrix (macOS host + linux arm64 + linux amd64) that runs
-      `ci.sh` itself, not just the build.
+- [x] **CI on linux.** `docker/ci-linux.sh` runs `./ci.sh` inside
+      `rust:1-bookworm` (`ARCH=amd64` by default, `ARCH=arm64` selects the
+      platform) with the parent work tree mounted so `rust-secure-memory-public`
+      and `simple-network` resolve. Host `./ci.sh` remains the macOS gate.
+      `docker/build.sh` stays musl compile-only (arm64 and amd64). uc11 stays
+      manual. GitHub Actions is not the gate.
 - [x] Automated "no plaintext on the peer" scan: `nas test peer-no-plaintext
       <ns>` (`nas-cli/src/peerscan.rs`) walks the whole peer root — blobs,
       slots, leases, witnesses, everything under it — for the fixture's

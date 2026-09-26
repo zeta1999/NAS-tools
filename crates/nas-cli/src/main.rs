@@ -39,6 +39,8 @@ nas — NAS-tools command line
   nas ns list
   nas ns open <ns> [--passphrase <pw>]
   nas ns export-pub <ns> <out-dir>       keys a peer operator needs to admit <ns>
+  nas ns export-key <ns> <file>          32-byte vault key, mode 0600; refuses if <file> exists
+  nas ns rotate <ns>                     new CS generation; old chunks stay readable
   nas ns roster add <ns> <file>          operator-curated writer pub (local only)
   nas ns roster list <ns>
   nas acl grant|revoke|check <ns> --subject <s> --right <r>
@@ -349,6 +351,46 @@ fn acl(args: &[String]) -> i32 {
     }
 }
 
+fn policy_or_error(e: std::io::Error) -> i32 {
+    if e.kind() == std::io::ErrorKind::PermissionDenied {
+        eprintln!("refused: {e}");
+        exit::REFUSED
+    } else {
+        eprintln!("error: {e}");
+        exit::ERROR
+    }
+}
+
+fn export_key(name: &str, out: &str) -> i32 {
+    match Repo::open_with(name, None) {
+        Ok(r) => match r.export_vault_key(std::path::Path::new(out)) {
+            Ok(()) => {
+                println!("wrote vault key to {out}");
+                exit::OK
+            }
+            Err(e) => policy_or_error(e),
+        },
+        Err(e) => policy_or_error(e),
+    }
+}
+
+fn rotate_ns(name: &str) -> i32 {
+    match Repo::open_with(name, None) {
+        Ok(mut r) => match r.rotate_convergence() {
+            Ok(n) => {
+                println!("rotated {name} to generation {n}");
+                println!(
+                    "  old chunks stay readable under the generations the vault kept; \
+                     nothing already copied can be unread (SPECS §3.9c)"
+                );
+                exit::OK
+            }
+            Err(e) => policy_or_error(e),
+        },
+        Err(e) => policy_or_error(e),
+    }
+}
+
 fn ns(args: &[String]) -> i32 {
     let pos = positional(args);
     match pos.first().copied() {
@@ -606,6 +648,20 @@ fn ns(args: &[String]) -> i32 {
                 exit::ERROR
             }
         },
+        Some("export-key") => match (pos.get(1), pos.get(2)) {
+            (Some(name), Some(out)) => export_key(name, out),
+            _ => {
+                eprintln!("usage: nas ns export-key <name> <file>");
+                exit::ERROR
+            }
+        },
+        Some("rotate") => {
+            let Some(name) = pos.get(1) else {
+                eprintln!("usage: nas ns rotate <name>");
+                return exit::ERROR;
+            };
+            rotate_ns(name)
+        }
         Some("roster") => match (pos.get(1).copied(), pos.get(2), pos.get(3)) {
             (Some("add"), Some(ns), Some(file)) => peercmd::roster_add(ns, file),
             (Some("list"), Some(ns), None) => peercmd::roster_list(ns),
@@ -615,7 +671,7 @@ fn ns(args: &[String]) -> i32 {
             }
         },
         _ => {
-            eprintln!("usage: nas ns create|list|open|export-pub|roster");
+            eprintln!("usage: nas ns create|list|open|export-pub|export-key|rotate|roster");
             exit::ERROR
         }
     }

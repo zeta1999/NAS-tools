@@ -634,10 +634,12 @@ manifest's own encryption protects both `ck` and `pt_hash`.
 
 ### 4.4 Names and listing
 
-Path *segments* are encrypted individually (Cryptomator-style), so listings
-resolve without a server-side prefix scan. **Listing is local**: the client
-fetches and decrypts the manifest and answers `PROPFIND` / `list-objects` from it.
-The peer is never asked to match a prefix and could not.
+Names are not encrypted a second time. In `e2ee` and `passphrase` the filename
+lives inside the sealed directory manifest, so the peer never sees it; a
+Cryptomator-style per-segment layer would buy nothing. In `transit-only` names
+are visible on purpose. **Listing is local**: the client fetches and decrypts
+the manifest and answers `PROPFIND` / `list-objects` from it. The peer is never
+asked to match a prefix and, outside `transit-only`, could not.
 
 ### 4.5 Upload dedup requires proof of possession
 

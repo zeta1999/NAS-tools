@@ -8,13 +8,13 @@ fail=0
 step() { printf '\n\033[1m── %s ──\033[0m\n' "$1"; }
 
 # NOT `cargo fmt --all`. Three of our crates take path dependencies that live
-# outside this tree (rust-secure-memory x2, simple-network), and cargo collects
+# outside this tree (rust-secure-memory-public x2, simple-network), and cargo collects
 # fmt targets from the whole metadata graph rather than from `[workspace]
 # members` -- so `--all` reaches into those checkouts and rewrites files in
 # repositories that are not this one. Measured here, not assumed:
 #
 #   cargo fmt --all -v -- --check | grep -oE '/.../work/[a-z-]+' | sort -u
-#     -> rust-secure-memory, simple-network
+#     -> rust-secure-memory-public, simple-network
 #   cargo fmt      -v    --check | ...   -> nothing outside this repo
 #
 # A rustfmt rewrite is indistinguishable from an intentional edit in `git

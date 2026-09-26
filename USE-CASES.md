@@ -186,9 +186,11 @@ Build first, then set the milestone.
                   found for struct `SigKeyPair`
       --> crates/nas-crypto/src/sign.rs:137
 
-`nas-crypto` depends on `../../../rust-secure-memory` (the private repo
-`zeta1999/rust-secure-memory`, clean at `7786c46`), and none of those three
-items exist there — `SigKeyPair` offers only `generate` and `from_bytes`.
+On that date `nas-crypto` depended on `../../../rust-secure-memory` (the private
+repo `zeta1999/rust-secure-memory`, clean at `7786c46`), and none of those three
+items existed there — `SigKeyPair` offered only `generate` and `from_bytes`.
+The dependency now points at `../../../rust-secure-memory-public`, which has
+`seal_with_nonce`, `open_with_nonce`, and `SigKeyPair::from_seed`.
 
 So the acceptance suite cannot run at any milestone above M0 until three
 functions are added to `secure-memory`: `seal_with_nonce`, `open_with_nonce`,

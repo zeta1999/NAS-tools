@@ -209,10 +209,11 @@ See `MANUAL-TESTING.md` §5 for the commands and raw output.
 
 ## Where the numbers stand
 
-`.github/workflows/ci.yml` runs `ci.sh` on macos-latest and ubuntu-latest
-after checking out `simple-network` and `rust-secure-memory` as siblings.
-linux arm64 is a musl *compile* job (`docker/build.sh ARCH=arm64`), not a
-substitute for `ci.sh`. uc11 stays manual.
+`docker/ci-linux.sh` runs `ci.sh` on Linux (`ARCH=amd64` by default,
+`ARCH=arm64` for the other platform) with `simple-network` and
+`rust-secure-memory-public` mounted as siblings. Host `./ci.sh` is the macOS
+gate. linux arm64 and amd64 musl images are a *compile* job
+(`docker/build.sh`), not a substitute for `ci.sh`. uc11 stays manual.
 
 `ci.sh` is green end to end today, at `CI_MILESTONE=M6`:
 

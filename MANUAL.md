@@ -100,6 +100,8 @@ On the device:
 ```
 nas ns create work --mode e2ee
 nas ns export-pub work ./work-pub        # transport + slot public keys, no secrets
+nas ns export-key work ./work.key        # the 32-byte vault key; whoever holds it opens the vault
+nas ns rotate work                       # new CS generation; does not rewrite old chunks
 ```
 
 On the peer (a NAS, a VPS, a container — something you do **not** need to trust):
@@ -260,16 +262,27 @@ run:
 Rotation costs all cross-generation dedup for rewritten data; there is no
 cheaper revocation.
 
-Today the vault keeps `CS` generations in `e2ee` mode (so rotation is not a
-data-loss event), but no CLI command performs a rotation and there is no
-background rewrite. `passphrase` mode has no generation table at all: rotating
-there means changing the data key, which is a re-encryption, not a vault edit.
+`nas ns rotate <ns>` appends a generation and seals the vault again. It does
+not rewrite old chunks, and it cannot un-read bytes a peer already holds — a
+rotated secret does not reach back into a copy that left the machine. Data
+still in an old generation stays readable, including by a revoked device,
+until that chunk is rewritten. There is no background rewriter. `passphrase`
+mode has no generation table: rotating there means changing the data key,
+which is a re-encryption, not a vault edit, and `nas ns rotate` exits 2.
 `nas acl revoke` in either encrypted mode changes the declared list; it does
 not re-key anything, so it does not by itself revoke a reader — and `nas acl
 check --right read` on such a namespace tells you so by exiting `1` rather than
 pretending a decision was made (SPECS §15.3). In `transit-only` mode the
 peer-side list is the whole mechanism, and takes effect the moment the peer
 next evaluates it — if the peer is honest.
+
+### 4.4 The vault key is a file you can export
+
+`e2ee` and `transit-only` keep the 32-byte key that opens `vault.bin` in the
+OS keychain when that works, and in `vault.key` otherwise. `nas ns export-key
+<ns> <file>` writes that key to a new file, mode `0600`, and refuses if the
+destination already exists. It does not print the key. Whoever holds the file
+opens the vault. `passphrase` mode has no such key and the command exits 2.
 
 ## 5. Deletion, retention and garbage collection — in one paragraph each
 
@@ -294,11 +307,13 @@ retained address is not swept even if nobody leases it (§16.3). Deletion is a
 loop — a signed request, a 7-day cooling-off, m approvals from distinct
 holders bound to that request, then execution (§16.2).
 
-Today the request, approvals and execution records are published, served and
-audited over the wire, but **execution does not delete data**: in an encrypted
-namespace the peer cannot map an object name to addresses, so it records the
-authorisation and the client half — releasing the leases so the sweep can run —
-is not built yet (TODO.md, M2).
+The loop that runs is: a signed request, a cooling-off, m approvals from
+distinct holders bound to that request, then Execute. After a recorded
+Execute the client releases the leases on the addresses it mapped from the
+object and calls `forget_retention` with that execution proof, so the floor
+shrinks only by those addresses (`new ⊆ old`). Shrink without the proof stays
+exit 2. The e2ee peer still cannot name the file: it sees addresses, not the
+path.
 
 None of this is confidentiality: the peer sees every retention set and every
 lease inventory in plaintext (SPECS §1, §6.5). That is the price of a peer that

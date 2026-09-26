@@ -4,7 +4,7 @@
 #
 # ARCH=arm64|amd64 (default arm64). A second rust container / `--platform`
 # selects the musl target so amd64 is no longer missing. The out-of-repo path
-# deps (../rust-secure-memory, ../simple-network) resolve because the whole
+# deps (../rust-secure-memory-public, ../simple-network) resolve because the whole
 # parent tree is mounted at /work. Cargo registry and the musl target dir live
 # on named volumes, so rebuilds are incremental.
 #

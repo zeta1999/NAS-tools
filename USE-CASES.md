@@ -152,18 +152,17 @@ path: one blob per request and leases in batches of 256, so it does not
 die on a 10 MiB catalog, and a million chunks means a million round trips.
 This case is the backup pair, not that sync.
 
-**What fails on a large store.** `push` puts every snapshot, every object
-id, and a possession challenge per object into one JSON frame. The cap is
-10 MiB, about fifty thousand chunks, a few gigabytes. Past that the push
-fails before any payload, and a retry rebuilds the same frame. The reply
-that lists what the receiver still needs is one frame too. For every
-object the receiver claims to hold, it reads the whole object into memory
-to answer the proof, so a repeat push of a terabyte re-reads a terabyte.
-A snapshot manifest is one JSON document on disk and one control message
-on the wire. Object bodies themselves already move in 4 MiB pieces.
-Today's push also copies the convergence secret onto the receiver, so the
-other server can open the chunks. A large copy to a machine you do not
-trust with that secret is the wrong shape until the send is explicit.
+**A large store.** A catalog that fits in one frame still uses one
+`PushBegin`. Past that, object ids go out 1024 at a time and the manifest
+JSON is sliced under 1 MiB, so one file's chunk list can cross a page.
+Pull is paged the same way. The snapshot on disk stays one JSON file.
+A peer that cannot decode a page fails the session, and a partial manifest
+is not committed. Run `push` again to resume: objects already stored are
+skipped after a streamed possession proof. That proof still reads the
+ciphertext off disk, so a later push of an unchanged terabyte reads a
+terabyte and sends almost nothing. Object bodies move in 4 MiB pieces.
+The convergence secret stays off the wire unless the operator passes
+`--send-cs`. A destination that receives it can open the chunks.
 
 ---
 

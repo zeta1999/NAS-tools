@@ -391,8 +391,13 @@ no notion of time or concurrency.
   rests on. Also proves padding is reversible **unconditionally** — a wrong size
   class can leak more length information than intended, but can never make a
   chunk unrecoverable.
-- *(planned)* Merkle proof soundness for lease checkpoints and slot skip-chains:
-  verification succeeding implies membership.
+- *(planned)* `merkle::root` in `nas-lease`: the root is a function of the set
+  (order and duplicates do not matter), the odd node is promoted rather than
+  duplicated, and the element count is hashed into the root. BLAKE3 stays
+  abstract. This is not a skip-chain membership theorem. `verify_skip_chain`
+  has no Merkle inclusion check; an empty tail still verifies, and records
+  between checkpoints are not claimed to be in hand. `SlotConsistency.tla`
+  already covers a missing witness edge.
 
 ### Property tests — implementation behaviour
 

@@ -1673,6 +1673,44 @@ distinct slots, so **there is no contention at all** (§7.4). Two agents on one
 branch collide as a normal non-fast-forward error. Patch queues (§7.5) give review
 gating without a forge.
 
+### 19.9 A server backing up to another server, even when the vault is very big
+
+The block below is the operator's intent. `JobConfig` does not parse
+`peers`. A second copy is a second `pair` and a second `push`.
+
+```yaml
+source: /srv/photos
+repo: /var/backups/photos
+# not a field the job loader reads:
+#   backup-a  10.0.0.2:9876
+#   backup-b  10.0.0.3:9876
+```
+
+The sender holds the keys and runs `push` once per pinned peer. The
+receiver runs `serve`. A witness stores no blobs and is not a copy. One
+`nas-peer` does not pull a namespace from another.
+
+A large `simple-backups` push has to survive four limits, not one:
+
+- The offer, the challenge list, and the `WantObjects` reply each have to
+  fit in a 10 MiB frame. One snapshot of about fifty thousand chunks does
+  not.
+- Proving an object the receiver already holds reads that object. A repeat
+  push re-reads the bytes it will not send. The read is streamed. It is
+  still a full read.
+- A snapshot manifest that does not fit in a control frame is sent in
+  pages whose encoded JSON stays under 1 MiB. A page may split one file's
+  chunk list. Counting files is not the bound. Pull is paged the same way.
+  The on-disk snapshot stays one JSON file, loaded one snapshot at a time.
+  A manifest the machine cannot parse locally is out of scope.
+- The convergence secret is not attached to a push unless the operator
+  asks. A destination that receives it can open the chunks.
+
+A catalog that fits in one frame still uses one `PushBegin`. Both ends of
+a large pair run the paged code. New messages, protocol version stays 1, so
+a small `PushBegin` to an old peer still works. A peer that cannot decode a
+page fails the session. A partial manifest is not a committed snapshot.
+
 ---
 
 ## 20. Why each feature exists — requirement traceability

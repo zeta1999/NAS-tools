@@ -135,15 +135,48 @@ storage peer can and cannot do. It can withhold data, serve stale history, and
 observe access patterns. It cannot read `e2ee` content, forge signatures, or
 roll history back undetectably once a witness has seen it.
 
+### 10. A server backing up to another server, even when the vault is very big *(§19.9)*
+
+**The intent.** One machine holds the data. A second machine holds a copy.
+A third copy is the same step again. The copy has to finish when the store
+is a photo NAS: many snapshots, tens or hundreds of gigabytes, millions of
+chunks. A witness node is not this copy. It stores no blobs.
+
+**How the copy is made.** `simple-backups` already pairs two machines.
+`identity-gen`, a one-time code, `pair`, `serve` on the receiver, `push`
+or `pull` on the sender. Each command names one peer. A second destination
+is a second `pair` and a second `push`, written as two cron lines. The job
+YAML has no destination field, and this case does not add one. One
+`nas-peer` does not pull from another. `nas peer sync` is a different
+path: one blob per request and leases in batches of 256, so it does not
+die on a 10 MiB catalog, and a million chunks means a million round trips.
+This case is the backup pair, not that sync.
+
+**What fails on a large store.** `push` puts every snapshot, every object
+id, and a possession challenge per object into one JSON frame. The cap is
+10 MiB, about fifty thousand chunks, a few gigabytes. Past that the push
+fails before any payload, and a retry rebuilds the same frame. The reply
+that lists what the receiver still needs is one frame too. For every
+object the receiver claims to hold, it reads the whole object into memory
+to answer the proof, so a repeat push of a terabyte re-reads a terabyte.
+A snapshot manifest is one JSON document on disk and one control message
+on the wire. Object bodies themselves already move in 4 MiB pieces.
+Today's push also copies the convergence secret onto the receiver, so the
+other server can open the chunks. A large copy to a machine you do not
+trust with that secret is the wrong shape until the send is explicit.
+
 ---
 
 ## How these are tested
 
-`tests/usecases/` turns §19 into **executable acceptance criteria**, written
-before the implementation "so it cannot quietly redefine success". **106 checks
-across 11 scripts**, run by `ci.sh`. Four further scripts (`uc10`–`uc13`) are
-manual drills needing real processes, fixed ports or docker — excluded from the
-automated run by design and documented in `MANUAL-TESTING.md` §12.
+`tests/usecases/` turns §19.1–§19.8 into **executable acceptance criteria**,
+written before the implementation "so it cannot quietly redefine success".
+**106 checks across 11 scripts**, run by `ci.sh`. Four further scripts
+(`uc10`–`uc13`) are manual drills needing real processes, fixed ports or
+docker — excluded from the automated run by design and documented in
+`MANUAL-TESTING.md` §12. Case 10 (§19.9) is not one of those scripts.
+`uc10` stays the three-node drill. The large-copy checks belong with
+`simple-backups` transfer tests, as `docs/close-leftover-notes.md` describes.
 
 Beneath that: **614 `#[test]`s** in the crates, 10 fuzz targets over every
 decoder, and `formal/` carrying Lean and TLA+ models.

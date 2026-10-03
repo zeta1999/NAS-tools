@@ -512,7 +512,7 @@ namespace before any data is written.
       choice; restoring a workflow file is not a fix. `docker/ci-linux.sh`
       runs `./ci.sh` inside `rust:1-bookworm` (`ARCH=amd64` by default,
       `ARCH=arm64` selects the platform) with the parent work tree mounted so
-      `rust-secure-memory-public` and `simple-network` resolve. Host `./ci.sh`
+      `rust-secure-memory-public` and `simple-network-public` resolve. Host `./ci.sh`
       remains the macOS gate. `docker/build.sh` stays musl compile-only
       (arm64 and amd64). uc11 stays manual.
 - [x] Automated "no plaintext on the peer" scan: `nas test peer-no-plaintext

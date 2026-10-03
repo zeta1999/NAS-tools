@@ -2,7 +2,7 @@
 # Run ./ci.sh inside a Linux container. Host ./ci.sh remains the macOS gate.
 #
 # ARCH=amd64|arm64 (default amd64). The parent work tree is mounted at /work so
-# the path deps (../rust-secure-memory-public, ../simple-network) resolve.
+# the path deps (../rust-secure-memory-public, ../simple-network-public) resolve.
 # This runs the tests and the acceptance suite. docker/build.sh is the musl
 # compile, and it is not a substitute for this. uc11 stays manual.
 #

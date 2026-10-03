@@ -1034,11 +1034,11 @@ Poll-on-slot and pubsub are not alternatives at the same layer.
   notification cannot be believed and its absence cannot be believed either — you
   always re-verify by fetching. So pubsub can never be load-bearing.
 
-**Therefore the doc face is not blocked on `simple-network` pubsub.** Build
-adaptive polling first (sub-second while a document is actively edited, minutes
-when idle); it captures most of the benefit and degrades cleanly on a flaky link,
-which a held-open push channel does not. Pubsub is a post-M6 optimisation whose
-upstream cost is set out in §14.
+**Therefore the doc face is not blocked on `simple-network` pubsub.** Adaptive
+polling is what ships (sub-second while a document is actively edited, minutes
+when idle). Pubsub is not built. A notification is not load-bearing: the
+client still fetches the slot head. The upstream cost of a later channel is
+history in §14, not a backlog item.
 
 ---
 
@@ -1060,9 +1060,8 @@ path → slot → root manifest → segment-decrypt names → chunk list
 | FUSE-T | moderate | user must install FUSE-T | good, but NFS underneath regardless |
 
 WebDAV first: it rides the HTTP server the S3 face already needs, and HTTP range
-GETs map onto chunk range reads directly. Migrate to self-served NFSv3 when macOS
-WebDAV performance becomes the limit — the read path is unchanged, only the shim
-moves.
+GETs map onto chunk range reads directly. Finder supports WebDAV, so v0 stays
+WebDAV. A later measurement is not a reason to start NFSv3.
 
 *(Revision 1 also claimed WebDAV grants browser and mobile access. It does not:
 §2.1 binds the gateway to loopback and a unix socket. Mobile requires a mobile
@@ -1223,11 +1222,10 @@ is refused with an explicit version error rather than silently downgraded, so bo
 ends of any paired deployment upgrade together — `simple-backups` push/pull rides
 this channel. Verify interoperability at M1 rather than assuming it.
 
-If the doc face later wants pubsub (§7.2), the upstream cost is: topic filtering
-(small), routing pubsub over `SecureConnection` instead of raw TCP (moderate, and
-needed for anything secure regardless), and durable subscriptions with reconnect
-and missed-message semantics (the real work). Only the third is genuinely hard, and
-none of it is on the critical path.
+Pubsub stays unbuilt (§7.2). A notification from an untrusted peer is not
+load-bearing. The upstream cost, recorded here and not scheduled, would have
+been topic filtering, routing pubsub over `SecureConnection` instead of raw
+TCP, and durable subscriptions with reconnect and missed-message semantics.
 
 ---
 
@@ -1252,8 +1250,8 @@ so in `e2ee` and `passphrase` modes the peer never sees them. Two traps:
 **WebDAV has no concept of POSIX mode.** Files appear as whatever the client
 synthesises — typically `0644`, owned by whoever mounted the share. The stored
 mode is preserved faithfully for *restore*, but it is **not visible through a
-WebDAV mount**. NFSv3 carries mode/uid/gid properly, which is a second argument
-for that migration beyond raw throughput. Since v0 is read-only, write-permission
+WebDAV mount**. NFSv3 would carry mode/uid/gid. Finder supports WebDAV, so
+that is not a reason to start NFSv3. Since v0 is read-only, write-permission
 semantics largely do not arise yet.
 
 A `uid_mode: preserve | squash` knob is provided, because on a NAS you usually
@@ -1728,7 +1726,7 @@ than its *driver* for your situation, delete the feature.
 | …plus "the family should browse them, with thumbnails" | server-side **reading** | `transit-only` (§2.2.3) | the peer reads everything; read control becomes policy, not maths |
 | "locked by a simple password" | the key must live in a human head | Argon2id KEK wrapping a random DEK (§2.2.2) | offline brute force is available to the peer; needs a real passphrase |
 | "append only, never delete" | a compromised client must not be able to destroy | key separation + quorum + cooling-off (§16) | approval keys must live off the laptop, or the defence is theatre |
-| "read-only mount, rootless" | no kext, no root password | WebDAV now, NFSv3 later (§8) | WebDAV cannot express POSIX modes (§15.2) |
+| "read-only mount, rootless" | no kext, no root password | WebDAV (§8). Finder supports it. NFSv3 is not a dev task | WebDAV cannot express POSIX modes (§15.2) |
 | "laptop at home, office, cafés" | two devices may never be online together | witness records relayed by the peer (§5.3) | fork detection converges only when witnesses propagate |
 | "git-like" | mutable refs on a store that cannot read them | ref slots, fast-forward merge (§7.3) | force-push becomes an audited override |
 | "worktrees, coding agents" | parallel pushes to different branches | one slot per ref (§7.4) | **nothing** — it falls out of the design for free |

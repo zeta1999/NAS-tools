@@ -287,8 +287,8 @@ assertion fails at `NAS_MILESTONE=M2`:** 62 pass, 0 fail, 38 pending. At M3:
 
 M4 is built: WebDAV (`OPTIONS`/`PROPFIND`/`HEAD`/`GET`) on the same gateway,
 Basic auth with the S3 secret, an encrypted per-boot LRU under `state/cache/`,
-and ranged GET that opens only overlapping chunks. NFSv3 is deferred until a
-Finder mount is measured (SPECS §8).
+and ranged GET that opens only overlapping chunks. Finder supports WebDAV,
+so v0 stays WebDAV. NFSv3 is not a dev task (SPECS §8).
 
 M5 is built: `git-remote-nas` (same binary as `nas`, argv0 dispatch)
 speaks fetch/push over `nas://`; objects are stored inflated; the OID map
@@ -299,7 +299,8 @@ sealed `private_sha → public_sha` map, mandatory dry-run, secret scan,
 
 M6 is built: per-doc CRDT op-log (`cas-merge` is set-union), compaction
 drops tombstones, adaptive poll is sub-second while editing and minutes
-when idle (SPECS §7.2). Pubsub is still a post-M6 latency optimisation.
+when idle (SPECS §7.2). Pubsub is not built. A notification is not
+load-bearing.
 `nas peer feature-permitted` records that transit-only may run peer-side
 thumbnails (SPECS §19.1); the feature itself is not built.
 

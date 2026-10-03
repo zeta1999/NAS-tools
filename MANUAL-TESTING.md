@@ -1075,9 +1075,9 @@ dropping to genesis the next day), and the report said "1 rungs".
 
 ## 16. Finder WebDAV measurement (no NFS code)
 
-SPECS §8 keeps the read path; only the shim moves, and **only when macOS
-WebDAV is the limit**. Unit tests cannot decide this. Do not implement NFSv3
-until this playbook has been run and the numbers say Finder is unacceptable.
+Finder supports WebDAV, so this playbook does not gate development and
+NFSv3 is not a dev task. The numbers are an optional measurement. SPECS §8
+keeps the read path on WebDAV.
 
 POSIX mode/uid/gid remaining invisible through WebDAV (§15.2) is a second
 argument, not a reason to start NFS now.

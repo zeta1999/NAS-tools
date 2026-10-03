@@ -2,13 +2,13 @@
 
 Fastest route is documentation wherever the code already matches the decision. The only file deletion is `.github/workflows/ci.yml`. No crypto reimplementation, no NFSv3, no pubsub.
 
-- [ ] Doc only: rewrite the owner TODO section as Deployment and drop the build-blocked sentence
-- [ ] Doc only: check off the stale secure-memory box; code is already on both remotes
-- [ ] Delete `.github/workflows/ci.yml` and record in TODO that GitHub workflows are not used
-- [ ] Doc only: drop the NFSv3 dev box; Finder WebDAV support closes it
-- [ ] Doc only: check the rotation/deletion and export-key TODO boxes against MANUAL.md
-- [ ] Doc only: close pubsub as a decision, not a post-M6 upgrade
-- [ ] Code, separate from the doc pass: page simple-backups push/pull for a very large repo (USE-CASES case 10, SPECS §19.9). See the limits below. Do not treat "split the catalog" as the whole fix.
+- [x] Doc only: rewrite the owner TODO section as Deployment and drop the build-blocked sentence
+- [x] Doc only: check off the stale secure-memory box; code is already on both remotes
+- [x] Delete `.github/workflows/ci.yml` and record in TODO that GitHub workflows are not used
+- [x] Doc only: drop the NFSv3 dev box; Finder WebDAV support closes it
+- [x] Doc only: check the rotation/deletion and export-key TODO boxes against MANUAL.md
+- [x] Doc only: close pubsub as a decision, not a post-M6 upgrade
+- [x] Code, separate from the doc pass: page simple-backups push/pull for a very large repo (USE-CASES case 10, SPECS §19.9). See the limits below. Do not treat "split the catalog" as the whole fix.
 - [ ] Lean: lease Merkle root is a function of the set, with the count in the root (`nas-lease` `merkle::root`). Not a skip-chain membership theorem.
 - [ ] TLA+: the paged push and pull, written with that code. Pages are bounded by encoded size, and a single file's chunk list may be split.
 

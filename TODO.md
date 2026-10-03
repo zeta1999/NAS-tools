@@ -3,41 +3,23 @@
 Honest status. **M0 is complete**; this tracks the design decisions that are
 settled and the work that follows from them.
 
-## For zeta1999 — needs a human, not an agent
+## Deployment
 
-- [ ] **Check the test NAS configuration and deploy.** Nobody can do this for
-      you: it needs the physical box, its network position, and a judgement
-      about which namespace modes the real hardware should carry. Worth doing
-      against `USE-CASES.md` — the mode choice per namespace (`transit-only`
-      vs `passphrase` vs `e2ee`) is the decision the whole design turns on, and
-      it is not reversible by editing YAML after the data is in.
-      - **Blocked today by a build failure** (see below). Deploying needs a
-        binary, and there is not one.
-      - When it does build, the acceptance suite is the deployment check:
-        `NAS_MILESTONE=M6 ./tests/usecases/run.sh` against the real peer rather
-        than a fixture. `run.sh` defaults to `M0` and skips everything above
-        it, so a bare run on a fresh box reports `0 passed, 0 failed, 106
-        pending` and looks the same as a working deployment. Set the milestone.
+Not a development task. It needs the physical box and a mode choice per
+namespace before any data is written.
 
-- [ ] **Unblock the build — three functions missing from `secure-memory`.**
-      Verified on andromeda 2026-09-26, `cargo build --release -p nas-crypto`:
+- [ ] **Check the test NAS configuration and deploy.** The mode per namespace
+      (`transit-only` vs `passphrase` vs `e2ee`) is the decision the design
+      turns on, and it is not reversible by editing YAML after the data is in.
+      The acceptance check is `NAS_MILESTONE=M6 ./tests/usecases/run.sh`
+      against the real peer. A bare `./tests/usecases/run.sh` stays at M0 and
+      prints `0 passed, 0 failed, 106 pending`.
 
-          error[E0432] unresolved imports `secure_memory::open_with_nonce`,
-                       `secure_memory::seal_with_nonce`  (nas-crypto/src/keys.rs:21)
-          error[E0599] no associated item `from_seed` for `SigKeyPair`
-                       (nas-crypto/src/sign.rs:137)
-
-      `nas-crypto` depends on `../../../rust-secure-memory`
-      (`zeta1999/rust-secure-memory`, clean at `7786c46`); none of the three
-      exist there and `SigKeyPair` offers only `generate` and `from_bytes`.
-      Note `STATUS.md:3` claims "M0–M6 are done (106 pass, 0 fail at
-      `NAS_MILESTONE=M6`)" — that is **not reproducible here**, because the
-      workspace does not compile. Either it was true against an older
-      `secure-memory` and broke when that repo moved, or it was never
-      reproduced. Whichever it is, the compiler is the one to believe.
-      Related: `~/work/rust-secure-memory-public` has two uncommitted files
-      (`hybrid_kem.rs`, `kem.rs` — `export_secret`/`from_secret`/`from_parts`)
-      that nobody has claimed; possibly the same work, possibly not.
+- [x] **`secure-memory` has the three functions, on both remotes.** Closed:
+      public path. `seal_with_nonce`, `open_with_nonce`, and
+      `SigKeyPair::from_seed` are in `rust-secure-memory` and
+      `rust-secure-memory-public`. The uncommitted `export_secret` /
+      `from_parts` edits are gone.
 
 ## Done (design)
 
@@ -57,7 +39,7 @@ settled and the work that follows from them.
 - [x] Three revocation paths separated: peer block / roster removal / `CS` rotation
 - [x] Witness records + witness-only nodes for roaming and rarely-online devices
 - [x] Slot-history compaction: retain-N + skip-chain checkpoints, explicit degradation
-- [x] Doc liveness: adaptive polling is the correctness path; pubsub is optional
+- [x] Doc liveness: adaptive polling is the correctness path; pubsub is not built
 - [x] Three confidentiality modes: `e2ee`, `passphrase`, `transit-only` (rev 4)
 - [x] Git face: remote helper, inflated loose objects, encrypted OID map
 - [x] Refs revised from `single-writer` to `cas-merge` with fast-forward merge
@@ -501,12 +483,9 @@ settled and the work that follows from them.
 - [x] WebDAV on the same gateway (`OPTIONS` / `PROPFIND` / `HEAD` / `GET`)
 - [x] Encrypted chunk cache under a per-boot key, bounded LRU
 - [x] Ranged GET fetches O(range), not O(file) (`X-Nas-Chunks-Fetched`)
-- [ ] Decide whether macOS WebDAV performance forces the NFSv3 path.
-      WebDAV is what ships; the read path is unchanged if the shim moves
-      (SPECS §8). Playbook in `MANUAL-TESTING.md` §16 (Finder mount vs
-      `nas get`). Box stays unchecked until that measurement exists. No NFS
-      code. POSIX mode is invisible through WebDAV (§15.2), which is a second
-      argument for NFSv3 later, not a reason to start it now.
+- [x] WebDAV is the mount. Finder supports it (Connect to Server). NFSv3 is
+      not a dev task. `MANUAL-TESTING.md` §16 is an optional measurement and
+      does not gate development. No NFS code.
 
 ## M5 — git face
 
@@ -520,27 +499,22 @@ settled and the work that follows from them.
 ## M6 — doc face
 
 - [x] CRDT engine, op-log blobs, compaction (UC15)
-- [x] Adaptive polling (sub-second active, minutes idle). Pubsub remains
-      post-M6 — it cannot be load-bearing against an untrusted peer (§7.2).
+- [x] Adaptive polling (sub-second active, minutes idle). Pubsub is not
+      built. A notification is not load-bearing against an untrusted peer
+      (§7.2).
 
 ## Cross-cutting
 
 - [x] `ci.sh`: fmt (not `--all` — see the comment there), clippy `-D warnings`,
       workspace tests, `formal/check.sh`, release `nas`, and the acceptance
       suite at `CI_MILESTONE` (default M6).
-- [x] **CI on linux.** `.github/workflows/ci.yml` runs `./ci.sh` on
-      `ubuntu-latest` and `macos-latest` on every push and PR, checking out
-      the two public sibling mirrors (no token needed, which is why the
-      `-public` deps matter). It was deleted in 5827799 and restored here:
-      the deletion removed the only *automatic* Linux CI, so ticking this box
-      for that commit was backwards. Its real blocker had been that it checked
-      out the private `rust-secure-memory`; after the repoint that is a
-      one-line change. Additionally `docker/ci-linux.sh` runs `./ci.sh` inside
-      `rust:1-bookworm` (`ARCH=amd64` by default, `ARCH=arm64` selects the
-      platform) with the parent work tree mounted so `rust-secure-memory-public`
-      and `simple-network` resolve. Host `./ci.sh` remains the macOS gate.
-      `docker/build.sh` stays musl compile-only (arm64 and amd64). uc11 stays
-      manual. GitHub Actions is not the gate.
+- [x] **CI on linux.** Do not add `.github/workflows`. That is the owner's
+      choice; restoring a workflow file is not a fix. `docker/ci-linux.sh`
+      runs `./ci.sh` inside `rust:1-bookworm` (`ARCH=amd64` by default,
+      `ARCH=arm64` selects the platform) with the parent work tree mounted so
+      `rust-secure-memory-public` and `simple-network` resolve. Host `./ci.sh`
+      remains the macOS gate. `docker/build.sh` stays musl compile-only
+      (arm64 and amd64). uc11 stays manual.
 - [x] Automated "no plaintext on the peer" scan: `nas test peer-no-plaintext
       <ns>` (`nas-cli/src/peerscan.rs`) walks the whole peer root — blobs,
       slots, leases, witnesses, everything under it — for the fixture's
@@ -551,12 +525,14 @@ settled and the work that follows from them.
 - [x] User manual must state plainly: fork detection is not prevention; a blocked
       peer keeps what it already had; a revoked device reads old data until rewritten
       — `MANUAL.md` (§1 "what you're buying", §5 forks, §6 revocation, §8 limits)
-- [ ] `MANUAL.md` §6: "a rotated peer can't be un-rotated" is a design statement —
-      re-check once `nas peer` grows a rotation subcommand; and §6 deletion prose
-      needs the M6 quorum flow filled in when it exists
-- [ ] `MANUAL.md` §4: no `nas vault export` / secret-mode command yet; the manual
-      names the OS keychain (and the `vault.key` fallback) rather than a
-      `nas vault export` command — still no export subcommand
+- [x] `MANUAL.md` §4.3 and §5. `nas ns rotate` appends a convergence-secret
+      generation and does not rewrite old chunks. Deletion is the loop that
+      runs: signed request, cooling-off, m approvals, Execute, lease release,
+      `forget_retention` with the proof. There is no `nas peer` rotation
+      subcommand and no `nas peer block`.
+- [x] `MANUAL.md` §4.4. `nas ns export-key` writes the 32-byte vault key,
+      mode 0600, refuses to overwrite, and exits 2 on a `passphrase`
+      namespace. There is no `nas vault export`.
 - [x] Propose CDC + at-rest encryption upstream to `simple-backups` rather than
       maintaining two stores — `docs/upstream-cdc.md`. Open as a discussion on
       that repo if writable; NAS-tools does not merge a second store.

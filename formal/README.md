@@ -6,8 +6,8 @@ Mirrors the layout of `../../seal-dao-public/formal/`.
 
 Run `./check.sh` — it fetches `tla2tools.jar` if absent and gates everything.
 The default gate is SlotConsistency at MaxSeq=2, LeaseGC at its tightest
-windowing and DeleteQuorum with 3-slot bundles, and takes about a minute and a
-half end to end. `DEEP=1 ./check.sh` is MaxSeq=3, two wider LeaseGC windowings
+windowing, DeleteQuorum with 3-slot bundles, and PagedReplication at page
+budget 2. It takes about a minute and a half end to end. `DEEP=1 ./check.sh` is MaxSeq=3, two wider LeaseGC windowings
 and DeleteQuorum with 4-slot bundles: ~13 minutes on a laptop for the first two
 (almost all of it SlotConsistency's ForkAt=1 run) plus DeleteQuorum's own
 11½ — about 25 minutes, as a sum of separately measured runs. DeleteQuorum's
@@ -18,12 +18,15 @@ counterexample it finds in single-digit steps.
 |---|---|---|
 | `lean/NasVerify/Transcript.lean` | Lean 4.28 | **VERIFIED** — 3 theorems, 0 admitted, axioms clean |
 | `lean/NasVerify/Padding.lean` | Lean 4.28 | **VERIFIED** — 11 theorems, 0 admitted, axioms clean. Models the *ladder* (closing the gap where `Nat` truncation hid a `usize` underflow) and the reader's strict check (closing the class-selection covert channel the M0 review found) |
+| `lean/NasVerify/Merkle.lean` | Lean 4.28 | **VERIFIED** — 7 theorems, 0 admitted, axioms `propext` only. The lease root is a function of the normalized set; the count is in the root, so two sizes do not collide; tail duplication collides on `[0,1,2]` and `[0,1,2,2]`, and promotion does not. BLAKE3 is not the model |
 | `tlaplus/SlotConsistency.tla` | TLA+ / TLC | **MODEL-CHECKED**, revision 3 — but note it constrains §5, which is **M2** code; it is assurance about the design, not about anything shipped in M0. `ForkAt` (the sequence number at which branch "b" diverges) is varied over every admissible point, `1..MaxSeq`, not fixed at one value — see [Varying `ForkAt`](#varying-forkat) below. CI gate, MaxSeq=2: ForkAt=1 337,817 distinct states, depth 25 (~3 s); ForkAt=2 38,709 distinct states, depth 20 (~1 s). Deep gate (`DEEP=1`), MaxSeq=3: ForkAt=1 38,366,601 distinct states from 570.7 M generated, depth 35; ForkAt=2 4,699,837 distinct states from 60.1 M generated, depth 30; ForkAt=3 443,429 distinct states, depth 25. **5** invariants + 1 action property hold at every (MaxSeq, ForkAt) pair. Revision 3 changed what is *derived* from the state, not the state space, so every count above is unchanged from revision 2 — measured, not assumed. |
 | sanity checks | TLA+ / TLC | **3 required counterexamples found, at both ForkAt=1 and ForkAt=2** — the model is not vacuous at either end of the admissible range |
 | `tlaplus/LeaseGC.tla` | TLA+ / TLC | **MODEL-CHECKED** — the write/sweep race of SPECS §6, transcribed from `crates/nas-lease/src/sweep.rs`, which is M0 code that ships. 7 invariants hold at every windowing gated. CI gate: grace-expiry-notice 1-1-1 — 242,988 distinct states from 2,578,505 generated, depth 23 (~13 s); 1-2-3 — 652,268 distinct from 6,914,841 generated, depth 30 (~26 s). Deep gate (`DEEP=1`) adds 2-2-1 — 1,345,944 distinct from 15,186,524 generated, depth 25 (~50 s). The state counts are exact; the times were measured on a laptop running three other TLC jobs and are therefore upper bounds. It also **found a real gap** between §6.2 and the code, since closed — see [What `LeaseGC.tla` found](#what-leasegctla-covers-and-what-it-found) |
 | LeaseGC sanity checks | TLA+ / TLC | **5 required counterexamples found** at the CI bound — `NeverSweeps`, `GraceIsRedundant`, `NoticeIsRedundant`, `RenewalNeverRestores`, `EveryUploadGetsGrace`. The last is a negative control: its cfg sets `TouchOnDedup = FALSE`, the code the model found the gap in, and must reproduce it |
 | `tlaplus/DeleteQuorum.tla` | TLA+ / TLC | **MODEL-CHECKED** — the §16.2 deletion loop against a hostile executor that assembles the `DeleteExecution` bundle itself, out of every approval record that exists, in any multiplicity: replay and re-targeting are behaviours of the model, not things it assumes away. Constrains `crates/nas-delete` (`decide`, `DeleteExecution::verify`, `Approver::may_sign`), which is **M2** code. 6 invariants + 1 step property. CI gate (3 authority members, 1 minted key, 2 requests, cooling-off 2, bundles of 3): 1,326,144 distinct states from 7,889,266 generated, depth 22 (~24 s). Deep gate (`DEEP=1`, bundles of 4 — room to pad a full quorum with a replayed record): **the same 1,326,144 distinct states** from 12,793,312 generated, depth 22 (11 min 31 s). See [DeleteQuorum](#deletequorum-the-deletion-approval-loop-specs-162) |
 | DeleteQuorum sanity checks | TLA+ / TLC | **6 required counterexamples found** — three reachability, and three *negative controls* that switch off one defence apiece (the request-hash binding, the offline authority, the approver's own clock) and must then break the invariant that defence carries |
+| `tlaplus/PagedReplication.tla` | TLA+ / TLC | **MODEL-CHECKED** — paged push and pull from `simple-backups` `backups-transfer`. Page budget 2, three objects, three manifest slices (the first two are one file). A skip requires a read, an old peer commits nothing, a partial manifest is not a snapshot, and no page exceeds the budget. 13,600 distinct states, depth 16 |
+| PagedReplication sanity | TLA+ / TLC | **1 required counterexample** — `RequireCommitGuard = FALSE` (`MC_PagedReplication_NoPartialCommit.cfg`) violates `NoPartialCommit` |
 
 ### What the model check actually caught
 
@@ -391,13 +394,13 @@ no notion of time or concurrency.
   rests on. Also proves padding is reversible **unconditionally** — a wrong size
   class can leak more length information than intended, but can never make a
   chunk unrecoverable.
-- *(planned)* `merkle::root` in `nas-lease`: the root is a function of the set
-  (order and duplicates do not matter), the odd node is promoted rather than
-  duplicated, and the element count is hashed into the root. BLAKE3 stays
-  abstract. This is not a skip-chain membership theorem. `verify_skip_chain`
-  has no Merkle inclusion check; an empty tail still verifies, and records
-  between checkpoints are not claimed to be in hand. `SlotConsistency.tla`
-  already covers a missing witness edge.
+- **`Merkle.lean`** *(verified)* — `merkle::root` in `nas-lease`. The root is a
+  function of the normalized set (order and duplicates do not matter), the odd
+  node is promoted rather than duplicated, and the element count is in the
+  root. BLAKE3 stays abstract. This is not a skip-chain membership theorem.
+  `verify_skip_chain` has no Merkle inclusion check; an empty tail still
+  verifies, and records between checkpoints are not claimed to be in hand.
+  `SlotConsistency.tla` already covers a missing witness edge.
 
 ### Property tests — implementation behaviour
 

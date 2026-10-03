@@ -235,6 +235,27 @@ for entry in NeverExecutes:NeverExecutes \
     say "$label" "FAIL — model is VACUOUS"; fail=1
   fi
 done
+
+# ── PagedReplication (simple-backups push/pull) ───────────────────────────
+# Page budget 2, three objects, a manifest of three slices. The first two
+# slices are one file's chunk list. The sanity config turns the commit guard
+# off and must then commit a partial.
+label="PagedReplication invariants (page budget 2)"
+out=$(run MC_PagedReplication.cfg PagedReplication)
+if echo "$out" | grep -q "No error has been found"; then
+  n=$(echo "$out" | grep -oE "[0-9][0-9,]* distinct states" | tail -1)
+  say "$label" "ok — $n"
+else
+  say "$label" "FAIL"; echo "$out" | tail -60; fail=1
+fi
+
+label="sanity: PagedReplication NoPartialCommit"
+out=$(run MC_PagedReplication_NoPartialCommit.cfg PagedReplication)
+if echo "$out" | grep -q "Invariant NoPartialCommit is violated"; then
+  say "$label" "violated as required"
+else
+  say "$label" "FAIL — model is VACUOUS"; echo "$out" | tail -40; fail=1
+fi
 popd >/dev/null
 
 echo "──────────────────────────────────────────────────────────────────"

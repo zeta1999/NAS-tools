@@ -9,8 +9,8 @@ Fastest route is documentation wherever the code already matches the decision. T
 - [x] Doc only: check the rotation/deletion and export-key TODO boxes against MANUAL.md
 - [x] Doc only: close pubsub as a decision, not a post-M6 upgrade
 - [x] Code, separate from the doc pass: page simple-backups push/pull for a very large repo (USE-CASES case 10, SPECS §19.9). See the limits below. Do not treat "split the catalog" as the whole fix.
-- [ ] Lean: lease Merkle root is a function of the set, with the count in the root (`nas-lease` `merkle::root`). Not a skip-chain membership theorem.
-- [ ] TLA+: the paged push and pull, written with that code. Pages are bounded by encoded size, and a single file's chunk list may be split.
+- [x] Lean: lease Merkle root is a function of the set, with the count in the root (`nas-lease` `merkle::root`). Not a skip-chain membership theorem.
+- [x] TLA+: the paged push and pull, written with that code. Pages are bounded by encoded size, and a single file's chunk list may be split.
 
 ## Fastest route
 
@@ -112,4 +112,4 @@ Reviewed against `verify_skip_chain` and `merkle::root`. The skip-chain walk doe
 
 ## Review
 
-A review against cases 1–10 and the decisions above was done after this plan was drafted. Cases 1–9 are already built and are not work items here. Case 10 is this backup change and is not built. The doc pass can be implemented as written. The transfer and the Lean proof are implementable only with the corrections in this section: manifest pages bounded by encoded size, pull included, new wire variants at protocol version 1, and the Lean statement about `merkle::root` rather than `verify_skip_chain`.
+A review against cases 1–10 and the decisions above was done after this plan was drafted. Cases 1–9 were already built. Case 10 is the paged push and pull in `simple-backups`. The doc pass, that transfer, `formal/lean/NasVerify/Merkle.lean`, and `formal/tlaplus/PagedReplication.tla` are in place. Manifest pages are bounded by encoded size, pull is included, the new wire variants stay at protocol version 1, and the Lean statement is about `merkle::root` rather than `verify_skip_chain`.

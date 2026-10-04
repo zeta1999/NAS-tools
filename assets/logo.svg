@@ -1,0 +1,32 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 200" width="200" height="200">
+  <defs>
+    <linearGradient id="nas-grad-a" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#60a5fa"/>
+      <stop offset="100%" stop-color="#a78bfa"/>
+    </linearGradient>
+    <linearGradient id="nas-grad-b" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#f59e0b"/>
+      <stop offset="100%" stop-color="#ef4444"/>
+    </linearGradient>
+  </defs>
+
+  <circle cx="100" cy="100" r="96" fill="#0d1b2a"/>
+
+  <!-- Stacked platters -->
+  <rect x="46" y="52" width="108" height="22" rx="11" fill="url(#nas-grad-a)" opacity="0.95"/>
+  <rect x="46" y="86" width="108" height="22" rx="11" fill="url(#nas-grad-a)" opacity="0.72"/>
+  <rect x="46" y="120" width="108" height="22" rx="11" fill="url(#nas-grad-b)" opacity="0.9"/>
+
+  <!-- Ciphertext ticks: the peer sees blocks, not files -->
+  <rect x="58" y="59" width="10" height="8" rx="1.5" fill="#0d1b2a" opacity="0.55"/>
+  <rect x="72" y="59" width="14" height="8" rx="1.5" fill="#0d1b2a" opacity="0.4"/>
+  <rect x="90" y="59" width="8" height="8" rx="1.5" fill="#0d1b2a" opacity="0.5"/>
+  <rect x="58" y="93" width="16" height="8" rx="1.5" fill="#0d1b2a" opacity="0.45"/>
+  <rect x="78" y="93" width="8" height="8" rx="1.5" fill="#0d1b2a" opacity="0.35"/>
+  <rect x="90" y="93" width="12" height="8" rx="1.5" fill="#0d1b2a" opacity="0.5"/>
+
+  <!-- Lock: only the key holder reads the bottom platter -->
+  <rect x="118" y="124" width="22" height="14" rx="2" fill="none" stroke="#72efdd" stroke-width="2.5"/>
+  <path d="M122 124 v-5 a7 7 0 0 1 14 0 v5" fill="none" stroke="#72efdd" stroke-width="2.5" stroke-linecap="round"/>
+  <circle cx="129" cy="131" r="1.6" fill="#72efdd"/>
+</svg>
